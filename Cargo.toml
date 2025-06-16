@@ -1,0 +1,17 @@
+[package]
+name = "dsync"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1"
+blake3 = "1.8.2"
+chrono = "0.4"
+clap = { version = "4.5", features = ["env"] }
+opentelemetry = "0.30"
+opentelemetry-otlp = { version = "0.30", features = ["grpc-tonic", "tls"] }
+opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }
+tokio = { version = "1.45", features = ["full"] }
+tracing = "0.1"
+tracing-opentelemetry = "0.31"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
