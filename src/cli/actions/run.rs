@@ -1,5 +1,5 @@
 use crate::cli::actions::Action;
-use crate::dsync::tools;
+use crate::dsync::{sync, tools};
 use anyhow::Result;
 use tracing::info;
 use tracing::instrument;
@@ -24,9 +24,14 @@ pub async fn handle(action: Action) -> Result<()> {
     println!("Should copy file from {:?} to {:?}: {}", src, dst, copy);
 
     // get hash of src
-    let src_hash = tools::blake3(&src).await?;
+    // let src_hash = tools::blake3(&src).await?;
+    // println!("Hash of source file {:?}: {}", src, src_hash);
 
-    println!("Hash of source file {:?}: {}", src, src_hash);
+    if !copy {
+        println!("Syncing changed blocks from {:?} to {:?}", src, dst);
+        sync::sync_changed_blocks(&src, &dst).await?;
+        println!("File copied from {:?} to {:?}", src, dst);
+    }
 
     Ok(())
 }
