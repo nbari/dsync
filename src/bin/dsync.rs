@@ -8,7 +8,9 @@ async fn main() -> Result<()> {
     let action = start()?;
 
     match action {
-        Action::Run { .. } => actions::run::handle(action).await?,
+        Action::Run { .. } | Action::Listen { .. } | Action::Connect { .. } => {
+            actions::run::handle(action).await?;
+        }
     }
 
     Ok(())

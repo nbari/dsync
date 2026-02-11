@@ -4,34 +4,80 @@ use anyhow::Result;
 use tracing::info;
 use tracing::instrument;
 
-/// Handle the create action
+/// Handle the action
+///
+/// # Errors
+///
+/// Returns an error if synchronization fails.
 #[instrument(skip(action))]
 pub async fn handle(action: Action) -> Result<()> {
-    let Action::Run {
-        src,
-        dst,
-        threshold,
-    } = action;
+    match action {
+        Action::Listen { addr, dst } => {
+            println!("Listening on {addr} for incoming sync to {}", dst.display());
+            crate::dsync::net::run_receiver(&addr, &dst).await?;
+        }
+        Action::Connect {
+            addr,
+            src,
+            checksum,
+        } => {
+            println!(
+                "Connecting to {addr} to sync from {} (checksum: {checksum})",
+                src.display()
+            );
+            crate::dsync::net::run_sender(&addr, &src, checksum).await?;
+        }
+        Action::Run {
+            src,
+            dst,
+            threshold,
+            checksum,
+            dry_run,
+        } => {
+            info!(
+                "src: {:?}, dst: {:?}, threshold: {:?}, checksum: {checksum}, dry_run: {dry_run}",
+                &src, &dst, threshold
+            );
 
-    info!(
-        "src: {:?}, dst: {:?}, threshold: {:?}",
-        &src, &dst, threshold
-    );
+            let src_meta = tokio::fs::metadata(&src).await?;
 
-    // check size of src and dst
-    let copy = tools::should_copy_file(&src, &dst, threshold).await?;
+            if src_meta.is_dir() {
+                println!(
+                    "Syncing directory from {} to {}",
+                    src.display(),
+                    dst.display()
+                );
+                sync::sync_dir(&src, &dst, threshold, checksum, dry_run).await?;
+            } else {
+                if tools::should_skip_file(&src, &dst, checksum).await? {
+                    println!("File {} is already up to date.", src.display());
+                    return Ok(());
+                }
 
-    println!("Should copy file from {:?} to {:?}: {}", src, dst, copy);
+                if dry_run {
+                    let src_size = tools::get_file_size(&src).await?;
+                    println!("(dry-run) sync file: {} ({src_size} bytes)", src.display());
+                    return Ok(());
+                }
 
-    // get hash of src
-    // let src_hash = tools::blake3(&src).await?;
-    // println!("Hash of source file {:?}: {}", src, src_hash);
+                println!(
+                    "Syncing changed blocks from {} to {}",
+                    src.display(),
+                    dst.display()
+                );
+                let stats = sync::sync_changed_blocks(&src, &dst, false).await?;
 
-    if !copy {
-        println!("Syncing changed blocks from {:?} to {:?}", src, dst);
-        sync::sync_changed_blocks(&src, &dst).await?;
-        println!("File copied from {:?} to {:?}", src, dst);
+                #[allow(clippy::cast_precision_loss)]
+                let percentage = (stats.updated_blocks as f64 / stats.total_blocks as f64) * 100.0;
+                println!(
+                    "Summary: {}/{} blocks updated ({percentage:.2}%)",
+                    stats.updated_blocks, stats.total_blocks
+                );
+            }
+        }
     }
+
+    println!("Synchronization complete");
 
     Ok(())
 }
