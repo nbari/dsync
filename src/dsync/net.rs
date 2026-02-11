@@ -9,6 +9,7 @@ use rkyv::{
     {Archive, Deserialize, Serialize},
 };
 use std::{
+    collections::HashMap,
     fmt::Write as _,
     os::unix::fs::{FileExt, MetadataExt},
     path::Path,
@@ -19,6 +20,7 @@ use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
     process::Command,
+    sync::mpsc,
 };
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
@@ -81,6 +83,9 @@ pub enum Message {
         path: String,
         metadata: FileMetadata,
     },
+    MetadataApplied {
+        path: String,
+    },
     EndOfFile {
         path: String,
     },
@@ -117,7 +122,6 @@ pub fn serialize_message(msg: &Message) -> anyhow::Result<Vec<u8>> {
 pub fn deserialize_message(bytes: &[u8]) -> anyhow::Result<Message> {
     let mut aligned = AlignedVec::<16>::new();
     aligned.extend_from_slice(bytes);
-
     rkyv::from_bytes::<Message, rkyv::rancor::Error>(&aligned)
         .map_err(|e| anyhow::anyhow!("failed to deserialize message: {e}"))
 }
@@ -130,22 +134,14 @@ pub fn deserialize_message(bytes: &[u8]) -> anyhow::Result<Message> {
 pub fn apply_file_metadata(path: &Path, metadata: &FileMetadata) -> anyhow::Result<()> {
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
-
-    // Set permissions
     std::fs::set_permissions(path, Permissions::from_mode(metadata.mode))?;
-
-    // Set ownership
     let _ = nix::unistd::chown(
         path,
         Some(nix::unistd::Uid::from_raw(metadata.uid)),
         Some(nix::unistd::Gid::from_raw(metadata.gid)),
     );
-
-    // Set times
     let mtime = FileTime::from_unix_time(metadata.mtime, metadata.mtime_nsec);
-    // Use same for atime
     filetime::set_file_times(path, mtime, mtime)?;
-
     Ok(())
 }
 
@@ -162,50 +158,35 @@ impl Decoder for DsyncCodec {
             if src.len() < 8 {
                 return Ok(None);
             }
-
-            // High-speed search for Magic Header
-
             if src.get(0..4) != Some(MAGIC) {
                 if let Some(pos) = memchr::memchr(MAGIC[0], src) {
                     src.advance(pos);
-
                     if src.len() < 4 {
                         return Ok(None);
                     }
-
                     if src.get(0..4) != Some(MAGIC) {
                         src.advance(1);
-
                         continue;
                     }
                 } else {
                     src.clear();
-
                     return Ok(None);
                 }
             }
-
             let mut len_bytes = [0u8; 4];
-
             if let Some(bytes) = src.get(4..8) {
                 len_bytes.copy_from_slice(bytes);
             } else {
                 return Ok(None);
             }
-
             let len = u32::from_be_bytes(len_bytes) as usize;
-
             if len > 64 * 1024 * 1024 {
                 return Err(anyhow::anyhow!("Frame size too big: {len}"));
             }
-
             if src.len() < 8 + len {
-                // Wait for more data
                 return Ok(None);
             }
-
-            // We have a full frame!
-            src.advance(8); // Skip magic and length
+            src.advance(8);
             let data = src.split_to(len).to_vec();
             return Ok(Some(data));
         }
@@ -214,7 +195,6 @@ impl Decoder for DsyncCodec {
 
 impl Encoder<Vec<u8>> for DsyncCodec {
     type Error = anyhow::Error;
-
     fn encode(&mut self, item: Vec<u8>, dst: &mut BytesMut) -> Result<(), Self::Error> {
         if item.len() > 64 * 1024 * 1024 {
             return Err(anyhow::anyhow!("Frame size too big: {}", item.len()));
@@ -236,10 +216,8 @@ impl Encoder<Vec<u8>> for DsyncCodec {
 pub async fn run_receiver(addr: &str, dst_root: &Path) -> anyhow::Result<()> {
     let listener = TcpListener::bind(addr).await?;
     eprintln!("Receiver listening on {addr}");
-
     while let Ok((stream, peer_addr)) = listener.accept().await {
         eprintln!("Accepted connection from {peer_addr}");
-
         let dst_root = dst_root.to_path_buf();
         tokio::spawn(async move {
             let mut framed = Framed::new(stream, DsyncCodec);
@@ -260,7 +238,6 @@ pub async fn run_receiver(addr: &str, dst_root: &Path) -> anyhow::Result<()> {
 pub async fn run_stdio_receiver(dst_root: &Path) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
-
     let combined = tokio::io::join(stdin, stdout);
     let mut framed = Framed::new(combined, DsyncCodec);
     handle_client(&mut framed, dst_root).await
@@ -279,13 +256,10 @@ pub async fn handle_client<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut open_files: std::collections::HashMap<String, std::fs::File> =
-        std::collections::HashMap::new();
-
+    let mut open_files: HashMap<String, std::fs::File> = HashMap::new();
     while let Some(result) = framed.next().await {
         let bytes = result?;
         let msg = deserialize_message(&bytes)?;
-
         match msg {
             Message::Handshake { version } => {
                 tracing::info!("Client connected (version: {version})");
@@ -322,26 +296,23 @@ where
                 let full_path = dst_root.join(&path);
                 if full_path.exists() {
                     let meta = tokio::fs::metadata(&full_path).await?;
-                    if meta.len() == metadata.size && !checksum {
-                        // Check mtime too
-                        if meta.mtime() == metadata.mtime {
-                            framed
-                                .send(serialize_message(&Message::EndOfFile { path })?)
-                                .await?;
-                            continue;
-                        }
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    if meta.len() == metadata.size
+                        && !checksum
+                        && meta.mtime() == metadata.mtime
+                        && (meta.mtime_nsec() as u32) == metadata.mtime_nsec
+                    {
+                        framed
+                            .send(serialize_message(&Message::EndOfFile { path })?)
+                            .await?;
+                        continue;
                     }
-                    framed
-                        .send(serialize_message(&Message::RequestHashes { path })?)
-                        .await?;
-                } else {
-                    if let Some(parent) = full_path.parent() {
-                        tokio::fs::create_dir_all(parent).await?;
-                    }
-                    framed
-                        .send(serialize_message(&Message::RequestHashes { path })?)
-                        .await?;
+                } else if let Some(parent) = full_path.parent() {
+                    tokio::fs::create_dir_all(parent).await?;
                 }
+                framed
+                    .send(serialize_message(&Message::RequestHashes { path })?)
+                    .await?;
             }
             Message::BlockHashes { path, hashes } => {
                 let full_path = dst_root.join(&path);
@@ -350,12 +321,10 @@ where
                     let concurrency = std::thread::available_parallelism()
                         .map(std::num::NonZeroUsize::get)
                         .unwrap_or(8);
-
                     let num_blocks = hashes.len();
                     let results = Arc::new(std::sync::Mutex::new(Vec::new()));
                     #[allow(clippy::cast_possible_truncation)]
                     let chunk_size = (num_blocks as u64).div_ceil(concurrency as u64);
-
                     std::thread::scope(|s| {
                         for i in 0..concurrency {
                             let start_idx = (i as u64) * chunk_size;
@@ -363,17 +332,14 @@ where
                                 break;
                             }
                             let end_idx = std::cmp::min(start_idx + chunk_size, num_blocks as u64);
-
                             let file_ref = &file;
                             let hashes_ref = &hashes;
                             let results_clone = Arc::clone(&results);
-
                             s.spawn(move || {
                                 let mut local_requested = Vec::new();
                                 #[allow(clippy::cast_possible_truncation)]
                                 let mut buf = vec![0u8; BLOCK_SIZE as usize];
                                 for idx in start_idx..end_idx {
-                                    #[allow(clippy::cast_possible_truncation)]
                                     let offset = idx * BLOCK_SIZE;
                                     let mut matched = false;
                                     if let Ok(n) = file_ref.read_at(&mut buf, offset)
@@ -398,17 +364,16 @@ where
                             });
                         }
                     });
-                    let results_guard = results
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!("mutex poisoned"))?;
-                    let mut r = results_guard.clone();
+                    let mut r = Arc::try_unwrap(results)
+                        .map_err(|_| anyhow::anyhow!("Arc busy"))?
+                        .into_inner()
+                        .map_err(|_| anyhow::anyhow!("Mutex poisoned"))?;
                     r.sort_unstable();
                     r
                 } else {
                     #[allow(clippy::cast_possible_truncation)]
                     (0..hashes.len() as u32).collect()
                 };
-
                 if requested.is_empty() {
                     framed
                         .send(serialize_message(&Message::EndOfFile { path })?)
@@ -434,23 +399,22 @@ where
                         .open(full_path)?;
                     open_files.entry(path.clone()).or_insert(f)
                 };
-
                 for block in blocks {
                     file.write_all_at(&block.data, block.offset)?;
                 }
             }
             Message::ApplyMetadata { path, metadata } => {
                 let full_path = dst_root.join(&path);
-                // Ensure file is closed before applying metadata (some OS need this for mtime)
                 open_files.remove(&path);
                 apply_file_metadata(&full_path, &metadata)?;
+                framed
+                    .send(serialize_message(&Message::MetadataApplied { path })?)
+                    .await?;
             }
             Message::EndOfFile { path } => {
                 open_files.remove(&path);
             }
-            _ => {
-                eprintln!("Unhandled message: {msg:?}");
-            }
+            _ => eprintln!("Unhandled message: {msg:?}"),
         }
     }
     Ok(())
@@ -469,7 +433,6 @@ pub async fn run_sender(
 ) -> anyhow::Result<()> {
     let total_size = sync::calculate_total_size(src_root, ignores)?;
     let pb = Arc::new(tools::create_progress_bar(total_size));
-
     let stream = TcpStream::connect(addr).await?;
     let mut framed = Framed::new(stream, DsyncCodec);
     sender_loop(&mut framed, src_root, checksum, ignores, pb).await
@@ -487,7 +450,6 @@ pub async fn run_stdio_sender(
 ) -> anyhow::Result<()> {
     let total_size = sync::calculate_total_size(src_root, ignores)?;
     let pb = Arc::new(tools::create_progress_bar(total_size));
-
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let combined = tokio::io::join(stdin, stdout);
@@ -509,7 +471,6 @@ pub async fn run_ssh_sender(
 ) -> anyhow::Result<()> {
     let total_size = sync::calculate_total_size(src_root, ignores)?;
     let pb = Arc::new(tools::create_progress_bar(total_size));
-
     let mut cmd = Command::new("ssh");
     cmd.arg("-q")
         .arg("-o")
@@ -519,38 +480,32 @@ pub async fn run_ssh_sender(
         .arg("-o")
         .arg("IPQoS=throughput")
         .arg(addr);
-
     let mut remote_cmd = format!("dsync --stdio --destination {dst_path}");
     for pattern in ignores {
         let _ = write!(remote_cmd, " --ignore '{pattern}'");
     }
-
     let mut child = cmd
         .arg(remote_cmd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
-
     let stdin = child
         .stdin
         .take()
-        .ok_or_else(|| anyhow::anyhow!("failed to open stdin"))?;
+        .ok_or_else(|| anyhow::anyhow!("stdin failed"))?;
     let stdout = child
         .stdout
         .take()
-        .ok_or_else(|| anyhow::anyhow!("failed to open stdout"))?;
-
+        .ok_or_else(|| anyhow::anyhow!("stdout failed"))?;
     {
         let combined = tokio::io::join(stdout, stdin);
         let mut framed = Framed::new(combined, DsyncCodec);
         sender_loop(&mut framed, src_root, checksum, ignores, Arc::clone(&pb)).await?;
     }
-
     let status = child.wait().await?;
     if !status.success() {
         anyhow::bail!("SSH process exited with error: {status}");
     }
-
     pb.finish_with_message("Done");
     Ok(())
 }
@@ -565,172 +520,32 @@ async fn sender_loop<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    // Handshake
     let handshake = Message::Handshake {
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
     framed.send(serialize_message(&handshake)?).await?;
-
     let resp_bytes = framed
         .next()
         .await
         .ok_or_else(|| anyhow::anyhow!("Connection closed during handshake"))??;
     let _resp = deserialize_message(&resp_bytes)?;
-
     eprintln!("Handshake successful");
-
-    let meta = tokio::fs::metadata(src_root).await?;
-    if meta.is_dir() {
-        sync_remote_dir(framed, src_root, src_root, checksum, ignores, pb).await?;
-    } else {
-        sync_remote_file(
-            framed,
-            src_root.parent().unwrap_or(Path::new(".")),
-            src_root,
-            checksum,
-            pb,
-        )
-        .await?;
-    }
-
-    Ok(())
+    sync_remote_dir(framed, src_root, src_root, checksum, ignores, pb).await
 }
 
-#[allow(clippy::too_many_lines)]
-async fn sync_remote_file<T>(
-    framed: &mut Framed<T, DsyncCodec>,
-    src_root: &Path,
-    path: &Path,
-    checksum: bool,
-    pb: Arc<ProgressBar>,
-) -> anyhow::Result<()>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut relative_path = path
-        .strip_prefix(src_root)
-        .unwrap_or(Path::new(""))
-        .to_string_lossy()
-        .to_string();
-    if relative_path.is_empty() {
-        relative_path = path
-            .file_name()
-            .ok_or_else(|| anyhow::anyhow!("invalid filename"))?
-            .to_string_lossy()
-            .to_string();
-    }
-    let meta = tokio::fs::metadata(path).await?;
-    let metadata = FileMetadata::from(meta);
-
-    let sync_msg = Message::SyncFile {
-        path: relative_path.clone(),
-        metadata,
-        checksum,
-    };
-
-    pb.set_message(relative_path.clone());
-    framed.send(serialize_message(&sync_msg)?).await?;
-
-    while let Some(msg_result) = framed.next().await {
-        let msg_bytes = msg_result?;
-        let msg = deserialize_message(&msg_bytes)?;
-
-        match msg {
-            Message::RequestHashes { path: p } => {
-                let full_path = if src_root == path {
-                    path.to_path_buf()
-                } else {
-                    src_root.join(&p)
-                };
-                let hashes = calculate_file_hashes(&full_path).await?;
-                let resp = Message::BlockHashes { path: p, hashes };
-                framed.send(serialize_message(&resp)?).await?;
-            }
-            Message::RequestBlocks { path: p, indices } => {
-                let full_path = if src_root == path {
-                    path.to_path_buf()
-                } else {
-                    src_root.join(&p)
-                };
-
-                // CRITICAL: Calculate skipped blocks and update progress bar
-                // Total blocks in file
-                let num_blocks = metadata.size.div_ceil(BLOCK_SIZE);
-                let requested_count = indices.len() as u64;
-                let skipped_count = num_blocks - requested_count;
-
-                // Increment PB for blocks already on the destination
-                if skipped_count > 0 {
-                    // We need to be careful with the last block which might be smaller than 64KB
-                    // For simplicity, we approximate or use the exact bytes.
-                    // Let's use metadata.size - (actual requested bytes)
-                    let mut requested_bytes = 0u64;
-                    for &idx in &indices {
-                        let offset = u64::from(idx) * BLOCK_SIZE;
-                        let n = std::cmp::min(BLOCK_SIZE, metadata.size - offset);
-                        requested_bytes += n;
-                    }
-                    pb.inc(metadata.size - requested_bytes);
-                }
-
-                // Read and send blocks in large parallel batches
-                let batch_size = 128; // 8MB per batch
-
-                for chunk_indices in indices.chunks(batch_size) {
-                    let full_path_clone = full_path.clone();
-                    let chunk_indices_vec = chunk_indices.to_vec();
-
-                    let blocks = tokio::task::spawn_blocking(move || {
-                        let file = std::fs::File::open(&full_path_clone)?;
-                        let mut local_blocks = Vec::with_capacity(chunk_indices_vec.len());
-                        #[allow(clippy::cast_possible_truncation)]
-                        let mut buf = vec![0u8; BLOCK_SIZE as usize];
-
-                        for &idx in &chunk_indices_vec {
-                            let offset = u64::from(idx) * BLOCK_SIZE;
-                            let n = file.read_at(&mut buf, offset)?;
-                            let chunk = buf.get(..n).unwrap_or_default();
-                            local_blocks.push(Block {
-                                offset,
-                                data: chunk.to_vec(),
-                            });
-                        }
-                        Ok::<Vec<Block>, anyhow::Error>(local_blocks)
-                    })
-                    .await??;
-
-                    let bytes_sent: u64 = blocks.iter().map(|b| b.data.len() as u64).sum();
-                    let apply = Message::ApplyBlocks {
-                        path: p.clone(),
-                        blocks,
-                    };
-                    framed.send(serialize_message(&apply)?).await?;
-                    pb.inc(bytes_sent);
-                }
-
-                // Send final metadata
-                let apply_meta = Message::ApplyMetadata {
-                    path: p.clone(),
-                    metadata,
-                };
-                framed.send(serialize_message(&apply_meta)?).await?;
-
-                let end = Message::EndOfFile { path: p };
-                framed.send(serialize_message(&end)?).await?;
-                return Ok(());
-            }
-            Message::EndOfFile { path: p } => {
-                // Receiver says it's already up to date
-                pb.inc(metadata.size);
-                let apply_meta = Message::ApplyMetadata { path: p, metadata };
-                framed.send(serialize_message(&apply_meta)?).await?;
-                return Ok(());
-            }
-            _ => anyhow::bail!("Unexpected message: {msg:?}"),
-        }
-    }
-
-    anyhow::bail!("Connection closed unexpectedly")
+enum SyncTask {
+    Dir {
+        path: String,
+        metadata: FileMetadata,
+    },
+    Symlink {
+        path: String,
+        target: String,
+        metadata: FileMetadata,
+    },
+    File {
+        path: String,
+    },
 }
 
 async fn sync_remote_dir<T>(
@@ -745,70 +560,224 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     use ignore::WalkBuilder;
-    use ignore::overrides::OverrideBuilder;
+    let (tx, mut rx) = mpsc::channel(128);
+    let src_root_owned = src_root.to_path_buf();
+    let current_dir_owned = current_dir.to_path_buf();
+    let ignores_owned = ignores.to_vec();
 
-    let mut override_builder = OverrideBuilder::new(current_dir);
-    for pattern in ignores {
-        override_builder.add(&format!("!{pattern}"))?;
-    }
-    let overrides = override_builder.build()?;
-
-    let walker = WalkBuilder::new(current_dir)
-        .hidden(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .ignore(false)
-        .parents(false)
-        .max_depth(Some(1)) // Process level by level to mimic recursion
-        .overrides(overrides)
-        .build();
-
-    for entry in walker {
-        let entry = entry?;
-        let path = entry.path();
-        if path == current_dir {
-            continue;
+    tokio::task::spawn_blocking(move || {
+        let mut builder = WalkBuilder::new(&current_dir_owned);
+        builder.hidden(false).git_ignore(false).ignore(false);
+        for pattern in &ignores_owned {
+            let _ = builder.add_ignore(pattern);
         }
+        let walker = builder.build();
+        for entry in walker {
+            let Ok(entry) = entry else { continue };
+            let path = entry.path();
 
-        let file_type = entry
-            .file_type()
-            .ok_or_else(|| anyhow::anyhow!("unknown file type"))?;
+            // Only skip the exact root if it's a directory
+            if path == current_dir_owned && path.is_dir() {
+                continue;
+            }
 
-        if file_type.is_symlink() {
-            let target = tokio::fs::read_link(path).await?;
-            let rel_path = path.strip_prefix(src_root)?.to_string_lossy().to_string();
-            let meta = tokio::fs::symlink_metadata(path).await?;
-            let msg = Message::SyncSymlink {
-                path: rel_path,
-                target: target.to_string_lossy().to_string(),
-                metadata: FileMetadata::from(meta),
+            let Ok(rel_path) = path.strip_prefix(&src_root_owned) else {
+                // If stripping prefix fails, it's either the root file or something outside
+                if path == src_root_owned {
+                    let rel_path_str = path
+                        .file_name()
+                        .map_or_else(|| ".".to_string(), |n| n.to_string_lossy().to_string());
+                    let Ok(_meta) = entry.metadata() else {
+                        continue;
+                    };
+                    let _ = tx.blocking_send(SyncTask::File { path: rel_path_str });
+                }
+                continue;
             };
-            framed.send(serialize_message(&msg)?).await?;
-        } else if file_type.is_dir() {
-            let rel_path = path.strip_prefix(src_root)?.to_string_lossy().to_string();
-            let meta = tokio::fs::metadata(path).await?;
-            let msg = Message::SyncDir {
-                path: rel_path,
-                metadata: FileMetadata::from(meta),
-            };
-            framed.send(serialize_message(&msg)?).await?;
 
-            Box::pin(sync_remote_dir(
-                framed,
-                src_root,
+            let rel_path_str = if rel_path.as_os_str().is_empty() {
+                path.file_name()
+                    .map_or_else(|| ".".to_string(), |n| n.to_string_lossy().to_string())
+            } else {
+                rel_path.to_string_lossy().to_string()
+            };
+
+            let Ok(meta) = entry.metadata() else { continue };
+            let metadata = FileMetadata::from(meta);
+            let task = if entry.file_type().is_some_and(|ft| ft.is_symlink()) {
+                let target = std::fs::read_link(path).unwrap_or_default();
+                SyncTask::Symlink {
+                    path: rel_path_str,
+                    target: target.to_string_lossy().to_string(),
+                    metadata,
+                }
+            } else if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+                SyncTask::Dir {
+                    path: rel_path_str,
+                    metadata,
+                }
+            } else {
+                SyncTask::File { path: rel_path_str }
+            };
+            let _ = tx.blocking_send(task);
+        }
+    });
+
+    while let Some(task) = rx.recv().await {
+        match task {
+            SyncTask::Dir { path, metadata } => {
+                framed
+                    .send(serialize_message(&Message::SyncDir { path, metadata })?)
+                    .await?;
+            }
+            SyncTask::Symlink {
                 path,
-                checksum,
-                ignores,
-                Arc::clone(&pb),
-            ))
-            .await?;
-        } else if file_type.is_file() {
-            sync_remote_file(framed, src_root, path, checksum, Arc::clone(&pb)).await?;
+                target,
+                metadata,
+            } => {
+                framed
+                    .send(serialize_message(&Message::SyncSymlink {
+                        path,
+                        target,
+                        metadata,
+                    })?)
+                    .await?;
+            }
+            SyncTask::File { path } => {
+                // Determine the correct source path for reading
+                let full_src_path = if src_root.is_file() {
+                    src_root.to_path_buf()
+                } else {
+                    src_root.join(&path)
+                };
+                sync_remote_file(framed, src_root, &full_src_path, checksum, pb.clone()).await?;
+            }
         }
     }
-
     Ok(())
+}
+
+/// Sync a remote file.
+///
+/// # Errors
+///
+/// Returns an error if synchronization fails.
+#[allow(clippy::too_many_lines)]
+pub async fn sync_remote_file<T>(
+    framed: &mut Framed<T, DsyncCodec>,
+    src_root: &Path,
+    path: &Path,
+    checksum: bool,
+    pb: Arc<ProgressBar>,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let rel_path = if src_root.is_file() {
+        path.file_name()
+            .map(|n| n.to_string_lossy().to_string())
+            .unwrap_or_default()
+    } else {
+        path.strip_prefix(src_root)
+            .unwrap_or(path)
+            .to_string_lossy()
+            .to_string()
+    };
+
+    let meta = tokio::fs::metadata(path).await?;
+    let metadata = FileMetadata::from(meta);
+    pb.set_message(rel_path.clone());
+    framed
+        .send(serialize_message(&Message::SyncFile {
+            path: rel_path.clone(),
+            metadata,
+            checksum,
+        })?)
+        .await?;
+
+    while let Some(msg_result) = framed.next().await {
+        let msg_bytes = msg_result?;
+        let msg = deserialize_message(&msg_bytes)?;
+        match msg {
+            Message::RequestHashes { path: p } => {
+                let hashes = calculate_file_hashes(path).await?;
+                framed
+                    .send(serialize_message(&Message::BlockHashes {
+                        path: p,
+                        hashes,
+                    })?)
+                    .await?;
+            }
+            Message::RequestBlocks { path: p, indices } => {
+                // Calculate skipped blocks for PB accuracy
+                let num_blocks = metadata.size.div_ceil(BLOCK_SIZE);
+                let requested_count = indices.len() as u64;
+                let skipped_count = num_blocks - requested_count;
+                if skipped_count > 0 {
+                    let mut requested_bytes = 0u64;
+                    for &idx in &indices {
+                        let offset = u64::from(idx) * BLOCK_SIZE;
+                        let n = std::cmp::min(BLOCK_SIZE, metadata.size - offset);
+                        requested_bytes += n;
+                    }
+                    pb.inc(metadata.size - requested_bytes);
+                }
+
+                let batch_size = 128;
+                for chunk_indices in indices.chunks(batch_size) {
+                    let path_clone = path.to_path_buf();
+                    let chunk_indices_vec = chunk_indices.to_vec();
+                    let blocks = tokio::task::spawn_blocking(move || {
+                        let file = std::fs::File::open(&path_clone)?;
+                        let mut local_blocks = Vec::with_capacity(chunk_indices_vec.len());
+                        #[allow(clippy::cast_possible_truncation)]
+                        let mut buf = vec![0u8; BLOCK_SIZE as usize];
+                        for &idx in &chunk_indices_vec {
+                            let offset = u64::from(idx) * BLOCK_SIZE;
+                            let n = file.read_at(&mut buf, offset)?;
+                            let chunk =
+                                buf.get(..n).ok_or_else(|| anyhow::anyhow!("chunk fail"))?;
+                            local_blocks.push(Block {
+                                offset,
+                                data: chunk.to_vec(),
+                            });
+                        }
+                        Ok::<Vec<Block>, anyhow::Error>(local_blocks)
+                    })
+                    .await??;
+                    let bytes_sent: u64 = blocks.iter().map(|b| b.data.len() as u64).sum();
+                    framed
+                        .send(serialize_message(&Message::ApplyBlocks {
+                            path: p.clone(),
+                            blocks,
+                        })?)
+                        .await?;
+                    pb.inc(bytes_sent);
+                }
+                framed
+                    .send(serialize_message(&Message::ApplyMetadata {
+                        path: p.clone(),
+                        metadata,
+                    })?)
+                    .await?;
+            }
+            Message::MetadataApplied { path: _ } => {
+                return Ok(());
+            }
+            Message::EndOfFile { path: p } => {
+                pb.inc(metadata.size);
+                framed
+                    .send(serialize_message(&Message::ApplyMetadata {
+                        path: p,
+                        metadata,
+                    })?)
+                    .await?;
+                // MUST wait for acknowledgement even when skipping
+            }
+            _ => anyhow::bail!("Unexpected message: {msg:?}"),
+        }
+    }
+    anyhow::bail!("Connection closed unexpectedly")
 }
 
 async fn calculate_file_hashes(path: &Path) -> anyhow::Result<Vec<u64>> {
@@ -817,37 +786,28 @@ async fn calculate_file_hashes(path: &Path) -> anyhow::Result<Vec<u64>> {
         let file = std::fs::File::open(&path)?;
         let len = file.metadata()?.len();
         let num_blocks = len.div_ceil(BLOCK_SIZE);
-
         let concurrency = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(8);
-
         let mut hashes = vec![0u64; usize::try_from(num_blocks)?];
         #[allow(clippy::cast_possible_truncation)]
         let chunk_size = num_blocks.div_ceil(concurrency as u64);
-
         std::thread::scope(|s| {
-            // Use split_at_mut to safely give each thread its own slice of the hashes vector
             let mut remaining_hashes = &mut hashes[..];
-
             for _ in 0..concurrency {
                 #[allow(clippy::cast_possible_truncation)]
                 let current_chunk_size = std::cmp::min(chunk_size as usize, remaining_hashes.len());
                 if current_chunk_size == 0 {
                     break;
                 }
-
                 let (chunk_hashes, next_remaining) =
                     remaining_hashes.split_at_mut(current_chunk_size);
                 remaining_hashes = next_remaining;
-
                 let start_block = (num_blocks
                     - (remaining_hashes.len() as u64 + chunk_hashes.len() as u64))
                     as u64;
                 let end_block = start_block + chunk_hashes.len() as u64;
-
                 let file_ref = &file;
-
                 s.spawn(move || {
                     #[allow(clippy::cast_possible_truncation)]
                     let mut buf = vec![0u8; BLOCK_SIZE as usize];
@@ -865,7 +825,6 @@ async fn calculate_file_hashes(path: &Path) -> anyhow::Result<Vec<u64>> {
                 });
             }
         });
-
         Ok(hashes)
     })
     .await?
