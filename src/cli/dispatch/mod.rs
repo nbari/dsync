@@ -39,20 +39,27 @@ pub fn handler(matches: &clap::ArgMatches) -> Action {
             .cloned()
             .unwrap_or_default();
 
-        // Check if it's an SSH style address: user@host:/path
-        if let Some((ssh_addr, path)) = addr.split_once(':') {
-            let remote_path = if path.is_empty() {
-                ".".to_string()
-            } else {
-                path.to_string()
-            };
-            return Action::Connect {
-                addr: ssh_addr.to_string(),
-                src,
-                checksum,
-                remote_path: Some(remote_path),
-                ignores,
-            };
+        // Check if it's an SSH style address: user@host:path or host:path
+        // Heuristic: if it contains a colon and the suffix is NOT a port number, it's SSH.
+        // If there's an '@', it's always SSH.
+        if let Some((prefix, suffix)) = addr.split_once(':') {
+            let is_numeric_port = !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
+            let has_user = prefix.contains('@');
+
+            if has_user || !is_numeric_port {
+                let remote_path = if suffix.is_empty() {
+                    ".".to_string()
+                } else {
+                    suffix.to_string()
+                };
+                return Action::Connect {
+                    addr: prefix.to_string(),
+                    src,
+                    checksum,
+                    remote_path: Some(remote_path),
+                    ignores,
+                };
+            }
         }
 
         return Action::Connect {

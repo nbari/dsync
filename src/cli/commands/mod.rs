@@ -95,7 +95,8 @@ pub fn new() -> Command {
         .group(
             clap::ArgGroup::new("mode")
                 .args(["listen", "remote", "destination"])
-                .required(true),
+                .required(true)
+                .multiple(true),
         )
         .arg(
             Arg::new("threshold")

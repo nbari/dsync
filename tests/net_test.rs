@@ -1,7 +1,7 @@
-use dsync::dsync::net::{self, Block, FileMetadata, Message};
+use dsync::dsync::net::{self, Block, DsyncCodec, FileMetadata, Message};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
-use tokio_util::codec::{Framed, LengthDelimitedCodec};
+use tokio_util::codec::Framed;
 
 #[test]
 fn test_protocol_serialization() -> anyhow::Result<()> {
@@ -19,8 +19,8 @@ fn test_protocol_serialization() -> anyhow::Result<()> {
         checksum: true,
     };
 
-    let bytes = net::serialize_message(&msg);
-    let decoded = net::deserialize_message(&bytes);
+    let bytes = net::serialize_message(&msg)?;
+    let decoded = net::deserialize_message(&bytes)?;
 
     if let Message::SyncFile {
         path, metadata: m, ..
@@ -59,7 +59,7 @@ async fn test_full_network_sync_simulation() -> anyhow::Result<()> {
     let dst_root = dst_dir.clone();
     let receiver_handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.map_err(|e| anyhow::anyhow!(e))?;
-        let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
+        let mut framed = Framed::new(stream, DsyncCodec);
         net::handle_client(&mut framed, &dst_root).await
     });
 
@@ -89,8 +89,8 @@ fn test_block_serialization() -> anyhow::Result<()> {
         blocks: vec![block],
     };
 
-    let bytes = net::serialize_message(&msg);
-    let decoded = net::deserialize_message(&bytes);
+    let bytes = net::serialize_message(&msg)?;
+    let decoded = net::deserialize_message(&bytes)?;
 
     if let Message::ApplyBlocks { blocks, .. } = decoded {
         assert_eq!(blocks.len(), 1);

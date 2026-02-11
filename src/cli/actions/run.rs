@@ -12,7 +12,7 @@ use tracing::{info, instrument};
 pub async fn handle(action: Action) -> Result<()> {
     match action {
         Action::Listen { addr, dst } => {
-            println!("Listening on {addr} for incoming sync to {}", dst.display());
+            eprintln!("Listening on {addr} for incoming sync to {}", dst.display());
             crate::dsync::net::run_receiver(&addr, &dst).await?;
         }
         Action::Connect {
@@ -23,12 +23,12 @@ pub async fn handle(action: Action) -> Result<()> {
             ignores,
         } => {
             if let Some(path) = remote_path {
-                println!("Connecting via SSH to {addr} to sync to {path}");
+                eprintln!("Connecting via SSH to {addr} to sync to {path}");
                 crate::dsync::net::run_ssh_sender(&addr, &src, &path, checksum, &ignores).await?;
             } else if addr == "-" {
                 crate::dsync::net::run_stdio_sender(&src, checksum, &ignores).await?;
             } else {
-                println!(
+                eprintln!(
                     "Connecting to {addr} to sync from {} (checksum: {checksum})",
                     src.display()
                 );
@@ -54,7 +54,7 @@ pub async fn handle(action: Action) -> Result<()> {
             let src_meta = tokio::fs::metadata(&src).await?;
 
             if src_meta.is_dir() {
-                println!(
+                eprintln!(
                     "Syncing directory from {} to {}",
                     src.display(),
                     dst.display()
@@ -62,17 +62,17 @@ pub async fn handle(action: Action) -> Result<()> {
                 sync::sync_dir(&src, &dst, threshold, checksum, dry_run, &ignores).await?;
             } else {
                 if tools::should_skip_file(&src, &dst, checksum).await? {
-                    println!("File {} is already up to date.", src.display());
+                    eprintln!("File {} is already up to date.", src.display());
                     return Ok(());
                 }
 
                 if dry_run {
                     let src_size = tools::get_file_size(&src).await?;
-                    println!("(dry-run) sync file: {} ({src_size} bytes)", src.display());
+                    eprintln!("(dry-run) sync file: {} ({src_size} bytes)", src.display());
                     return Ok(());
                 }
 
-                println!(
+                eprintln!(
                     "Syncing changed blocks from {} to {}",
                     src.display(),
                     dst.display()
@@ -81,7 +81,7 @@ pub async fn handle(action: Action) -> Result<()> {
 
                 #[allow(clippy::cast_precision_loss)]
                 let percentage = (stats.updated_blocks as f64 / stats.total_blocks as f64) * 100.0;
-                println!(
+                eprintln!(
                     "Summary: {}/{} blocks updated ({percentage:.2}%)",
                     stats.updated_blocks, stats.total_blocks
                 );
@@ -89,7 +89,7 @@ pub async fn handle(action: Action) -> Result<()> {
         }
     }
 
-    println!("Synchronization complete");
+    eprintln!("Synchronization complete");
 
     Ok(())
 }

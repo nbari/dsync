@@ -36,21 +36,18 @@ fn init_tracer() -> Result<Tracer> {
 /// # Errors
 /// Will return an error if the telemetry layer fails to start
 pub fn init(verbosity_level: Option<Level>) -> Result<()> {
-    let verbosity_level = verbosity_level.unwrap_or(Level::ERROR);
-
-    let tracer = init_tracer()?;
-
-    let otel_tracer_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+    let verbosity_level = verbosity_level.unwrap_or(Level::INFO);
 
     let fmt_layer = fmt::layer()
+        .with_writer(std::io::stderr)
         .with_file(false)
         .with_line_number(false)
         .with_thread_ids(false)
         .with_thread_names(false)
         .with_target(false)
-        .pretty();
+        .without_time()
+        .compact();
 
-    // RUST_LOG=
     let filter = EnvFilter::builder()
         .with_default_directive(verbosity_level.into())
         .from_env_lossy()
@@ -58,10 +55,14 @@ pub fn init(verbosity_level: Option<Level>) -> Result<()> {
         .add_directive("tokio=error".parse()?)
         .add_directive("reqwest=error".parse()?);
 
-    let subscriber = Registry::default()
-        .with(fmt_layer)
-        .with(otel_tracer_layer)
-        .with(filter);
+    let registry = Registry::default().with(fmt_layer).with(filter);
 
-    Ok(tracing::subscriber::set_global_default(subscriber)?)
+    if let Ok(tracer) = init_tracer() {
+        let otel_tracer_layer = tracing_opentelemetry::layer().with_tracer(tracer);
+        tracing::subscriber::set_global_default(registry.with(otel_tracer_layer))?;
+    } else {
+        tracing::subscriber::set_global_default(registry)?;
+    }
+
+    Ok(())
 }

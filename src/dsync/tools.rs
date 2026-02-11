@@ -1,6 +1,20 @@
 use anyhow::Result;
+use indicatif::{ProgressBar, ProgressStyle};
 use std::{os::unix::fs::MetadataExt, path::Path};
 use tokio::{fs, io::AsyncReadExt};
+
+/// Create a standardized progress bar for dsync
+#[must_use]
+pub fn create_progress_bar(total_size: u64) -> ProgressBar {
+    let pb = ProgressBar::new(total_size);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%) {bytes_per_sec} {eta} {msg}")
+            .unwrap_or_else(|_| ProgressStyle::default_bar())
+            .progress_chars("#>-"),
+    );
+    pb
+}
 
 /// Get the size of a file
 ///

@@ -1,6 +1,6 @@
 use crate::dsync::tools;
 use filetime::{FileTime, set_file_times};
-use indicatif::{ProgressBar, ProgressStyle};
+use indicatif::ProgressBar;
 use std::{hash::Hasher, os::unix::fs::FileExt, path::Path, sync::Arc};
 use tokio::sync::Semaphore;
 use twox_hash::XxHash64;
@@ -111,14 +111,7 @@ pub async fn sync_dir(
     println!("Calculating total size for {}...", src_dir.display());
     let total_size = calculate_total_size(src_dir, ignores)?;
 
-    let pb = ProgressBar::new(total_size);
-    pb.set_style(
-        ProgressStyle::default_bar()
-            .template("{spinner:.green} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({bytes_per_sec}, {eta})")?
-            .progress_chars("#>-"),
-    );
-
-    let pb = Arc::new(pb);
+    let pb = Arc::new(tools::create_progress_bar(total_size));
 
     sync_dir_recursive(
         src_dir,
@@ -244,6 +237,7 @@ async fn sync_dir_recursive(
                     return Ok::<(), anyhow::Error>(());
                 }
 
+                pb_clone.set_message(format!("{}", src.display()));
                 sync_changed_blocks_with_pb(&src, &dst, false, pb_clone).await?;
                 apply_metadata(&src, &dst)?;
                 Ok::<(), anyhow::Error>(())
