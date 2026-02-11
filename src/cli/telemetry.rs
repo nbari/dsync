@@ -5,11 +5,19 @@ use opentelemetry_sdk::{
     Resource,
     trace::{SdkTracerProvider, Tracer},
 };
+use std::sync::OnceLock;
 use std::time::Duration;
 use tracing::Level;
 use tracing_subscriber::{EnvFilter, Registry, fmt, layer::SubscriberExt};
 
+static TRACER_PROVIDER: OnceLock<SdkTracerProvider> = OnceLock::new();
+
 fn init_tracer() -> Result<Tracer> {
+    // Only initialize OTLP if an endpoint is explicitly provided in the environment
+    if std::env::var("OTEL_EXPORTER_OTLP_ENDPOINT").is_err() {
+        return Err(anyhow::anyhow!("No OTLP endpoint configured"));
+    }
+
     let tracer_provider = SdkTracerProvider::builder()
         .with_batch_exporter(
             opentelemetry_otlp::SpanExporter::builder()
@@ -28,8 +36,12 @@ fn init_tracer() -> Result<Tracer> {
         .build();
 
     global::set_tracer_provider(tracer_provider.clone());
+    let tracer = tracer_provider.tracer(env!("CARGO_PKG_NAME"));
 
-    Ok(tracer_provider.tracer(env!("CARGO_PKG_NAME")))
+    // Store the provider for later shutdown
+    let _ = TRACER_PROVIDER.set(tracer_provider);
+
+    Ok(tracer)
 }
 
 /// Start the telemetry layer
@@ -45,6 +57,7 @@ pub fn init(verbosity_level: Option<Level>) -> Result<()> {
         .with_thread_ids(false)
         .with_thread_names(false)
         .with_target(false)
+        .with_level(false) // Hide "INFO" prefix
         .without_time()
         .compact();
 
@@ -65,4 +78,11 @@ pub fn init(verbosity_level: Option<Level>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Shutdown the telemetry layer
+pub fn shutdown() {
+    if let Some(provider) = TRACER_PROVIDER.get() {
+        let _ = provider.shutdown();
+    }
 }

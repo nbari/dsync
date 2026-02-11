@@ -16,5 +16,7 @@ async fn main() -> Result<()> {
         }
     }
 
+    dsync::cli::telemetry::shutdown();
+
     Ok(())
 }

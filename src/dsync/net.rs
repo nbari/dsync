@@ -540,10 +540,11 @@ pub async fn run_ssh_sender(
         .take()
         .ok_or_else(|| anyhow::anyhow!("failed to open stdout"))?;
 
-    let combined = tokio::io::join(stdout, stdin);
-    let mut framed = Framed::new(combined, DsyncCodec);
-
-    sender_loop(&mut framed, src_root, checksum, ignores, Arc::clone(&pb)).await?;
+    {
+        let combined = tokio::io::join(stdout, stdin);
+        let mut framed = Framed::new(combined, DsyncCodec);
+        sender_loop(&mut framed, src_root, checksum, ignores, Arc::clone(&pb)).await?;
+    }
 
     let status = child.wait().await?;
     if !status.success() {
