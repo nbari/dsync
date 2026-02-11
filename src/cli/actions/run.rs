@@ -20,18 +20,19 @@ pub async fn handle(action: Action) -> Result<()> {
             src,
             checksum,
             remote_path,
+            ignores,
         } => {
             if let Some(path) = remote_path {
                 println!("Connecting via SSH to {addr} to sync to {path}");
-                crate::dsync::net::run_ssh_sender(&addr, &src, &path, checksum).await?;
+                crate::dsync::net::run_ssh_sender(&addr, &src, &path, checksum, &ignores).await?;
             } else if addr == "-" {
-                crate::dsync::net::run_stdio_sender(&src, checksum).await?;
+                crate::dsync::net::run_stdio_sender(&src, checksum, &ignores).await?;
             } else {
                 println!(
                     "Connecting to {addr} to sync from {} (checksum: {checksum})",
                     src.display()
                 );
-                crate::dsync::net::run_sender(&addr, &src, checksum).await?;
+                crate::dsync::net::run_sender(&addr, &src, checksum, &ignores).await?;
             }
         }
         Action::Stdio { dst } => {
@@ -43,10 +44,11 @@ pub async fn handle(action: Action) -> Result<()> {
             threshold,
             checksum,
             dry_run,
+            ignores,
         } => {
             info!(
-                "src: {:?}, dst: {:?}, threshold: {:?}, checksum: {checksum}, dry_run: {dry_run}",
-                &src, &dst, threshold
+                "src: {:?}, dst: {:?}, threshold: {:?}, checksum: {checksum}, dry_run: {dry_run}, ignores: {:?}",
+                &src, &dst, threshold, ignores
             );
 
             let src_meta = tokio::fs::metadata(&src).await?;
@@ -57,7 +59,7 @@ pub async fn handle(action: Action) -> Result<()> {
                     src.display(),
                     dst.display()
                 );
-                sync::sync_dir(&src, &dst, threshold, checksum, dry_run).await?;
+                sync::sync_dir(&src, &dst, threshold, checksum, dry_run, &ignores).await?;
             } else {
                 if tools::should_skip_file(&src, &dst, checksum).await? {
                     println!("File {} is already up to date.", src.display());

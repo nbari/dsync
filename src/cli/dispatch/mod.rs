@@ -4,6 +4,23 @@ use std::path::PathBuf;
 pub fn handler(matches: &clap::ArgMatches) -> Action {
     let checksum = matches.get_flag("checksum");
     let dry_run = matches.get_flag("dry_run");
+    let mut ignores: Vec<String> = matches
+        .get_many::<String>("ignore")
+        .unwrap_or_default()
+        .cloned()
+        .collect();
+
+    // Read additional patterns from file if provided
+    if let Some(file_path) = matches.get_one::<PathBuf>("exclude_from")
+        && let Ok(content) = std::fs::read_to_string(file_path)
+    {
+        for line in content.lines() {
+            let trimmed = line.trim();
+            if !trimmed.is_empty() && !trimmed.starts_with('#') {
+                ignores.push(trimmed.to_string());
+            }
+        }
+    }
 
     if let Some(addr) = matches.get_one::<String>("listen") {
         let dst = matches
@@ -29,6 +46,7 @@ pub fn handler(matches: &clap::ArgMatches) -> Action {
                 src,
                 checksum,
                 remote_path: Some(path.to_string()),
+                ignores,
             };
         }
 
@@ -37,6 +55,7 @@ pub fn handler(matches: &clap::ArgMatches) -> Action {
             src,
             checksum,
             remote_path: None,
+            ignores,
         };
     }
 
@@ -64,5 +83,6 @@ pub fn handler(matches: &clap::ArgMatches) -> Action {
         threshold,
         checksum,
         dry_run,
+        ignores,
     }
 }

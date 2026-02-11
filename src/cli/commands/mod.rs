@@ -163,4 +163,20 @@ pub fn new() -> Command {
                 .action(ArgAction::SetTrue)
                 .conflicts_with_all(["listen", "remote"]),
         )
+        .arg(
+            Arg::new("ignore")
+                .short('i')
+                .long("ignore")
+                .help("Ignore files/directories matching this pattern (glob)")
+                .action(ArgAction::Append)
+                .value_name("PATTERN"),
+        )
+        .arg(
+            Arg::new("exclude_from")
+                .short('E')
+                .long("exclude-from")
+                .help("Read exclude patterns from FILE")
+                .value_name("FILE")
+                .value_parser(validator_path_exists()),
+        )
 }

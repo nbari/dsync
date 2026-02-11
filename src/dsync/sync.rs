@@ -1,4 +1,5 @@
 use crate::dsync::tools;
+use filetime::{FileTime, set_file_times};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::{hash::Hasher, os::unix::fs::FileExt, path::Path, sync::Arc};
 use tokio::sync::Semaphore;
@@ -10,6 +11,38 @@ const BLOCK_SIZE: usize = 64 * 1024;
 pub struct SyncStats {
     pub total_blocks: usize,
     pub updated_blocks: usize,
+}
+
+/// Apply metadata (mode, uid, gid, mtime) from src to dst
+///
+/// # Errors
+///
+/// Returns an error if any attribute fails to be applied.
+pub fn apply_metadata(src: &Path, dst: &Path) -> anyhow::Result<()> {
+    let meta = std::fs::metadata(src)?;
+    let permissions = meta.permissions();
+    std::fs::set_permissions(dst, permissions)?;
+
+    // Set ownership if running as root
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        let uid = meta.uid();
+        let gid = meta.gid();
+        // Ignoring errors for chown if not root
+        let _ = nix::unistd::chown(
+            dst,
+            Some(nix::unistd::Uid::from_raw(uid)),
+            Some(nix::unistd::Gid::from_raw(gid)),
+        );
+    }
+
+    // Set mtime
+    let mtime = FileTime::from_last_modification_time(&meta);
+    let atime = FileTime::from_last_access_time(&meta);
+    set_file_times(dst, atime, mtime)?;
+
+    Ok(())
 }
 
 /// Fast hash a block of data.
@@ -29,15 +62,34 @@ pub fn fast_hash_block(data: &[u8]) -> u64 {
 /// # Errors
 ///
 /// Returns an error if any IO operation fails.
-pub async fn calculate_total_size(path: &Path) -> std::io::Result<u64> {
+pub fn calculate_total_size(path: &Path, ignores: &[String]) -> std::io::Result<u64> {
+    use ignore::WalkBuilder;
+    use ignore::overrides::OverrideBuilder;
+
+    let mut override_builder = OverrideBuilder::new(path);
+    for pattern in ignores {
+        override_builder
+            .add(&format!("!{pattern}"))
+            .map_err(std::io::Error::other)?;
+    }
+    let overrides = override_builder.build().map_err(std::io::Error::other)?;
+
+    let walker = WalkBuilder::new(path)
+        .hidden(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false)
+        .overrides(overrides)
+        .build();
+
     let mut total = 0;
-    let mut entries = tokio::fs::read_dir(path).await?;
-    while let Some(entry) = entries.next_entry().await? {
-        let file_type = entry.file_type().await?;
-        if file_type.is_dir() {
-            total += Box::pin(calculate_total_size(&entry.path())).await?;
-        } else {
-            total += entry.metadata().await?.len();
+    for entry in walker {
+        let entry = entry.map_err(std::io::Error::other)?;
+        if entry.file_type().is_some_and(|ft| ft.is_file()) {
+            let meta = entry.metadata().map_err(std::io::Error::other)?;
+            total += meta.len();
         }
     }
     Ok(total)
@@ -54,9 +106,10 @@ pub async fn sync_dir(
     threshold: f32,
     checksum: bool,
     dry_run: bool,
+    ignores: &[String],
 ) -> anyhow::Result<()> {
-    println!("Calculating total size...");
-    let total_size = calculate_total_size(src_dir).await?;
+    println!("Calculating total size for {}...", src_dir.display());
+    let total_size = calculate_total_size(src_dir, ignores)?;
 
     let pb = ProgressBar::new(total_size);
     pb.set_style(
@@ -73,6 +126,7 @@ pub async fn sync_dir(
         threshold,
         checksum,
         dry_run,
+        ignores,
         Arc::clone(&pb),
     )
     .await?;
@@ -81,14 +135,20 @@ pub async fn sync_dir(
     Ok(())
 }
 
+#[allow(clippy::too_many_lines)]
 async fn sync_dir_recursive(
     src_dir: &Path,
     dst_dir: &Path,
-    threshold: f32,
+    _threshold: f32,
     checksum: bool,
     dry_run: bool,
+    ignores: &[String],
     pb: Arc<ProgressBar>,
 ) -> anyhow::Result<()> {
+    use ignore::WalkBuilder;
+    use ignore::overrides::OverrideBuilder;
+
+    // 1. Create destination root if it doesn't exist
     if !dst_dir.exists() {
         if dry_run {
             println!("(dry-run) create directory: {}", dst_dir.display());
@@ -97,7 +157,6 @@ async fn sync_dir_recursive(
         }
     }
 
-    let mut entries = tokio::fs::read_dir(src_dir).await?;
     let semaphore = Arc::new(Semaphore::new(
         std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
@@ -106,22 +165,63 @@ async fn sync_dir_recursive(
 
     let mut tasks = Vec::new();
 
-    while let Some(entry) = entries.next_entry().await? {
-        let src_path = entry.path();
-        let relative_path = src_path.strip_prefix(src_dir)?;
-        let dst_path = dst_dir.join(relative_path);
+    // Configure overrides for ignores
+    let mut override_builder = OverrideBuilder::new(src_dir);
+    for pattern in ignores {
+        override_builder.add(&format!("!{pattern}"))?;
+    }
+    let overrides = override_builder.build()?;
 
-        let file_type = entry.file_type().await?;
+    // We use WalkBuilder to handle all files and directories
+    let walker = WalkBuilder::new(src_dir)
+        .hidden(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false)
+        .overrides(overrides.clone())
+        .build();
+
+    for entry in walker {
+        let entry = entry?;
+        let src_path = entry.path();
+        if src_path == src_dir {
+            continue;
+        }
+
+        let rel_path = src_path.strip_prefix(src_dir)?;
+        let dst_path = dst_dir.join(rel_path);
+        let file_type = entry
+            .file_type()
+            .ok_or_else(|| anyhow::anyhow!("unknown file type"))?;
 
         if file_type.is_dir() {
-            let pb_clone = Arc::clone(&pb);
-            Box::pin(sync_dir_recursive(
-                &src_path, &dst_path, threshold, checksum, dry_run, pb_clone,
-            ))
-            .await?;
+            if !dst_path.exists() {
+                if dry_run {
+                    println!("(dry-run) create directory: {}", dst_path.display());
+                } else {
+                    tokio::fs::create_dir_all(&dst_path).await?;
+                }
+            }
+        } else if file_type.is_symlink() {
+            let target = tokio::fs::read_link(src_path).await?;
+            if dry_run {
+                println!(
+                    "(dry-run) symlink {} -> {}",
+                    dst_path.display(),
+                    target.display()
+                );
+            } else {
+                if dst_path.exists() {
+                    tokio::fs::remove_file(&dst_path).await?;
+                }
+                tokio::fs::symlink(&target, &dst_path).await?;
+                apply_metadata(src_path, &dst_path)?;
+            }
         } else if file_type.is_file() {
             let sem = Arc::clone(&semaphore);
-            let src = src_path.clone();
+            let src = src_path.to_path_buf();
             let dst = dst_path.clone();
             let pb_clone = Arc::clone(&pb);
 
@@ -139,16 +239,13 @@ async fn sync_dir_recursive(
 
                 if dry_run {
                     let src_size = tools::get_file_size(&src).await?;
-                    println!(
-                        "(dry-run) sync file: {} ({} bytes)",
-                        src.display(),
-                        src_size
-                    );
+                    println!("(dry-run) sync file: {} ({src_size} bytes)", src.display());
                     pb_clone.inc(src_size);
                     return Ok::<(), anyhow::Error>(());
                 }
 
                 sync_changed_blocks_with_pb(&src, &dst, false, pb_clone).await?;
+                apply_metadata(&src, &dst)?;
                 Ok::<(), anyhow::Error>(())
             }));
         }
@@ -156,6 +253,32 @@ async fn sync_dir_recursive(
 
     for task in tasks {
         task.await??;
+    }
+
+    // Final pass: Apply metadata to all entries (directories, files, etc)
+    let walker = WalkBuilder::new(src_dir)
+        .hidden(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false)
+        .overrides(overrides)
+        .build();
+
+    if !dry_run {
+        // Collect directories to apply them bottom-up
+        let mut all_entries = Vec::new();
+        for entry in walker {
+            all_entries.push(entry?.path().to_path_buf());
+        }
+
+        // Apply metadata from deepest to shallowest
+        for src_path in all_entries.iter().rev() {
+            let rel_path = src_path.strip_prefix(src_dir)?;
+            let dst_path = dst_dir.join(rel_path);
+            apply_metadata(src_path, &dst_path)?;
+        }
     }
 
     Ok(())
@@ -196,7 +319,7 @@ pub async fn sync_changed_blocks_with_pb(
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut handles = Vec::new();
-    let chunk_size = 1024 * 1024; // 1MB chunks for parallel processing
+    let chunk_size: u64 = 1024 * 1024; // 1MB chunks for parallel processing
 
     let num_chunks = src_len.div_ceil(chunk_size);
 
@@ -290,5 +413,7 @@ pub async fn sync_changed_blocks(
     full_copy: bool,
 ) -> anyhow::Result<SyncStats> {
     let pb = Arc::new(ProgressBar::hidden());
-    sync_changed_blocks_with_pb(src_path, dst_path, full_copy, pb).await
+    let stats = sync_changed_blocks_with_pb(src_path, dst_path, full_copy, pb).await?;
+    apply_metadata(src_path, dst_path)?;
+    Ok(stats)
 }

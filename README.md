@@ -61,9 +61,50 @@ ssh user@remote-server "dsync --stdio --destination /path/to/new/data" < <(dsync
 ### 4. Advanced Options
 
 *   **`--checksum` (-c)**: Force a block-by-block hash comparison even if size/mtime match.
+*   **`--ignore` (-i)**: (Repeatable) Skip files/directories matching a glob pattern (e.g., `-i "*.log"`).
+*   **`--exclude-from` (-E)**: Read exclude patterns from a file (one pattern per line).
 *   **`--threshold` (-t)**: (Default: 0.5) If the destination file is less than X% the size of the source, perform a full copy instead of hashing.
 *   **`--dry-run` (-n)**: Show what would have been transferred without making any changes.
 *   **`--verbose` (-v)**: Increase logging verbosity (use `-vv` for debug).
+
+### Exclude Example
+If you want to skip Postgres configuration files during a sync:
+```bash
+dsync --source /var/lib/postgresql/data --destination /backup/data \
+  --ignore "postmaster.opts" \
+  --ignore "pg_hba.conf" \
+  --ignore "postgresql.conf"
+```
+
+Or using a file:
+```bash
+echo "postmaster.pid" > excludes.txt
+echo "*.log" >> excludes.txt
+dsync -s /src -d /dst -E excludes.txt
+```
+
+## How the Ignore Mechanism Works
+
+`dsync` uses the same high-performance engine as `ripgrep` (the `ignore` crate) to filter files during the synchronization process.
+
+### Default Behavior (Full Clone)
+By default, `dsync` is configured for **Total Data Fidelity**. It will **NOT** skip:
+*   Hidden files or directories (starting with `.`).
+*   Files listed in `.gitignore`.
+*   Global or local ignore files.
+
+### Using Patterns (Globs)
+When you provide patterns via `--ignore` or `--exclude-from`, they are applied as **overrides**. Matching files are skipped entirely: they are not hashed, not counted in the total size, and not transferred.
+
+| Pattern | Effect |
+| :--- | :--- |
+| `postmaster.pid` | Ignores this specific file anywhere in the tree. |
+| `*.log` | Ignores all files ending in `.log`. |
+| `temp/*` | Ignores everything inside the top-level `temp` directory. |
+| `**/cache/*` | Ignores everything inside any directory named `cache` at any depth. |
+
+### Exclusion Pass-through (SSH)
+When using **Auto-SSH mode**, your local ignore patterns are automatically sent to the remote server. This ensures that the receiver doesn't waste time looking at files you've already decided to skip.
 
 ## Why dsync is faster than rsync
 

@@ -1,5 +1,6 @@
 use crate::dsync::sync;
 use bytes::Bytes;
+use filetime::FileTime;
 use futures_util::{SinkExt, StreamExt};
 use rkyv::{
     api::high::to_bytes_in,
@@ -7,8 +8,10 @@ use rkyv::{
     {Archive, Deserialize, Serialize},
 };
 use std::{
+    fmt::Write as _,
     os::unix::fs::{FileExt, MetadataExt},
     path::Path,
+    process::Stdio,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -19,6 +22,29 @@ use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 const BLOCK_SIZE: u64 = 64 * 1024;
 
+#[derive(Archive, Deserialize, Serialize, Debug, Clone, Copy)]
+pub struct FileMetadata {
+    pub size: u64,
+    pub mtime: i64,
+    pub mtime_nsec: u32,
+    pub mode: u32,
+    pub uid: u32,
+    pub gid: u32,
+}
+
+impl From<std::fs::Metadata> for FileMetadata {
+    fn from(meta: std::fs::Metadata) -> Self {
+        Self {
+            size: meta.len(),
+            mtime: meta.mtime(),
+            mtime_nsec: u32::try_from(meta.mtime_nsec()).unwrap_or(0),
+            mode: meta.mode(),
+            uid: meta.uid(),
+            gid: meta.gid(),
+        }
+    }
+}
+
 #[derive(Archive, Deserialize, Serialize, Debug)]
 pub enum Message {
     Handshake {
@@ -26,11 +52,16 @@ pub enum Message {
     },
     SyncDir {
         path: String,
+        metadata: FileMetadata,
+    },
+    SyncSymlink {
+        path: String,
+        target: String,
+        metadata: FileMetadata,
     },
     SyncFile {
         path: String,
-        size: u64,
-        mtime: i64,
+        metadata: FileMetadata,
         checksum: bool,
     },
     RequestHashes {
@@ -43,6 +74,10 @@ pub enum Message {
     ApplyBlocks {
         path: String,
         blocks: Vec<Block>,
+    },
+    ApplyMetadata {
+        path: String,
+        metadata: FileMetadata,
     },
     EndOfFile {
         path: String,
@@ -86,6 +121,33 @@ pub fn deserialize_message(bytes: &[u8]) -> Message {
     #[allow(clippy::expect_used)]
     rkyv::from_bytes::<Message, rkyv::rancor::Error>(&aligned)
         .expect("failed to deserialize message")
+}
+
+/// Apply metadata to a local path.
+///
+/// # Errors
+///
+/// Returns an error if any attribute fails to be applied.
+pub fn apply_file_metadata(path: &Path, metadata: &FileMetadata) -> anyhow::Result<()> {
+    use std::fs::Permissions;
+    use std::os::unix::fs::PermissionsExt;
+
+    // Set permissions
+    std::fs::set_permissions(path, Permissions::from_mode(metadata.mode))?;
+
+    // Set ownership
+    let _ = nix::unistd::chown(
+        path,
+        Some(nix::unistd::Uid::from_raw(metadata.uid)),
+        Some(nix::unistd::Gid::from_raw(metadata.gid)),
+    );
+
+    // Set times
+    let mtime = FileTime::from_unix_time(metadata.mtime, metadata.mtime_nsec);
+    // Use same for atime
+    filetime::set_file_times(path, mtime, mtime)?;
+
+    Ok(())
 }
 
 /// Run the receiver to handle incoming sync connections.
@@ -151,26 +213,47 @@ where
                 };
                 framed.send(Bytes::from(serialize_message(&resp))).await?;
             }
+            Message::SyncDir { path, metadata } => {
+                let full_path = dst_root.join(&path);
+                if !full_path.exists() {
+                    tokio::fs::create_dir_all(&full_path).await?;
+                }
+                apply_file_metadata(&full_path, &metadata)?;
+            }
+            Message::SyncSymlink {
+                path,
+                target,
+                metadata,
+            } => {
+                let full_path = dst_root.join(&path);
+                if full_path.exists() {
+                    tokio::fs::remove_file(&full_path).await?;
+                }
+                tokio::fs::symlink(target, &full_path).await?;
+                apply_file_metadata(&full_path, &metadata)?;
+            }
             Message::SyncFile {
                 path,
-                size,
-                mtime: _,
+                metadata,
                 checksum,
             } => {
                 let full_path = dst_root.join(&path);
                 if full_path.exists() {
                     let meta = tokio::fs::metadata(&full_path).await?;
-                    if meta.len() == size && !checksum {
-                        framed
-                            .send(Bytes::from(serialize_message(&Message::EndOfFile { path })))
-                            .await?;
-                    } else {
-                        framed
-                            .send(Bytes::from(serialize_message(&Message::RequestHashes {
-                                path,
-                            })))
-                            .await?;
+                    if meta.len() == metadata.size && !checksum {
+                        // Check mtime too
+                        if meta.mtime() == metadata.mtime {
+                            framed
+                                .send(Bytes::from(serialize_message(&Message::EndOfFile { path })))
+                                .await?;
+                            continue;
+                        }
                     }
+                    framed
+                        .send(Bytes::from(serialize_message(&Message::RequestHashes {
+                            path,
+                        })))
+                        .await?;
                 } else {
                     if let Some(parent) = full_path.parent() {
                         tokio::fs::create_dir_all(parent).await?;
@@ -245,8 +328,17 @@ where
                     file.write_all_at(&block.data, block.offset)?;
                 }
             }
+            Message::ApplyMetadata { path, metadata } => {
+                let full_path = dst_root.join(&path);
+                apply_file_metadata(&full_path, &metadata)?;
+            }
             Message::EndOfFile { path: _ } => {
-                // Done with file
+                // Here we might want to apply metadata after the file is fully received
+                // but SyncFile metadata is already sent.
+                // We'll trust the sender sends metadata in SyncFile.
+                // For safety, let's have the sender send metadata again or ensure receiver stores it.
+                // Actually, let's just make the receiver apply metadata when it gets EndOfFile if we stored it.
+                // For now, let's just ensure the sender sends it and we apply it.
             }
             _ => {
                 eprintln!("Unhandled message: {msg:?}");
@@ -261,10 +353,15 @@ where
 /// # Errors
 ///
 /// Returns an error if the connection fails or synchronization fails.
-pub async fn run_sender(addr: &str, src_root: &Path, checksum: bool) -> anyhow::Result<()> {
+pub async fn run_sender(
+    addr: &str,
+    src_root: &Path,
+    checksum: bool,
+    ignores: &[String],
+) -> anyhow::Result<()> {
     let stream = TcpStream::connect(addr).await?;
     let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
-    sender_loop(&mut framed, src_root, checksum).await
+    sender_loop(&mut framed, src_root, checksum, ignores).await
 }
 
 /// Run the sender using stdin/stdout (for manual piping)
@@ -272,12 +369,16 @@ pub async fn run_sender(addr: &str, src_root: &Path, checksum: bool) -> anyhow::
 /// # Errors
 ///
 /// Returns an error if synchronization fails.
-pub async fn run_stdio_sender(src_root: &Path, checksum: bool) -> anyhow::Result<()> {
+pub async fn run_stdio_sender(
+    src_root: &Path,
+    checksum: bool,
+    ignores: &[String],
+) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let combined = tokio::io::join(stdin, stdout);
     let mut framed = Framed::new(combined, LengthDelimitedCodec::new());
-    sender_loop(&mut framed, src_root, checksum).await
+    sender_loop(&mut framed, src_root, checksum, ignores).await
 }
 
 /// Run the sender over an SSH tunnel
@@ -290,12 +391,18 @@ pub async fn run_ssh_sender(
     src_root: &Path,
     dst_path: &str,
     checksum: bool,
+    ignores: &[String],
 ) -> anyhow::Result<()> {
-    use std::process::Stdio;
+    let mut cmd = Command::new("ssh");
+    cmd.arg(addr);
 
-    let mut child = Command::new("ssh")
-        .arg(addr)
-        .arg(format!("dsync --stdio --destination {dst_path}"))
+    let mut remote_cmd = format!("dsync --stdio --destination {dst_path}");
+    for pattern in ignores {
+        let _ = write!(remote_cmd, " --ignore '{pattern}'");
+    }
+
+    let mut child = cmd
+        .arg(remote_cmd)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .spawn()?;
@@ -312,7 +419,7 @@ pub async fn run_ssh_sender(
     let combined = tokio::io::join(stdout, stdin);
     let mut framed = Framed::new(combined, LengthDelimitedCodec::new());
 
-    sender_loop(&mut framed, src_root, checksum).await?;
+    sender_loop(&mut framed, src_root, checksum, ignores).await?;
 
     let status = child.wait().await?;
     if !status.success() {
@@ -326,6 +433,7 @@ async fn sender_loop<T>(
     framed: &mut Framed<T, LengthDelimitedCodec>,
     src_root: &Path,
     checksum: bool,
+    ignores: &[String],
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -348,7 +456,7 @@ where
 
     let meta = tokio::fs::metadata(src_root).await?;
     if meta.is_dir() {
-        sync_remote_dir(framed, src_root, src_root, checksum).await?;
+        sync_remote_dir(framed, src_root, src_root, checksum, ignores).await?;
     } else {
         sync_remote_file(
             framed,
@@ -384,11 +492,11 @@ where
             .to_string();
     }
     let meta = tokio::fs::metadata(path).await?;
+    let metadata = FileMetadata::from(meta);
 
     let sync_msg = Message::SyncFile {
         path: relative_path.clone(),
-        size: meta.len(),
-        mtime: meta.mtime(),
+        metadata,
         checksum,
     };
 
@@ -450,11 +558,25 @@ where
                     framed.send(Bytes::from(serialize_message(&apply))).await?;
                 }
 
+                // Send final metadata to reset mtime
+                let apply_meta = Message::ApplyMetadata {
+                    path: p.clone(),
+                    metadata,
+                };
+                framed
+                    .send(Bytes::from(serialize_message(&apply_meta)))
+                    .await?;
+
                 let end = Message::EndOfFile { path: p };
                 framed.send(Bytes::from(serialize_message(&end))).await?;
                 return Ok(());
             }
-            Message::EndOfFile { path: _ } => {
+            Message::EndOfFile { path: p } => {
+                // Receiver says it's already up to date, but we still want to match mtime/mode
+                let apply_meta = Message::ApplyMetadata { path: p, metadata };
+                framed
+                    .send(Bytes::from(serialize_message(&apply_meta)))
+                    .await?;
                 return Ok(());
             }
             _ => anyhow::bail!("Unexpected message: {msg:?}"),
@@ -469,20 +591,64 @@ async fn sync_remote_dir<T>(
     src_root: &Path,
     current_dir: &Path,
     checksum: bool,
+    ignores: &[String],
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let mut entries = tokio::fs::read_dir(current_dir).await?;
+    use ignore::WalkBuilder;
+    use ignore::overrides::OverrideBuilder;
 
-    while let Some(entry) = entries.next_entry().await? {
+    let mut override_builder = OverrideBuilder::new(current_dir);
+    for pattern in ignores {
+        override_builder.add(&format!("!{pattern}"))?;
+    }
+    let overrides = override_builder.build()?;
+
+    let walker = WalkBuilder::new(current_dir)
+        .hidden(false)
+        .git_ignore(false)
+        .git_global(false)
+        .git_exclude(false)
+        .ignore(false)
+        .parents(false)
+        .max_depth(Some(1)) // Process level by level to mimic recursion
+        .overrides(overrides)
+        .build();
+
+    for entry in walker {
+        let entry = entry?;
         let path = entry.path();
-        let file_type = entry.file_type().await?;
+        if path == current_dir {
+            continue;
+        }
 
-        if file_type.is_dir() {
-            Box::pin(sync_remote_dir(framed, src_root, &path, checksum)).await?;
+        let file_type = entry
+            .file_type()
+            .ok_or_else(|| anyhow::anyhow!("unknown file type"))?;
+
+        if file_type.is_symlink() {
+            let target = tokio::fs::read_link(path).await?;
+            let rel_path = path.strip_prefix(src_root)?.to_string_lossy().to_string();
+            let meta = tokio::fs::symlink_metadata(path).await?;
+            let msg = Message::SyncSymlink {
+                path: rel_path,
+                target: target.to_string_lossy().to_string(),
+                metadata: FileMetadata::from(meta),
+            };
+            framed.send(Bytes::from(serialize_message(&msg))).await?;
+        } else if file_type.is_dir() {
+            let rel_path = path.strip_prefix(src_root)?.to_string_lossy().to_string();
+            let meta = tokio::fs::metadata(path).await?;
+            let msg = Message::SyncDir {
+                path: rel_path,
+                metadata: FileMetadata::from(meta),
+            };
+            framed.send(Bytes::from(serialize_message(&msg))).await?;
+
+            Box::pin(sync_remote_dir(framed, src_root, path, checksum, ignores)).await?;
         } else if file_type.is_file() {
-            sync_remote_file(framed, src_root, &path, checksum).await?;
+            sync_remote_file(framed, src_root, path, checksum).await?;
         }
     }
 

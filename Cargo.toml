@@ -45,8 +45,11 @@ blake3 = "1.8.3"
 bytes = "1.11.1"
 chrono = "0.4"
 clap = { version = "4.5", features = ["env"] }
+filetime = "0.2.27"
 futures-util = "0.3.31"
+ignore = "0.4.25"
 indicatif = "0.18.3"
+nix = { version = "0.31.1", features = ["fs", "user"] }
 opentelemetry = "0.30"
 opentelemetry-otlp = { version = "0.30", features = ["grpc-tonic", "tls"] }
 opentelemetry_sdk = { version = "0.30", features = ["rt-tokio"] }

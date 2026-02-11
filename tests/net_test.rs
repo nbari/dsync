@@ -1,23 +1,33 @@
-use dsync::dsync::net::{self, Block, Message};
+use dsync::dsync::net::{self, Block, FileMetadata, Message};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 #[test]
 fn test_protocol_serialization() -> anyhow::Result<()> {
-    let msg = Message::SyncFile {
-        path: "/var/lib/postgresql/data/base/1/12345".to_string(),
+    let metadata = FileMetadata {
         size: 1024 * 1024 * 1024,
         mtime: 1_739_276_543,
+        mtime_nsec: 0,
+        mode: 0o644,
+        uid: 1000,
+        gid: 1000,
+    };
+    let msg = Message::SyncFile {
+        path: "/var/lib/postgresql/data/base/1/12345".to_string(),
+        metadata,
         checksum: true,
     };
 
     let bytes = net::serialize_message(&msg);
     let decoded = net::deserialize_message(&bytes);
 
-    if let Message::SyncFile { path, size, .. } = decoded {
+    if let Message::SyncFile {
+        path, metadata: m, ..
+    } = decoded
+    {
         assert_eq!(path, "/var/lib/postgresql/data/base/1/12345");
-        assert_eq!(size, 1024 * 1024 * 1024);
+        assert_eq!(m.size, 1024 * 1024 * 1024);
     } else {
         anyhow::bail!("Decoded message type mismatch");
     }
@@ -54,7 +64,7 @@ async fn test_full_network_sync_simulation() -> anyhow::Result<()> {
     });
 
     // Run sender
-    net::run_sender(&addr.to_string(), &src_dir, true).await?;
+    net::run_sender(&addr.to_string(), &src_dir, true, &[]).await?;
 
     receiver_handle.await??;
 

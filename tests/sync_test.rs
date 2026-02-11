@@ -67,7 +67,7 @@ async fn test_sync_dir_recursive() -> anyhow::Result<()> {
     fs::write(src_dir.join("file1.txt"), "hello")?;
     fs::write(src_dir.join("subdir/file2.txt"), "world")?;
 
-    sync::sync_dir(&src_dir, &dst_dir, 1.0, false, false).await?;
+    sync::sync_dir(&src_dir, &dst_dir, 1.0, false, false, &[]).await?;
 
     assert!(dst_dir.join("file1.txt").exists());
     assert!(dst_dir.join("subdir/file2.txt").exists());

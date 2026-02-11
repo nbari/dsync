@@ -10,6 +10,7 @@ pub enum Action {
         threshold: f32,
         checksum: bool,
         dry_run: bool,
+        ignores: Vec<String>,
     },
     Listen {
         addr: String,
@@ -20,6 +21,7 @@ pub enum Action {
         src: PathBuf,
         checksum: bool,
         remote_path: Option<String>,
+        ignores: Vec<String>,
     },
     Stdio {
         dst: PathBuf,
