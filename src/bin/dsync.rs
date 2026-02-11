@@ -8,7 +8,10 @@ async fn main() -> Result<()> {
     let action = start()?;
 
     match action {
-        Action::Run { .. } | Action::Listen { .. } | Action::Connect { .. } => {
+        Action::Run { .. }
+        | Action::Listen { .. }
+        | Action::Connect { .. }
+        | Action::Stdio { .. } => {
             actions::run::handle(action).await?;
         }
     }

@@ -45,6 +45,7 @@ pub fn validator_parent_exist() -> ValueParser {
     })
 }
 
+#[allow(clippy::too_many_lines)]
 pub fn new() -> Command {
     let styles = Styles::styled()
         .header(AnsiColor::Yellow.on_default() | Effects::BOLD)
@@ -72,6 +73,7 @@ pub fn new() -> Command {
         .version(env!("CARGO_PKG_VERSION"))
         .color(ColorChoice::Auto)
         .styles(styles)
+        .arg_required_else_help(true)
         .arg(
             Arg::new("source")
                 .short('s')
@@ -89,6 +91,11 @@ pub fn new() -> Command {
                 .long_help("The local path to write data to. When using --listen, incoming data is stored here.")
                 .value_parser(validator_parent_exist())
                 .value_name("DST"),
+        )
+        .group(
+            clap::ArgGroup::new("mode")
+                .args(["listen", "remote", "destination"])
+                .required(true),
         )
         .arg(
             Arg::new("threshold")
@@ -135,7 +142,9 @@ pub fn new() -> Command {
                 .long("listen")
                 .help("Listen on ADDRESS:PORT for incoming sync")
                 .long_help("Starts dsync in server mode. Use with --destination to specify where files should be saved.")
-                .value_name("ADDR"),
+                .value_name("ADDR")
+                .requires("destination")
+                .conflicts_with("source"),
         )
         .arg(
             Arg::new("remote")
@@ -143,6 +152,15 @@ pub fn new() -> Command {
                 .long("remote")
                 .help("Sync to remote ADDRESS:PORT instead of local")
                 .long_help("Connects to a listening dsync instance. Use with --source to specify which files to send.")
-                .value_name("ADDR"),
+                .value_name("ADDR")
+                .requires("source")
+                .conflicts_with("destination"),
+        )
+        .arg(
+            Arg::new("stdio")
+                .long("stdio")
+                .help("Use stdin/stdout for communication (internal use for SSH)")
+                .action(ArgAction::SetTrue)
+                .conflicts_with_all(["listen", "remote"]),
         )
 }

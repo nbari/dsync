@@ -1,8 +1,7 @@
 use crate::cli::actions::Action;
 use crate::dsync::{sync, tools};
 use anyhow::Result;
-use tracing::info;
-use tracing::instrument;
+use tracing::{info, instrument};
 
 /// Handle the action
 ///
@@ -20,12 +19,23 @@ pub async fn handle(action: Action) -> Result<()> {
             addr,
             src,
             checksum,
+            remote_path,
         } => {
-            println!(
-                "Connecting to {addr} to sync from {} (checksum: {checksum})",
-                src.display()
-            );
-            crate::dsync::net::run_sender(&addr, &src, checksum).await?;
+            if let Some(path) = remote_path {
+                println!("Connecting via SSH to {addr} to sync to {path}");
+                crate::dsync::net::run_ssh_sender(&addr, &src, &path, checksum).await?;
+            } else if addr == "-" {
+                crate::dsync::net::run_stdio_sender(&src, checksum).await?;
+            } else {
+                println!(
+                    "Connecting to {addr} to sync from {} (checksum: {checksum})",
+                    src.display()
+                );
+                crate::dsync::net::run_sender(&addr, &src, checksum).await?;
+            }
+        }
+        Action::Stdio { dst } => {
+            crate::dsync::net::run_stdio_receiver(&dst).await?;
         }
         Action::Run {
             src,

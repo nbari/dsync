@@ -1,6 +1,5 @@
 use anyhow::Result;
-use std::os::unix::fs::MetadataExt;
-use std::path::Path;
+use std::{os::unix::fs::MetadataExt, path::Path};
 use tokio::{fs, io::AsyncReadExt};
 
 /// Get the size of a file

@@ -19,5 +19,9 @@ pub enum Action {
         addr: String,
         src: PathBuf,
         checksum: bool,
+        remote_path: Option<String>,
+    },
+    Stdio {
+        dst: PathBuf,
     },
 }

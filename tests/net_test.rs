@@ -1,7 +1,6 @@
-use bytes::Bytes;
 use dsync::dsync::net::{self, Block, Message};
-use futures_util::{SinkExt, StreamExt};
-use tokio::net::{TcpListener, TcpStream};
+use tempfile::tempdir;
+use tokio::net::TcpListener;
 use tokio_util::codec::{Framed, LengthDelimitedCodec};
 
 #[test]
@@ -26,61 +25,45 @@ fn test_protocol_serialization() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
-async fn test_network_handshake_simulation() -> anyhow::Result<()> {
+async fn test_full_network_sync_simulation() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    std::fs::create_dir_all(&src_dir)?;
+    std::fs::create_dir_all(&dst_dir)?;
+
+    // Create a 128KB file (2 blocks)
+    let file_path = src_dir.join("test.bin");
+    let content = (0..128 * 1024)
+        .map(|i| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let val = (i % 256) as u8;
+            val
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(&file_path, &content)?;
+
     let listener = TcpListener::bind("127.0.0.1:0").await?;
     let addr = listener.local_addr()?;
 
-    let server_task = tokio::spawn(async move {
+    let dst_root = dst_dir.clone();
+    let receiver_handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.map_err(|e| anyhow::anyhow!(e))?;
         let mut framed = Framed::new(stream, LengthDelimitedCodec::new());
-
-        // Receive Handshake
-        let bytes = framed
-            .next()
-            .await
-            .ok_or_else(|| anyhow::anyhow!("no message"))?
-            .map_err(|e| anyhow::anyhow!(e))?;
-        let msg = net::deserialize_message(&bytes);
-
-        if let Message::Handshake { version } = msg {
-            assert_eq!(version, "0.1.0");
-            // Send back confirmation or next step
-            let response = Message::Handshake {
-                version: "0.1.0".to_string(),
-            };
-            let resp_bytes = net::serialize_message(&response);
-            framed
-                .send(Bytes::from(resp_bytes))
-                .await
-                .map_err(|e| anyhow::anyhow!(e))?;
-        }
-        Ok::<(), anyhow::Error>(())
+        net::handle_client(&mut framed, &dst_root).await
     });
 
-    let client_stream = TcpStream::connect(addr).await?;
-    let mut framed = Framed::new(client_stream, LengthDelimitedCodec::new());
+    // Run sender
+    net::run_sender(&addr.to_string(), &src_dir, true).await?;
 
-    // Send Handshake
-    let handshake = Message::Handshake {
-        version: "0.1.0".to_string(),
-    };
-    let bytes = net::serialize_message(&handshake);
-    framed.send(Bytes::from(bytes)).await?;
+    receiver_handle.await??;
 
-    // Receive Response
-    let resp_bytes = framed
-        .next()
-        .await
-        .ok_or_else(|| anyhow::anyhow!("no response"))??;
-    let resp_msg = net::deserialize_message(&resp_bytes);
+    // Verify
+    let dst_file_path = dst_dir.join("test.bin");
+    assert!(dst_file_path.exists());
+    let dst_content = std::fs::read(dst_file_path)?;
+    assert_eq!(content, dst_content);
 
-    if let Message::Handshake { version } = resp_msg {
-        assert_eq!(version, "0.1.0");
-    } else {
-        anyhow::bail!("Handshake failed");
-    }
-
-    server_task.await??;
     Ok(())
 }
 
@@ -88,7 +71,7 @@ async fn test_network_handshake_simulation() -> anyhow::Result<()> {
 fn test_block_serialization() -> anyhow::Result<()> {
     let block = Block {
         offset: 5000,
-        data: vec![1, 2, 3, 4, 5],
+        data: vec![1, 2, 255, 4, 5],
     };
 
     let msg = Message::ApplyBlocks {
@@ -103,7 +86,7 @@ fn test_block_serialization() -> anyhow::Result<()> {
         assert_eq!(blocks.len(), 1);
         let first = blocks.first().ok_or_else(|| anyhow::anyhow!("no blocks"))?;
         assert_eq!(first.offset, 5000);
-        assert_eq!(first.data, vec![1, 2, 3, 4, 5]);
+        assert_eq!(first.data, vec![1, 2, 255, 4, 5]);
     } else {
         anyhow::bail!("Block message mismatch");
     }

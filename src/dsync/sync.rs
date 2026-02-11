@@ -1,9 +1,6 @@
 use crate::dsync::tools;
 use indicatif::{ProgressBar, ProgressStyle};
-use std::hash::Hasher;
-use std::os::unix::fs::FileExt;
-use std::path::Path;
-use std::sync::Arc;
+use std::{hash::Hasher, os::unix::fs::FileExt, path::Path, sync::Arc};
 use tokio::sync::Semaphore;
 use twox_hash::XxHash64;
 

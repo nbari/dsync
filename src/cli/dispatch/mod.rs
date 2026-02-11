@@ -21,11 +21,31 @@ pub fn handler(matches: &clap::ArgMatches) -> Action {
             .get_one::<PathBuf>("source")
             .cloned()
             .unwrap_or_default();
+
+        // Check if it's an SSH style address: user@host:/path
+        if let Some((ssh_addr, path)) = addr.split_once(':') {
+            return Action::Connect {
+                addr: ssh_addr.to_string(),
+                src,
+                checksum,
+                remote_path: Some(path.to_string()),
+            };
+        }
+
         return Action::Connect {
             addr: addr.clone(),
             src,
             checksum,
+            remote_path: None,
         };
+    }
+
+    if matches.get_flag("stdio") {
+        let dst = matches
+            .get_one::<PathBuf>("destination")
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from("."));
+        return Action::Stdio { dst };
     }
 
     let src = matches

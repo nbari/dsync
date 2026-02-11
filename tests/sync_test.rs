@@ -1,6 +1,8 @@
 use dsync::dsync::{sync, tools};
-use std::fs;
-use std::io::{Seek, SeekFrom, Write};
+use std::{
+    fs,
+    io::{Seek, SeekFrom, Write},
+};
 use tempfile::tempdir;
 
 #[tokio::test]
