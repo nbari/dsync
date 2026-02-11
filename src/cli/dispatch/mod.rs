@@ -41,11 +41,16 @@ pub fn handler(matches: &clap::ArgMatches) -> Action {
 
         // Check if it's an SSH style address: user@host:/path
         if let Some((ssh_addr, path)) = addr.split_once(':') {
+            let remote_path = if path.is_empty() {
+                ".".to_string()
+            } else {
+                path.to_string()
+            };
             return Action::Connect {
                 addr: ssh_addr.to_string(),
                 src,
                 checksum,
-                remote_path: Some(path.to_string()),
+                remote_path: Some(remote_path),
                 ignores,
             };
         }
