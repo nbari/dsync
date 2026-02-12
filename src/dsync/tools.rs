@@ -239,9 +239,8 @@ pub async fn calculate_file_hashes(path: &Path, block_size: u64) -> anyhow::Resu
                 let (chunk_hashes, next_remaining) =
                     remaining_hashes.split_at_mut(current_chunk_size);
                 remaining_hashes = next_remaining;
-                let start_block = (num_blocks
-                    - (remaining_hashes.len() as u64 + chunk_hashes.len() as u64))
-                    as u64;
+                let start_block =
+                    num_blocks - (remaining_hashes.len() as u64 + chunk_hashes.len() as u64);
                 let end_block = start_block + chunk_hashes.len() as u64;
                 let file_ref = &file;
 
