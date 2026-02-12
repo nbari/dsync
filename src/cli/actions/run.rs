@@ -1,37 +1,100 @@
 use crate::cli::actions::Action;
 use crate::dsync::{sync, tools};
 use anyhow::Result;
-use tracing::info;
-use tracing::instrument;
+use tracing::{info, instrument};
 
-/// Handle the create action
+/// Handle the action
+///
+/// # Errors
+///
+/// Returns an error if synchronization fails.
 #[instrument(skip(action))]
 pub async fn handle(action: Action) -> Result<()> {
-    let Action::Run {
-        src,
-        dst,
-        threshold,
-    } = action;
+    match action {
+        Action::Listen { addr, dst } => {
+            eprintln!("Listening on {addr} for incoming sync to {}", dst.display());
+            crate::dsync::net::run_receiver(&addr, &dst).await?;
+        }
+        Action::Connect {
+            addr,
+            src,
+            threshold,
+            checksum,
+            remote_path,
+            ignores,
+        } => {
+            if let Some(path) = remote_path {
+                eprintln!("Connecting via SSH to {addr} to sync to {path}");
+                crate::dsync::net::run_ssh_sender(
+                    &addr, &src, &path, threshold, checksum, &ignores,
+                )
+                .await?;
+            } else if addr == "-" {
+                crate::dsync::net::run_stdio_sender(&src, threshold, checksum, &ignores).await?;
+            } else {
+                eprintln!(
+                    "Connecting to {addr} to sync from {} (checksum: {checksum})",
+                    src.display()
+                );
+                crate::dsync::net::run_sender(&addr, &src, threshold, checksum, &ignores).await?;
+            }
+        }
+        Action::Stdio { dst } => {
+            crate::dsync::net::run_stdio_receiver(&dst).await?;
+        }
+        Action::Run {
+            src,
+            dst,
+            threshold,
+            checksum,
+            dry_run,
+            ignores,
+        } => {
+            info!(
+                "src: {:?}, dst: {:?}, threshold: {:?}, checksum: {checksum}, dry_run: {dry_run}, ignores: {:?}",
+                &src, &dst, threshold, ignores
+            );
 
-    info!(
-        "src: {:?}, dst: {:?}, threshold: {:?}",
-        &src, &dst, threshold
-    );
+            let src_meta = tokio::fs::metadata(&src).await?;
 
-    // check size of src and dst
-    let copy = tools::should_copy_file(&src, &dst, threshold).await?;
+            if src_meta.is_dir() {
+                eprintln!(
+                    "Syncing directory from {} to {}",
+                    src.display(),
+                    dst.display()
+                );
+                sync::sync_dir(&src, &dst, threshold, checksum, dry_run, &ignores).await?;
+            } else {
+                if tools::should_skip_file(&src, &dst, checksum).await? {
+                    eprintln!("File {} is already up to date.", src.display());
+                    return Ok(());
+                }
 
-    println!("Should copy file from {:?} to {:?}: {}", src, dst, copy);
+                if dry_run {
+                    let src_size = tools::get_file_size(&src).await?;
+                    eprintln!("(dry-run) sync file: {} ({src_size} bytes)", src.display());
+                    return Ok(());
+                }
 
-    // get hash of src
-    // let src_hash = tools::blake3(&src).await?;
-    // println!("Hash of source file {:?}: {}", src, src_hash);
+                eprintln!(
+                    "Syncing changed blocks from {} to {}",
+                    src.display(),
+                    dst.display()
+                );
+                let full_copy = tools::should_use_full_copy(&src, &dst, threshold).await?;
+                let stats = sync::sync_changed_blocks(&src, &dst, full_copy).await?;
 
-    if !copy {
-        println!("Syncing changed blocks from {:?} to {:?}", src, dst);
-        sync::sync_changed_blocks(&src, &dst).await?;
-        println!("File copied from {:?} to {:?}", src, dst);
+                #[allow(clippy::cast_precision_loss)]
+                let percentage = (stats.updated_blocks as f64 / stats.total_blocks as f64) * 100.0;
+                eprintln!(
+                    "Summary: {}/{} blocks updated ({percentage:.2}%)",
+                    stats.updated_blocks, stats.total_blocks
+                );
+            }
+        }
     }
+
+    eprintln!("Synchronization complete");
 
     Ok(())
 }
