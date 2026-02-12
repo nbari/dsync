@@ -19,6 +19,7 @@ pub enum Action {
     Connect {
         addr: String,
         src: PathBuf,
+        threshold: f32,
         checksum: bool,
         remote_path: Option<String>,
         ignores: Vec<String>,

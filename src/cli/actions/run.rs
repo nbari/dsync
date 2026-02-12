@@ -18,21 +18,25 @@ pub async fn handle(action: Action) -> Result<()> {
         Action::Connect {
             addr,
             src,
+            threshold,
             checksum,
             remote_path,
             ignores,
         } => {
             if let Some(path) = remote_path {
                 eprintln!("Connecting via SSH to {addr} to sync to {path}");
-                crate::dsync::net::run_ssh_sender(&addr, &src, &path, checksum, &ignores).await?;
+                crate::dsync::net::run_ssh_sender(
+                    &addr, &src, &path, threshold, checksum, &ignores,
+                )
+                .await?;
             } else if addr == "-" {
-                crate::dsync::net::run_stdio_sender(&src, checksum, &ignores).await?;
+                crate::dsync::net::run_stdio_sender(&src, threshold, checksum, &ignores).await?;
             } else {
                 eprintln!(
                     "Connecting to {addr} to sync from {} (checksum: {checksum})",
                     src.display()
                 );
-                crate::dsync::net::run_sender(&addr, &src, checksum, &ignores).await?;
+                crate::dsync::net::run_sender(&addr, &src, threshold, checksum, &ignores).await?;
             }
         }
         Action::Stdio { dst } => {
@@ -77,7 +81,8 @@ pub async fn handle(action: Action) -> Result<()> {
                     src.display(),
                     dst.display()
                 );
-                let stats = sync::sync_changed_blocks(&src, &dst, false).await?;
+                let full_copy = tools::should_use_full_copy(&src, &dst, threshold).await?;
+                let stats = sync::sync_changed_blocks(&src, &dst, full_copy).await?;
 
                 #[allow(clippy::cast_precision_loss)]
                 let percentage = (stats.updated_blocks as f64 / stats.total_blocks as f64) * 100.0;

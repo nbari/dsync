@@ -16,6 +16,7 @@ fn test_protocol_serialization() -> anyhow::Result<()> {
     let msg = Message::SyncFile {
         path: "/var/lib/postgresql/data/base/1/12345".to_string(),
         metadata,
+        threshold: 0.5,
         checksum: true,
     };
 
@@ -64,7 +65,7 @@ async fn test_full_network_sync_simulation() -> anyhow::Result<()> {
     });
 
     // Run sender
-    net::run_sender(&addr.to_string(), &src_dir, true, &[]).await?;
+    net::run_sender(&addr.to_string(), &src_dir, 0.5, true, &[]).await?;
 
     receiver_handle.await??;
 

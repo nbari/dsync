@@ -1,4 +1,5 @@
 use dsync::dsync::{sync, tools};
+use filetime::{FileTime, set_file_times};
 use std::{
     fs,
     io::{Seek, SeekFrom, Write},
@@ -92,5 +93,47 @@ async fn test_metadata_skip_logic() -> anyhow::Result<()> {
     fs::write(&src_path, "different content")?;
     let skip = tools::should_skip_file(&src_path, &dst_path, false).await?;
     assert!(!skip);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_metadata_skip_uses_nanosecond_precision() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_path = dir.path().join("src.txt");
+    let dst_path = dir.path().join("dst.txt");
+
+    fs::write(&src_path, "same content")?;
+    fs::write(&dst_path, "same content")?;
+
+    let src_time = FileTime::from_unix_time(1_700_000_000, 100);
+    let dst_time = FileTime::from_unix_time(1_700_000_000, 200);
+    set_file_times(&src_path, src_time, src_time)?;
+    set_file_times(&dst_path, dst_time, dst_time)?;
+
+    let skip = tools::should_skip_file(&src_path, &dst_path, false).await?;
+    assert!(!skip);
+
+    set_file_times(&dst_path, src_time, src_time)?;
+    let skip = tools::should_skip_file(&src_path, &dst_path, false).await?;
+    assert!(skip);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_threshold_full_copy_decision() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_path = dir.path().join("src.bin");
+    let dst_path = dir.path().join("dst.bin");
+
+    fs::write(&src_path, vec![1_u8; 1024 * 1024])?;
+    fs::write(&dst_path, vec![2_u8; 64 * 1024])?;
+
+    let full_copy = tools::should_use_full_copy(&src_path, &dst_path, 0.5).await?;
+    assert!(full_copy);
+
+    let full_copy = tools::should_use_full_copy(&src_path, &dst_path, 0.01).await?;
+    assert!(!full_copy);
+
     Ok(())
 }

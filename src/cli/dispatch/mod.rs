@@ -2,6 +2,7 @@ use crate::cli::actions::Action;
 use std::path::PathBuf;
 
 pub fn handler(matches: &clap::ArgMatches) -> Action {
+    let threshold = *matches.get_one::<f32>("threshold").unwrap_or(&0.5);
     let checksum = matches.get_flag("checksum");
     let dry_run = matches.get_flag("dry_run");
     let mut ignores: Vec<String> = matches
@@ -55,6 +56,7 @@ pub fn handler(matches: &clap::ArgMatches) -> Action {
                 return Action::Connect {
                     addr: prefix.to_string(),
                     src,
+                    threshold,
                     checksum,
                     remote_path: Some(remote_path),
                     ignores,
@@ -65,6 +67,7 @@ pub fn handler(matches: &clap::ArgMatches) -> Action {
         return Action::Connect {
             addr: addr.clone(),
             src,
+            threshold,
             checksum,
             remote_path: None,
             ignores,
@@ -87,8 +90,6 @@ pub fn handler(matches: &clap::ArgMatches) -> Action {
         .get_one::<PathBuf>("destination")
         .cloned()
         .unwrap_or_default();
-    let threshold = *matches.get_one::<f32>("threshold").unwrap_or(&0.5);
-
     Action::Run {
         src,
         dst,

@@ -132,7 +132,7 @@ pub async fn sync_dir(
 async fn sync_dir_recursive(
     src_dir: &Path,
     dst_dir: &Path,
-    _threshold: f32,
+    threshold: f32,
     checksum: bool,
     dry_run: bool,
     ignores: &[String],
@@ -238,7 +238,8 @@ async fn sync_dir_recursive(
                 }
 
                 pb_clone.set_message(format!("{}", src.display()));
-                sync_changed_blocks_with_pb(&src, &dst, false, pb_clone).await?;
+                let full_copy = tools::should_use_full_copy(&src, &dst, threshold).await?;
+                sync_changed_blocks_with_pb(&src, &dst, full_copy, pb_clone).await?;
                 apply_metadata(&src, &dst)?;
                 Ok::<(), anyhow::Error>(())
             }));
