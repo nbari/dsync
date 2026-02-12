@@ -1,6 +1,6 @@
 [package]
 name = "dsync"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 authors = ["Nicolas Embriz <nbari@tequila.io>"]
 description = "High-performance, concurrent synchronization tool for massive data transfers."
