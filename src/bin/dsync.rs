@@ -10,8 +10,11 @@ async fn main() -> Result<()> {
     match action {
         Action::Run { .. }
         | Action::Listen { .. }
+        | Action::ListenSender { .. }
         | Action::Connect { .. }
-        | Action::Stdio { .. } => {
+        | Action::Pull { .. }
+        | Action::Stdio { .. }
+        | Action::StdioSender { .. } => {
             actions::run::handle(action).await?;
         }
     }

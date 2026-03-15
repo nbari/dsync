@@ -9,11 +9,26 @@ use tracing::{info, instrument};
 ///
 /// Returns an error if synchronization fails.
 #[instrument(skip(action))]
+#[allow(clippy::too_many_lines)]
 pub async fn handle(action: Action) -> Result<()> {
     match action {
         Action::Listen { addr, dst } => {
             eprintln!("Listening on {addr} for incoming sync to {}", dst.display());
             crate::dsync::net::run_receiver(&addr, &dst).await?;
+        }
+        Action::ListenSender {
+            addr,
+            src,
+            threshold,
+            checksum,
+            ignores,
+        } => {
+            eprintln!(
+                "Listening on {addr} to serve {} (checksum: {checksum})",
+                src.display()
+            );
+            crate::dsync::net::run_sender_listener(&addr, &src, threshold, checksum, &ignores)
+                .await?;
         }
         Action::Connect {
             addr,
@@ -39,8 +54,36 @@ pub async fn handle(action: Action) -> Result<()> {
                 crate::dsync::net::run_sender(&addr, &src, threshold, checksum, &ignores).await?;
             }
         }
+        Action::Pull {
+            addr,
+            dst,
+            threshold,
+            checksum,
+            remote_path,
+            ignores,
+        } => {
+            if let Some(path) = remote_path {
+                eprintln!("Pulling via SSH from {addr}:{path} to {}", dst.display());
+                crate::dsync::net::run_ssh_receiver(
+                    &addr, &dst, &path, threshold, checksum, &ignores,
+                )
+                .await?;
+            } else {
+                eprintln!("Connecting to {addr} to pull to {}", dst.display());
+                crate::dsync::net::run_pull_client(&addr, &dst).await?;
+            }
+        }
+
         Action::Stdio { dst } => {
             crate::dsync::net::run_stdio_receiver(&dst).await?;
+        }
+        Action::StdioSender {
+            src,
+            threshold,
+            checksum,
+            ignores,
+        } => {
+            crate::dsync::net::run_stdio_sender(&src, threshold, checksum, &ignores).await?;
         }
         Action::Run {
             src,

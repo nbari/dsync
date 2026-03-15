@@ -58,7 +58,7 @@ pub fn new() -> Command {
         .long_about(
             "dsync is a multi-threaded file synchronization tool designed to saturate \
             high-speed networks (10GbE+) and utilize multi-core CPUs for hashing. \
-            It uses 64KB fixed-block chunking and XxHash64 for extremely fast comparison, \
+            It uses 128KB fixed-block chunking and XxHash64 for extremely fast comparison, \
             making it ideal for large database files like Postgres PG_DATA.\n\n\
             EXAMPLES:\n\n\
             1. Local Sync (File or Directory):\n\
@@ -67,7 +67,9 @@ pub fn new() -> Command {
                dsync --listen 0.0.0.0:8080 --destination /new/pgdata\n\n\
             3. Network Sync - Sender (Server 1):\n\
                dsync --remote 192.168.1.10:8080 --source /old/pgdata\n\n\
-            4. Force Content Verification (Checksum):\n\
+            4. Pull Mode (SSH):\n\
+               dsync --remote user@server:/data --destination ./local --pull\n\n\
+            5. Force Content Verification (Checksum):\n\
                dsync --source file.bin --destination copy.bin --checksum"
         )
         .version(env!("CARGO_PKG_VERSION"))
@@ -94,7 +96,7 @@ pub fn new() -> Command {
         )
         .group(
             clap::ArgGroup::new("mode")
-                .args(["listen", "remote", "destination"])
+                .args(["listen", "remote", "source", "destination"])
                 .required(true)
                 .multiple(true),
         )
@@ -141,20 +143,17 @@ pub fn new() -> Command {
             Arg::new("listen")
                 .short('l')
                 .long("listen")
-                .help("Listen on ADDRESS:PORT for incoming sync")
-                .long_help("Starts dsync in server mode. Use with --destination to specify where files should be saved.")
-                .value_name("ADDR")
-                .requires("destination")
-                .conflicts_with("source"),
+                .help("Listen on ADDRESS:PORT for incoming or outgoing sync")
+                .long_help("Starts dsync in server mode. If --destination is used, it receives files. If --source and --sender are used, it serves files to clients.")
+                .value_name("ADDR"),
         )
         .arg(
             Arg::new("remote")
                 .short('r')
                 .long("remote")
                 .help("Sync with remote ADDRESS:PORT or SSH path")
-                .long_help("Connects to a remote dsync instance. By default, it pushes --source to the remote. If --pull is used, it fetches from the remote to --destination.")
-                .value_name("ADDR")
-                .conflicts_with("listen"),
+                .long_help("Connects to a remote dsync instance. By default, it pushes --source. If --pull is used, it fetches data to --destination.")
+                .value_name("ADDR"),
         )
         .arg(
             Arg::new("stdio")
@@ -167,8 +166,8 @@ pub fn new() -> Command {
             Arg::new("pull")
                 .long("pull")
                 .short('P')
-                .help("Pull files from a remote SSH source")
-                .long_help("When used with --remote, it initiates a connection to fetch data from the remote path to the local --destination.")
+                .help("Pull files from a remote source")
+                .long_help("When used with --remote, it initiates a connection to fetch data from the remote source to the local --destination.")
                 .action(ArgAction::SetTrue)
                 .requires("destination")
                 .conflicts_with("source"),
@@ -176,9 +175,8 @@ pub fn new() -> Command {
         .arg(
             Arg::new("sender")
                 .long("sender")
-                .help("Run in sender mode (used internally with --stdio)")
-                .action(ArgAction::SetTrue)
-                .requires("stdio"),
+                .help("Run in sender mode (serves files to clients)")
+                .action(ArgAction::SetTrue),
         )
         .arg(
             Arg::new("ignore")

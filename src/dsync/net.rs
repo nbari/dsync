@@ -213,6 +213,52 @@ impl Encoder<AlignedVec<16>> for DsyncCodec {
     }
 }
 
+/// Run the listener in sender mode (serves files to clients)
+///
+/// # Errors
+///
+/// Returns an error if the listener fails to bind or synchronization fails.
+pub async fn run_sender_listener(
+    addr: &str,
+    src_root: &Path,
+    threshold: f32,
+    checksum: bool,
+    ignores: &[String],
+) -> anyhow::Result<()> {
+    let listener = TcpListener::bind(addr).await?;
+    eprintln!("Sender listener listening on {addr}");
+    let (tasks, total_size) = collect_sync_tasks(src_root, ignores).await?;
+
+    while let Ok((stream, peer_addr)) = listener.accept().await {
+        eprintln!("Accepted connection from {peer_addr}");
+        let src_root = src_root.to_path_buf();
+        let tasks = tasks.clone();
+        let pb = Arc::new(tools::create_progress_bar(total_size));
+
+        tokio::spawn(async move {
+            let mut framed = Framed::new(stream, DsyncCodec);
+            if let Err(e) =
+                sender_loop(&mut framed, &src_root, threshold, checksum, &tasks, pb).await
+            {
+                eprintln!("Error serving client {peer_addr}: {e}");
+            }
+            eprintln!("Served client {peer_addr}");
+        });
+    }
+    Ok(())
+}
+
+/// Run the client in pull mode (connects to a server to receive files)
+///
+/// # Errors
+///
+/// Returns an error if the connection fails or synchronization fails.
+pub async fn run_pull_client(addr: &str, dst_root: &Path) -> anyhow::Result<()> {
+    let stream = TcpStream::connect(addr).await?;
+    let mut framed = Framed::new(stream, DsyncCodec);
+    handle_client(&mut framed, dst_root).await
+}
+
 /// Run the receiver to handle incoming sync connections.
 ///
 /// # Errors
@@ -246,6 +292,66 @@ pub async fn run_stdio_receiver(dst_root: &Path) -> anyhow::Result<()> {
     let combined = tokio::io::join(stdin, stdout);
     let mut framed = Framed::new(combined, DsyncCodec);
     handle_client(&mut framed, dst_root).await
+}
+
+/// Run the receiver over an SSH tunnel (for Pull mode)
+///
+/// # Errors
+///
+/// Returns an error if the SSH command fails or synchronization fails.
+pub async fn run_ssh_receiver(
+    addr: &str,
+    dst_root: &Path,
+    src_path: &str,
+    threshold: f32,
+    checksum: bool,
+    ignores: &[String],
+) -> anyhow::Result<()> {
+    let mut cmd = Command::new("ssh");
+    cmd.arg("-q")
+        .arg("-o")
+        .arg("Compression=no")
+        .arg("-o")
+        .arg("Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-ctr")
+        .arg("-o")
+        .arg("IPQoS=throughput")
+        .arg(addr);
+
+    let mut remote_cmd =
+        format!("dsync --stdio --sender --source {src_path} --threshold {threshold}");
+    if checksum {
+        remote_cmd.push_str(" --checksum");
+    }
+    for pattern in ignores {
+        let _ = write!(remote_cmd, " --ignore '{pattern}'");
+    }
+
+    let mut child = cmd
+        .arg(remote_cmd)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("stdin failed"))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("stdout failed"))?;
+
+    {
+        let combined = tokio::io::join(stdout, stdin);
+        let mut framed = Framed::new(combined, DsyncCodec);
+        handle_client(&mut framed, dst_root).await?;
+    }
+
+    let status = child.wait().await?;
+    if !status.success() {
+        anyhow::bail!("SSH process exited with error: {status}");
+    }
+    Ok(())
 }
 
 async fn handle_handshake<T>(

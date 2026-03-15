@@ -10,18 +10,27 @@ pub fn handler(matches: &clap::ArgMatches) -> Action {
     let ignores = parse_ignores(matches);
 
     if let Some(addr) = matches.get_one::<String>("listen") {
-        let dst = get_destination(matches);
-        return Action::Listen {
-            addr: addr.clone(),
-            dst,
-        };
+        return handle_listen(addr, matches, threshold, checksum, ignores);
     }
 
     if let Some(addr) = matches.get_one::<String>("remote") {
+        let pull = matches.get_flag("pull");
+        if pull {
+            return handle_pull(addr, matches, threshold, checksum, ignores);
+        }
         return handle_remote(addr, matches, threshold, checksum, ignores);
     }
 
     if matches.get_flag("stdio") {
+        if matches.get_flag("sender") {
+            let src = get_source(matches);
+            return Action::StdioSender {
+                src,
+                threshold,
+                checksum,
+                ignores,
+            };
+        }
         let dst = get_destination(matches);
         return Action::Stdio { dst };
     }
@@ -73,8 +82,62 @@ fn get_destination(matches: &clap::ArgMatches) -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
+fn handle_listen(
+    addr: &str,
+    matches: &clap::ArgMatches,
+    threshold: f32,
+    checksum: bool,
+    ignores: Vec<String>,
+) -> Action {
+    if matches.get_flag("sender") {
+        let src = get_source(matches);
+        return Action::ListenSender {
+            addr: addr.to_string(),
+            src,
+            threshold,
+            checksum,
+            ignores,
+        };
+    }
+    let dst = get_destination(matches);
+    Action::Listen {
+        addr: addr.to_string(),
+        dst,
+    }
+}
+
+fn handle_pull(
+    addr: &str,
+    matches: &clap::ArgMatches,
+    threshold: f32,
+    checksum: bool,
+    ignores: Vec<String>,
+) -> Action {
+    let dst = get_destination(matches);
+
+    if let Some(ssh_info) = parse_ssh_address(addr) {
+        return Action::Pull {
+            addr: ssh_info.host,
+            dst,
+            threshold,
+            checksum,
+            remote_path: Some(ssh_info.path),
+            ignores,
+        };
+    }
+
+    Action::Pull {
+        addr: addr.to_string(),
+        dst,
+        threshold,
+        checksum,
+        remote_path: None,
+        ignores,
+    }
+}
+
 fn handle_remote(
-    addr: &String,
+    addr: &str,
     matches: &clap::ArgMatches,
     threshold: f32,
     checksum: bool,
@@ -84,7 +147,7 @@ fn handle_remote(
 
     if addr == "-" {
         return Action::Connect {
-            addr: addr.clone(),
+            addr: addr.to_string(),
             src,
             threshold,
             checksum,
@@ -105,7 +168,7 @@ fn handle_remote(
     }
 
     Action::Connect {
-        addr: addr.clone(),
+        addr: addr.to_string(),
         src,
         threshold,
         checksum,
