@@ -1,10 +1,44 @@
 use crate::cli::actions::Action;
 use std::path::PathBuf;
 
+/// Main command dispatcher
+#[must_use]
 pub fn handler(matches: &clap::ArgMatches) -> Action {
     let threshold = *matches.get_one::<f32>("threshold").unwrap_or(&0.5);
     let checksum = matches.get_flag("checksum");
     let dry_run = matches.get_flag("dry_run");
+    let ignores = parse_ignores(matches);
+
+    if let Some(addr) = matches.get_one::<String>("listen") {
+        let dst = get_destination(matches);
+        return Action::Listen {
+            addr: addr.clone(),
+            dst,
+        };
+    }
+
+    if let Some(addr) = matches.get_one::<String>("remote") {
+        return handle_remote(addr, matches, threshold, checksum, ignores);
+    }
+
+    if matches.get_flag("stdio") {
+        let dst = get_destination(matches);
+        return Action::Stdio { dst };
+    }
+
+    let src = get_source(matches);
+    let dst = get_destination(matches);
+    Action::Run {
+        src,
+        dst,
+        threshold,
+        checksum,
+        dry_run,
+        ignores,
+    }
+}
+
+fn parse_ignores(matches: &clap::ArgMatches) -> Vec<String> {
     let mut ignores: Vec<String> = matches
         .get_many::<String>("ignore")
         .unwrap_or_default()
@@ -22,48 +56,33 @@ pub fn handler(matches: &clap::ArgMatches) -> Action {
             }
         }
     }
+    ignores
+}
 
-    if let Some(addr) = matches.get_one::<String>("listen") {
-        let dst = matches
-            .get_one::<PathBuf>("destination")
-            .cloned()
-            .unwrap_or_else(|| PathBuf::from("."));
-        return Action::Listen {
-            addr: addr.clone(),
-            dst,
-        };
-    }
+fn get_source(matches: &clap::ArgMatches) -> PathBuf {
+    matches
+        .get_one::<PathBuf>("source")
+        .cloned()
+        .unwrap_or_default()
+}
 
-    if let Some(addr) = matches.get_one::<String>("remote") {
-        let src = matches
-            .get_one::<PathBuf>("source")
-            .cloned()
-            .unwrap_or_default();
+fn get_destination(matches: &clap::ArgMatches) -> PathBuf {
+    matches
+        .get_one::<PathBuf>("destination")
+        .cloned()
+        .unwrap_or_else(|| PathBuf::from("."))
+}
 
-        // Check if it's an SSH style address: user@host:path or host:path
-        // Heuristic: if it contains a colon and the suffix is NOT a port number, it's SSH.
-        // If there's an '@', it's always SSH.
-        if let Some((prefix, suffix)) = addr.split_once(':') {
-            let is_numeric_port = !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
-            let has_user = prefix.contains('@');
+fn handle_remote(
+    addr: &String,
+    matches: &clap::ArgMatches,
+    threshold: f32,
+    checksum: bool,
+    ignores: Vec<String>,
+) -> Action {
+    let src = get_source(matches);
 
-            if has_user || !is_numeric_port {
-                let remote_path = if suffix.is_empty() {
-                    ".".to_string()
-                } else {
-                    suffix.to_string()
-                };
-                return Action::Connect {
-                    addr: prefix.to_string(),
-                    src,
-                    threshold,
-                    checksum,
-                    remote_path: Some(remote_path),
-                    ignores,
-                };
-            }
-        }
-
+    if addr == "-" {
         return Action::Connect {
             addr: addr.clone(),
             src,
@@ -74,28 +93,59 @@ pub fn handler(matches: &clap::ArgMatches) -> Action {
         };
     }
 
-    if matches.get_flag("stdio") {
-        let dst = matches
-            .get_one::<PathBuf>("destination")
-            .cloned()
-            .unwrap_or_else(|| PathBuf::from("."));
-        return Action::Stdio { dst };
+    if let Some(ssh_info) = parse_ssh_address(addr) {
+        return Action::Connect {
+            addr: ssh_info.host,
+            src,
+            threshold,
+            checksum,
+            remote_path: Some(ssh_info.path),
+            ignores,
+        };
     }
 
-    let src = matches
-        .get_one::<PathBuf>("source")
-        .cloned()
-        .unwrap_or_default();
-    let dst = matches
-        .get_one::<PathBuf>("destination")
-        .cloned()
-        .unwrap_or_default();
-    Action::Run {
+    Action::Connect {
+        addr: addr.clone(),
         src,
-        dst,
         threshold,
         checksum,
-        dry_run,
+        remote_path: None,
         ignores,
     }
+}
+
+struct SshInfo {
+    host: String,
+    path: String,
+}
+
+fn parse_ssh_address(addr: &str) -> Option<SshInfo> {
+    // 1. If there's an '@', it's always SSH.
+    // 2. If it contains a colon, check if it's a valid SocketAddr.
+    // 3. If it's not a SocketAddr but has a colon, it might be an SSH path.
+    let is_ssh = if addr.contains('@') {
+        true
+    } else if let Some((_prefix, suffix)) = addr.rsplit_once(':') {
+        if addr.parse::<std::net::SocketAddr>().is_ok() {
+            false
+        } else {
+            let is_numeric_port = !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
+            !is_numeric_port
+        }
+    } else {
+        false
+    };
+
+    if is_ssh && let Some((prefix, suffix)) = addr.split_once(':') {
+        let path = if suffix.is_empty() {
+            ".".to_string()
+        } else {
+            suffix.to_string()
+        };
+        return Some(SshInfo {
+            host: prefix.to_string(),
+            path,
+        });
+    }
+    None
 }

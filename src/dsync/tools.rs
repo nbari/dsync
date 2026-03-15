@@ -1,6 +1,7 @@
 use crate::dsync::sync;
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
+use nix::fcntl::{FallocateFlags, fallocate};
 use std::{
     os::unix::fs::{FileExt, MetadataExt},
     path::Path,
@@ -14,7 +15,7 @@ pub fn create_progress_bar(total_size: u64) -> ProgressBar {
     let pb = ProgressBar::new(total_size);
     pb.set_style(
         ProgressStyle::default_bar()
-            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%) {bytes_per_sec} {eta} {msg}")
+            .template("[{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%) {binary_bytes_per_sec} {eta} {msg}")
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars("#>-"),
     );
@@ -74,14 +75,35 @@ pub async fn should_use_full_copy(src: &Path, dst: &Path, threshold: f32) -> Res
     }
 
     let src_meta = fs::metadata(src).await?;
-    let dst_meta = fs::metadata(dst).await?;
+    should_use_full_copy_meta(src_meta.len(), dst, threshold).await
+}
 
-    let src_size = src_meta.len();
+/// Return true if full copy is more efficient than block comparison, using provided source size.
+///
+/// # Errors
+///
+/// Returns an error if metadata cannot be read.
+pub async fn should_use_full_copy_meta(src_size: u64, dst: &Path, threshold: f32) -> Result<bool> {
+    if !dst.exists() {
+        return Ok(true);
+    }
+
     if src_size == 0 {
         return Ok(false);
     }
 
+    let dst_meta = fs::metadata(dst).await?;
     let dst_size = dst_meta.len();
+
+    // If file is large and destination exists, prefer delta-sync (resume) even if destination is small
+    // because hashing is fast and network/disk-write is slow.
+    // Heuristic: if file > 1MB, we use a much more aggressive threshold for full copy.
+    let threshold = if src_size > 1024 * 1024 {
+        threshold.min(0.1)
+    } else {
+        threshold
+    };
+
     Ok(is_below_threshold(src_size, dst_size, threshold))
 }
 
@@ -109,6 +131,22 @@ pub fn is_below_threshold(src_size: u64, dst_size: u64, threshold: f32) -> bool 
     let scaled_src = u128::from(src_size) * scaled_threshold;
 
     scaled_dst < scaled_src
+}
+
+/// Pre-allocate space for a file to improve write speed and reduce fragmentation.
+///
+/// # Errors
+///
+/// Returns an error if fallocate fails.
+pub fn preallocate(path: &Path, size: u64) -> Result<()> {
+    let file = std::fs::OpenOptions::new()
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(path)?;
+    #[allow(clippy::cast_possible_wrap)]
+    let _ = fallocate(&file, FallocateFlags::empty(), 0, size as i64);
+    Ok(())
 }
 
 /// create blake3 hash for a file
@@ -151,6 +189,8 @@ pub fn compute_requested_blocks(
     }
 
     let file = std::fs::File::open(full_path)?;
+    let mmap = unsafe { memmap2::MmapOptions::new().map(&file) };
+
     let concurrency = std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
         .unwrap_or(8);
@@ -166,9 +206,10 @@ pub fn compute_requested_blocks(
                 break;
             }
             let end_idx = std::cmp::min(start_idx + chunk_size, num_blocks as u64);
-            let file_ref = &file;
             let hashes_ref = hashes;
             let results_clone = Arc::clone(&results);
+            let mmap_ref = mmap.as_ref().ok();
+            let file_ref = &file;
 
             s.spawn(move || {
                 let mut local_requested = Vec::new();
@@ -178,7 +219,22 @@ pub fn compute_requested_blocks(
                 for idx in start_idx..end_idx {
                     let offset = idx * block_size;
                     let mut matched = false;
-                    if let Ok(n) = file_ref.read_at(&mut buf, offset)
+
+                    if let Some(m) = mmap_ref {
+                        #[allow(clippy::cast_possible_truncation)]
+                        let offset_usize = offset as usize;
+                        #[allow(clippy::cast_possible_truncation)]
+                        let end_usize = offset_usize + block_size as usize;
+                        if let Some(chunk) = m.get(offset_usize..std::cmp::min(end_usize, m.len()))
+                        {
+                            #[allow(clippy::cast_possible_truncation)]
+                            if let Some(&h) = hashes_ref.get(idx as usize)
+                                && sync::fast_hash_block(chunk) == h
+                            {
+                                matched = true;
+                            }
+                        }
+                    } else if let Ok(n) = file_ref.read_at(&mut buf, offset)
                         && n > 0
                     {
                         let chunk = buf.get(..n).unwrap_or_default();
@@ -189,6 +245,7 @@ pub fn compute_requested_blocks(
                             matched = true;
                         }
                     }
+
                     if !matched {
                         #[allow(clippy::cast_possible_truncation)]
                         local_requested.push(idx as u32);
@@ -221,6 +278,8 @@ pub async fn calculate_file_hashes(path: &Path, block_size: u64) -> anyhow::Resu
         let file = std::fs::File::open(&path)?;
         let len = file.metadata()?.len();
         let num_blocks = len.div_ceil(block_size);
+        let mmap = unsafe { memmap2::MmapOptions::new().map(&file) };
+
         let concurrency = std::thread::available_parallelism()
             .map(std::num::NonZeroUsize::get)
             .unwrap_or(8);
@@ -242,6 +301,7 @@ pub async fn calculate_file_hashes(path: &Path, block_size: u64) -> anyhow::Resu
                 let start_block =
                     num_blocks - (remaining_hashes.len() as u64 + chunk_hashes.len() as u64);
                 let end_block = start_block + chunk_hashes.len() as u64;
+                let mmap_ref = mmap.as_ref().ok();
                 let file_ref = &file;
 
                 s.spawn(move || {
@@ -249,6 +309,21 @@ pub async fn calculate_file_hashes(path: &Path, block_size: u64) -> anyhow::Resu
                     let mut buf = vec![0u8; block_size as usize];
                     for (i, block_idx) in (start_block..end_block).enumerate() {
                         let offset = block_idx * block_size;
+                        if let Some(m) = mmap_ref {
+                            #[allow(clippy::cast_possible_truncation)]
+                            let offset_usize = offset as usize;
+                            #[allow(clippy::cast_possible_truncation)]
+                            let end_usize = offset_usize + block_size as usize;
+                            if let Some(chunk) =
+                                m.get(offset_usize..std::cmp::min(end_usize, m.len()))
+                            {
+                                if let Some(h) = chunk_hashes.get_mut(i) {
+                                    *h = sync::fast_hash_block(chunk);
+                                }
+                                continue;
+                            }
+                        }
+
                         if let Ok(n) = file_ref.read_at(&mut buf, offset)
                             && n > 0
                         {

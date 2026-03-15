@@ -1,4 +1,5 @@
 use crate::dsync::tools;
+use anyhow::Context;
 use bytes::{Buf, BufMut, BytesMut};
 use filetime::FileTime;
 use futures_util::{SinkExt, StreamExt};
@@ -23,7 +24,7 @@ use tokio::{
 };
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
-const BLOCK_SIZE: u64 = 64 * 1024;
+const BLOCK_SIZE: u64 = 128 * 1024;
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, Copy)]
 pub struct FileMetadata {
@@ -110,11 +111,11 @@ pub struct Block {
 /// # Errors
 ///
 /// Returns an error if serialization fails.
-pub fn serialize_message(msg: &Message) -> anyhow::Result<Vec<u8>> {
+pub fn serialize_message(msg: &Message) -> anyhow::Result<AlignedVec<16>> {
     let mut vec = AlignedVec::<16>::new();
     to_bytes_in::<_, rkyv::rancor::Error>(msg, &mut vec)
         .map_err(|e| anyhow::anyhow!("failed to serialize message: {e}"))?;
-    Ok(vec.to_vec())
+    Ok(vec)
 }
 
 /// Deserialize a message from a byte slice.
@@ -137,14 +138,15 @@ pub fn deserialize_message(bytes: &[u8]) -> anyhow::Result<Message> {
 pub fn apply_file_metadata(path: &Path, metadata: &FileMetadata) -> anyhow::Result<()> {
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
-    std::fs::set_permissions(path, Permissions::from_mode(metadata.mode))?;
+    std::fs::set_permissions(path, Permissions::from_mode(metadata.mode))
+        .context("failed to set permissions")?;
     let _ = nix::unistd::chown(
         path,
         Some(nix::unistd::Uid::from_raw(metadata.uid)),
         Some(nix::unistd::Gid::from_raw(metadata.gid)),
     );
     let mtime = FileTime::from_unix_time(metadata.mtime, metadata.mtime_nsec);
-    filetime::set_file_times(path, mtime, mtime)?;
+    filetime::set_file_times(path, mtime, mtime).context("failed to set file times")?;
     Ok(())
 }
 
@@ -196,9 +198,9 @@ impl Decoder for DsyncCodec {
     }
 }
 
-impl Encoder<Vec<u8>> for DsyncCodec {
+impl Encoder<AlignedVec<16>> for DsyncCodec {
     type Error = anyhow::Error;
-    fn encode(&mut self, item: Vec<u8>, dst: &mut BytesMut) -> Result<(), Self::Error> {
+    fn encode(&mut self, item: AlignedVec<16>, dst: &mut BytesMut) -> Result<(), Self::Error> {
         if item.len() > 64 * 1024 * 1024 {
             return Err(anyhow::anyhow!("Frame size too big: {}", item.len()));
         }
@@ -317,7 +319,9 @@ where
             return Ok(());
         }
 
-        if metadata.size > 0 && tools::is_below_threshold(metadata.size, meta.len(), threshold) {
+        if metadata.size > 0
+            && tools::should_use_full_copy_meta(metadata.size, &full_path, threshold).await?
+        {
             framed
                 .send(serialize_message(&Message::RequestFullCopy { path })?)
                 .await?;
@@ -325,6 +329,9 @@ where
         }
     } else if let Some(parent) = full_path.parent() {
         tokio::fs::create_dir_all(parent).await?;
+        // Pre-allocate new file
+        tools::preallocate(&full_path, metadata.size)?;
+
         framed
             .send(serialize_message(&Message::RequestFullCopy { path })?)
             .await?;

@@ -1,11 +1,12 @@
 use crate::dsync::tools;
+use anyhow::Context;
 use filetime::{FileTime, set_file_times};
 use indicatif::ProgressBar;
 use std::{hash::Hasher, os::unix::fs::FileExt, path::Path, sync::Arc};
 use tokio::sync::Semaphore;
 use twox_hash::XxHash64;
 
-const BLOCK_SIZE: usize = 64 * 1024;
+const BLOCK_SIZE: usize = 128 * 1024;
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SyncStats {
@@ -19,9 +20,9 @@ pub struct SyncStats {
 ///
 /// Returns an error if any attribute fails to be applied.
 pub fn apply_metadata(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    let meta = std::fs::metadata(src)?;
+    let meta = std::fs::metadata(src).context("failed to read source metadata")?;
     let permissions = meta.permissions();
-    std::fs::set_permissions(dst, permissions)?;
+    std::fs::set_permissions(dst, permissions).context("failed to set destination permissions")?;
 
     // Set ownership if running as root
     #[cfg(unix)]
@@ -40,7 +41,7 @@ pub fn apply_metadata(src: &Path, dst: &Path) -> anyhow::Result<()> {
     // Set mtime
     let mtime = FileTime::from_last_modification_time(&meta);
     let atime = FileTime::from_last_access_time(&meta);
-    set_file_times(dst, atime, mtime)?;
+    set_file_times(dst, atime, mtime).context("failed to set destination file times")?;
 
     Ok(())
 }
@@ -176,6 +177,8 @@ async fn sync_dir_recursive(
         .overrides(overrides.clone())
         .build();
 
+    let mut directory_paths = Vec::new();
+
     for entry in walker {
         let entry = entry?;
         let src_path = entry.path();
@@ -190,6 +193,7 @@ async fn sync_dir_recursive(
             .ok_or_else(|| anyhow::anyhow!("unknown file type"))?;
 
         if file_type.is_dir() {
+            directory_paths.push(src_path.to_path_buf());
             if !dst_path.exists() {
                 if dry_run {
                     println!("(dry-run) create directory: {}", dst_path.display());
@@ -250,30 +254,16 @@ async fn sync_dir_recursive(
         task.await??;
     }
 
-    // Final pass: Apply metadata to all entries (directories, files, etc)
-    let walker = WalkBuilder::new(src_dir)
-        .hidden(false)
-        .git_ignore(false)
-        .git_global(false)
-        .git_exclude(false)
-        .ignore(false)
-        .parents(false)
-        .overrides(overrides)
-        .build();
-
     if !dry_run {
-        // Collect directories to apply them bottom-up
-        let mut all_entries = Vec::new();
-        for entry in walker {
-            all_entries.push(entry?.path().to_path_buf());
-        }
-
-        // Apply metadata from deepest to shallowest
-        for src_path in all_entries.iter().rev() {
+        // Apply metadata to directories from deepest to shallowest to ensure mtimes are preserved
+        directory_paths.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
+        for src_path in directory_paths {
             let rel_path = src_path.strip_prefix(src_dir)?;
             let dst_path = dst_dir.join(rel_path);
-            apply_metadata(src_path, &dst_path)?;
+            apply_metadata(&src_path, &dst_path)?;
         }
+        // Finally apply to root
+        apply_metadata(src_dir, dst_dir)?;
     }
 
     Ok(())
@@ -290,19 +280,45 @@ pub async fn sync_changed_blocks_with_pb(
     full_copy: bool,
     pb: Arc<ProgressBar>,
 ) -> anyhow::Result<SyncStats> {
-    let src_file = std::fs::File::open(src_path)?;
+    let src_file = std::fs::File::open(src_path)
+        .with_context(|| format!("failed to open source file: {}", src_path.display()))?;
+
+    let src_len = src_file
+        .metadata()
+        .context("failed to get source metadata")?
+        .len();
+
+    // Pre-allocate space
+    tools::preallocate(dst_path, src_len).context("failed to pre-allocate destination space")?;
+
     let dst_file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .create(true)
         .truncate(false)
-        .open(dst_path)?;
+        .open(dst_path)
+        .with_context(|| format!("failed to open destination file: {}", dst_path.display()))?;
 
-    let src_len = src_file.metadata()?.len();
-    let dst_len = dst_file.metadata()?.len();
+    let dst_len = dst_file
+        .metadata()
+        .context("failed to get destination metadata")?
+        .len();
 
-    if dst_len < src_len {
-        dst_file.set_len(src_len)?;
+    // Hint sequential access
+    #[cfg(unix)]
+    {
+        let _ = nix::fcntl::posix_fadvise(
+            &src_file,
+            0,
+            0,
+            nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
+        );
+        let _ = nix::fcntl::posix_fadvise(
+            &dst_file,
+            0,
+            0,
+            nix::fcntl::PosixFadviseAdvice::POSIX_FADV_SEQUENTIAL,
+        );
     }
 
     let src_arc = Arc::new(src_file);
@@ -315,86 +331,112 @@ pub async fn sync_changed_blocks_with_pb(
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let mut handles = Vec::new();
     let chunk_size: u64 = 1024 * 1024; // 1MB chunks for parallel processing
-
     let num_chunks = src_len.div_ceil(chunk_size);
 
     for i in 0..num_chunks {
-        let src = Arc::clone(&src_arc);
-        let dst = Arc::clone(&dst_arc);
-        let start_offset = i * chunk_size;
-        let end_offset = std::cmp::min(start_offset + chunk_size, src_len);
-        let pb_worker = Arc::clone(&pb);
-        let sem = Arc::clone(&semaphore);
-
-        let handle = tokio::spawn(async move {
-            let _permit = sem
-                .acquire()
-                .await
-                .map_err(|e| anyhow::anyhow!(e.to_string()))?;
-            tokio::task::spawn_blocking(move || {
-                let mut offset = start_offset;
-                let mut src_buf = vec![0u8; BLOCK_SIZE];
-                let mut dst_buf = vec![0u8; BLOCK_SIZE];
-                let mut chunk_updated = 0;
-                let mut chunk_total = 0;
-
-                while offset < end_offset {
-                    let to_read_u64 = std::cmp::min(BLOCK_SIZE as u64, end_offset - offset);
-                    let to_read = usize::try_from(to_read_u64).map_err(|e| anyhow::anyhow!(e))?;
-
-                    let src_chunk = src_buf
-                        .get_mut(..to_read)
-                        .ok_or_else(|| anyhow::anyhow!("src_buf too small"))?;
-                    src.read_exact_at(src_chunk, offset)?;
-
-                    let needs_write = if full_copy {
-                        true
-                    } else {
-                        let dst_chunk = dst_buf
-                            .get_mut(..to_read)
-                            .ok_or_else(|| anyhow::anyhow!("dst_buf too small"))?;
-                        let dst_read_result = dst.read_exact_at(dst_chunk, offset);
-                        match dst_read_result {
-                            Ok(()) => {
-                                let src_hash = fast_hash_block(src_chunk);
-                                let dst_hash = fast_hash_block(dst_chunk);
-                                src_hash != dst_hash
-                            }
-                            Err(_) => true,
-                        }
-                    };
-
-                    if needs_write {
-                        dst.write_all_at(src_chunk, offset)?;
-                        chunk_updated += 1;
-                    }
-
-                    chunk_total += 1;
-                    pb_worker.inc(to_read as u64);
-                    offset += to_read as u64;
-                }
-                Ok::<SyncStats, anyhow::Error>(SyncStats {
-                    total_blocks: chunk_total,
-                    updated_blocks: chunk_updated,
-                })
-            })
-            .await?
-        });
+        let handle = spawn_sync_worker(
+            i,
+            chunk_size,
+            src_len,
+            Arc::clone(&src_arc),
+            Arc::clone(&dst_arc),
+            Arc::clone(&pb),
+            Arc::clone(&semaphore),
+            full_copy,
+        );
         handles.push(handle);
     }
 
     let mut stats = SyncStats::default();
     for handle in handles {
-        let chunk_stats = handle.await.map_err(|e| anyhow::anyhow!(e))??;
+        let chunk_stats = handle
+            .await
+            .map_err(|e| anyhow::anyhow!(e))
+            .context("worker task panicked")??;
         stats.total_blocks += chunk_stats.total_blocks;
         stats.updated_blocks += chunk_stats.updated_blocks;
     }
 
     if dst_len > src_len {
-        dst_arc.set_len(src_len)?;
+        dst_arc
+            .set_len(src_len)
+            .context("failed to truncate destination file")?;
     }
 
     Ok(stats)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn spawn_sync_worker(
+    chunk_index: u64,
+    chunk_size: u64,
+    src_len: u64,
+    src: Arc<std::fs::File>,
+    dst: Arc<std::fs::File>,
+    pb: Arc<ProgressBar>,
+    semaphore: Arc<Semaphore>,
+    full_copy: bool,
+) -> tokio::task::JoinHandle<anyhow::Result<SyncStats>> {
+    tokio::spawn(async move {
+        let _permit = semaphore
+            .acquire()
+            .await
+            .map_err(|e| anyhow::anyhow!(e.to_string()))
+            .context("failed to acquire semaphore")?;
+
+        tokio::task::spawn_blocking(move || {
+            let start_offset = chunk_index * chunk_size;
+            let end_offset = std::cmp::min(start_offset + chunk_size, src_len);
+            let mut offset = start_offset;
+            let mut src_buf = vec![0u8; BLOCK_SIZE];
+            let mut dst_buf = vec![0u8; BLOCK_SIZE];
+            let mut chunk_updated = 0;
+            let mut chunk_total = 0;
+
+            while offset < end_offset {
+                let to_read_u64 = std::cmp::min(BLOCK_SIZE as u64, end_offset - offset);
+                let to_read = usize::try_from(to_read_u64).map_err(|e| anyhow::anyhow!(e))?;
+
+                let src_chunk = src_buf
+                    .get_mut(..to_read)
+                    .ok_or_else(|| anyhow::anyhow!("src_buf too small"))?;
+                src.read_exact_at(src_chunk, offset)
+                    .context("failed to read from source")?;
+
+                let needs_write = if full_copy {
+                    true
+                } else {
+                    let dst_chunk = dst_buf
+                        .get_mut(..to_read)
+                        .ok_or_else(|| anyhow::anyhow!("dst_buf too small"))?;
+                    let dst_read_result = dst.read_exact_at(dst_chunk, offset);
+                    match dst_read_result {
+                        Ok(()) => {
+                            let src_hash = fast_hash_block(src_chunk);
+                            let dst_hash = fast_hash_block(dst_chunk);
+                            src_hash != dst_hash
+                        }
+                        Err(_) => true,
+                    }
+                };
+
+                if needs_write {
+                    dst.write_all_at(src_chunk, offset)
+                        .context("failed to write to destination")?;
+                    chunk_updated += 1;
+                }
+
+                chunk_total += 1;
+                pb.inc(to_read as u64);
+                offset += to_read as u64;
+            }
+            Ok::<SyncStats, anyhow::Error>(SyncStats {
+                total_blocks: chunk_total,
+                updated_blocks: chunk_updated,
+            })
+        })
+        .await?
+    })
 }
 
 /// Synchronize changed blocks

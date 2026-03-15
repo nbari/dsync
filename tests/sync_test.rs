@@ -24,15 +24,15 @@ async fn test_incremental_sync_only_writes_changed_blocks() -> anyhow::Result<()
 
     // 2. Initial sync (Full copy)
     let stats = sync::sync_changed_blocks(&src_path, &dst_path, true).await?;
-    assert_eq!(stats.updated_blocks, 160); // 10MB / 64KB = 160 blocks
+    assert_eq!(stats.updated_blocks, 80); // 10MB / 128KB = 80 blocks
 
     // Verify initial sync
     let dst_data = fs::read(&dst_path)?;
     assert_eq!(initial_data, dst_data);
 
-    // 3. Modify exactly ONE block (64KB) at a specific aligned offset
+    // 3. Modify exactly ONE block (128KB) at a specific aligned offset
     let offset = 1024 * 1024; // 1MB offset
-    let block_size = 64 * 1024;
+    let block_size = 128 * 1024;
     let mut file = fs::OpenOptions::new().write(true).open(&src_path)?;
     file.seek(SeekFrom::Start(offset))?;
     let new_block_data = vec![0xAAu8; block_size];
@@ -42,7 +42,7 @@ async fn test_incremental_sync_only_writes_changed_blocks() -> anyhow::Result<()
     // 4. Perform incremental sync
     let stats = sync::sync_changed_blocks(&src_path, &dst_path, false).await?;
     assert_eq!(stats.updated_blocks, 1); // Only 1 block should be updated
-    assert_eq!(stats.total_blocks, 160);
+    assert_eq!(stats.total_blocks, 80);
 
     // 5. Verify content is correct
     let final_src_data = fs::read(&src_path)?;
