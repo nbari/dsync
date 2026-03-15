@@ -1,0 +1,27 @@
+FROM fedora:41
+
+RUN dnf install -y openssh-server openssh-clients iproute procps-ng && \
+    dnf clean all
+
+RUN ssh-keygen -A
+
+# Create devops user
+RUN useradd -m devops && \
+    echo "devops:devops" | chpasswd
+
+# Setup SSH for devops user
+USER devops
+RUN mkdir -p /home/devops/.ssh && chmod 700 /home/devops/.ssh
+COPY --chown=devops:devops id_ed25519.pub /home/devops/.ssh/authorized_keys
+RUN chmod 600 /home/devops/.ssh/authorized_keys
+
+USER root
+# Ensure SSH directory exists and has correct permissions
+RUN mkdir -p /run/sshd && chmod 755 /run/sshd
+
+# Install dsync (we will mount the binary)
+# COPY target/release/dsync /usr/local/bin/dsync
+
+EXPOSE 22
+
+CMD ["/usr/sbin/sshd", "-D", "-e"]
