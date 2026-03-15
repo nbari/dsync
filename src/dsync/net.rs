@@ -406,7 +406,7 @@ async fn handle_sync_file<T>(
     threshold: f32,
     checksum: bool,
     dst_root: &Path,
-    pb: &Option<Arc<ProgressBar>>,
+    pb: Option<&Arc<ProgressBar>>,
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -508,30 +508,16 @@ where
                 checksum,
             } => {
                 current_metadata = Some(metadata);
-                if let Some(progress) = &pb {
-                    progress.set_message(path.clone());
-                }
-                let full_path = dst_root.join(&path);
-                let mut skipped = false;
-                if full_path.exists() {
-                    let meta = tokio::fs::metadata(&full_path).await?;
-                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
-                    if meta.len() == metadata.size
-                        && !checksum
-                        && meta.mtime() == metadata.mtime
-                        && (meta.mtime_nsec() as u32) == metadata.mtime_nsec
-                    {
-                        skipped = true;
-                    }
-                }
-
-                if skipped {
-                    if let Some(progress) = &pb {
-                        progress.inc(metadata.size);
-                    }
-                } else {
-                    handle_sync_file(framed, path, metadata, threshold, checksum, dst_root, &pb).await?;
-                }
+                handle_client_sync_file(
+                    framed,
+                    path,
+                    metadata,
+                    threshold,
+                    checksum,
+                    dst_root,
+                    pb.as_ref(),
+                )
+                .await?;
             }
             Message::BlockHashes { path, hashes } => {
                 let full_path = dst_root.join(&path);
@@ -541,7 +527,9 @@ where
                     // Calculate skipped bytes for delta sync
                     let total_blocks = u64::try_from(hashes.len())?;
                     let requested_count = u64::try_from(requested.len())?;
-                    if total_blocks > requested_count && let Some(meta) = current_metadata {
+                    if total_blocks > requested_count
+                        && let Some(meta) = current_metadata
+                    {
                         let mut requested_bytes = 0u64;
                         for &idx in &requested {
                             let offset = u64::from(idx) * BLOCK_SIZE;
@@ -633,12 +621,47 @@ where
     Ok(())
 }
 
-/// Handle a client connection.
-///
-/// # Errors
-///
-/// Returns an error if synchronization or network I/O fails.
+#[allow(clippy::too_many_arguments)]
+async fn handle_client_sync_file<T>(
+    framed: &mut Framed<T, DsyncCodec>,
+    path: String,
+    metadata: FileMetadata,
+    threshold: f32,
+    checksum: bool,
+    dst_root: &Path,
+    pb: Option<&Arc<ProgressBar>>,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    if let Some(progress) = pb {
+        progress.set_message(path.clone());
+    }
+    let full_path = dst_root.join(&path);
+    let mut skipped = false;
+    if full_path.exists() {
+        let meta = tokio::fs::metadata(&full_path).await?;
+        #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+        if meta.len() == metadata.size
+            && !checksum
+            && meta.mtime() == metadata.mtime
+            && (meta.mtime_nsec() as u32) == metadata.mtime_nsec
+        {
+            skipped = true;
+        }
+    }
 
+    if skipped {
+        if let Some(progress) = pb {
+            progress.inc(metadata.size);
+        }
+    } else {
+        handle_sync_file(framed, path, metadata, threshold, checksum, dst_root, pb).await?;
+    }
+    Ok(())
+}
+
+/// Handle a client connection.
 /// Run the sender to coordinate the client-side sync.
 ///
 /// # Errors
