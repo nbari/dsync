@@ -1,7 +1,6 @@
 use crate::dsync::sync;
 use anyhow::Result;
 use indicatif::{ProgressBar, ProgressStyle};
-use nix::fcntl::{FallocateFlags, fallocate};
 use std::{
     os::unix::fs::{FileExt, MetadataExt},
     path::Path,
@@ -137,15 +136,27 @@ pub fn is_below_threshold(src_size: u64, dst_size: u64, threshold: f32) -> bool 
 ///
 /// # Errors
 ///
-/// Returns an error if fallocate fails.
+/// Returns an error if opening the file fails.
 pub fn preallocate(path: &Path, size: u64) -> Result<()> {
     let file = std::fs::OpenOptions::new()
         .write(true)
         .create(true)
         .truncate(false)
         .open(path)?;
-    #[allow(clippy::cast_possible_wrap)]
-    let _ = fallocate(&file, FallocateFlags::empty(), 0, size as i64);
+
+    #[cfg(target_os = "linux")]
+    {
+        use nix::fcntl::{FallocateFlags, fallocate};
+        #[allow(clippy::cast_possible_wrap)]
+        let _ = fallocate(&file, FallocateFlags::empty(), 0, size as i64);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = file;
+        let _ = size;
+    }
+
     Ok(())
 }
 

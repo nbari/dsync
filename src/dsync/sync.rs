@@ -305,7 +305,7 @@ pub async fn sync_changed_blocks_with_pb(
         .len();
 
     // Hint sequential access
-    #[cfg(unix)]
+    #[cfg(target_os = "linux")]
     {
         let _ = nix::fcntl::posix_fadvise(
             &src_file,
