@@ -151,11 +151,10 @@ pub fn new() -> Command {
             Arg::new("remote")
                 .short('r')
                 .long("remote")
-                .help("Sync to remote ADDRESS:PORT instead of local")
-                .long_help("Connects to a listening dsync instance. Use with --source to specify which files to send.")
+                .help("Sync with remote ADDRESS:PORT or SSH path")
+                .long_help("Connects to a remote dsync instance. By default, it pushes --source to the remote. If --pull is used, it fetches from the remote to --destination.")
                 .value_name("ADDR")
-                .requires("source")
-                .conflicts_with("destination"),
+                .conflicts_with("listen"),
         )
         .arg(
             Arg::new("stdio")
@@ -163,6 +162,23 @@ pub fn new() -> Command {
                 .help("Use stdin/stdout for communication (internal use for SSH)")
                 .action(ArgAction::SetTrue)
                 .conflicts_with_all(["listen", "remote"]),
+        )
+        .arg(
+            Arg::new("pull")
+                .long("pull")
+                .short('P')
+                .help("Pull files from a remote SSH source")
+                .long_help("When used with --remote, it initiates a connection to fetch data from the remote path to the local --destination.")
+                .action(ArgAction::SetTrue)
+                .requires("destination")
+                .conflicts_with("source"),
+        )
+        .arg(
+            Arg::new("sender")
+                .long("sender")
+                .help("Run in sender mode (used internally with --stdio)")
+                .action(ArgAction::SetTrue)
+                .requires("stdio"),
         )
         .arg(
             Arg::new("ignore")
