@@ -7,9 +7,10 @@ A high-performance, concurrent file synchronization tool written in Rust. Design
 ## Key Features
 
 *   **Multi-threaded Engine**: Parallelizes file walking, block-level hashing, and I/O operations.
-*   **Fixed-Block Synchronization**: Uses 64KB chunks and **XxHash64** for ultra-fast delta analysis.
+*   **Fixed-Block Synchronization**: Uses **128KB** chunks and **XxHash64** for ultra-fast delta analysis.
 *   **Zero-Copy Networking**: High-speed network protocol using **rkyv** serialization over raw TCP.
 *   **Auto-SSH Mode**: Seamlessly tunnels through SSH for secure transfers without manual port forwarding.
+*   **Pull Mode**: Supports both pushing to and pulling from remote servers.
 *   **In-place Updates**: Modifies existing files directly without creating large temporary files.
 *   **Smart Skipping**: Automatically skips unchanged files based on size and modification time.
 
@@ -26,30 +27,50 @@ The binary will be available at `./target/release/dsync`.
 ## Usage
 
 ### 1. Local Synchronization
-Synchronize files or directories on the same machine:
+Synchronize a single file:
 ```bash
-dsync --source /path/to/source --destination /path/to/dest
+dsync --source file.bin --destination backup.bin
+```
+
+Synchronize a directory:
+```bash
+dsync --source /path/to/source_dir --destination /path/to/dest_dir
 ```
 
 ### 2. Network Synchronization (Direct TCP)
-Best for high-speed local networks where maximum performance is needed.
+Best for high-speed local networks where maximum performance is needed (no encryption overhead).
 
-**Receiver (Server 2):**
-```bash
-dsync --listen 0.0.0.0:8080 --destination /new/data
-```
+**A. Pushing to a Receiver (Remote is getting the file)**
+*   **Receiver (Server 2):**
+    ```bash
+    dsync --listen 0.0.0.0:8080 --destination /new/data
+    ```
+*   **Sender (Server 1):**
+    ```bash
+    dsync --remote 192.168.1.10:8080 --source /old/data/file.bin
+    ```
 
-**Sender (Server 1):**
-```bash
-dsync --remote 192.168.1.10:8080 --source /old/data
-```
+**B. Pulling from a Sender (You are getting the file)**
+*   **Sender (Server 2):**
+    ```bash
+    dsync --listen 0.0.0.0:8080 --source /old/data/file.bin --sender
+    ```
+*   **Receiver (Server 1):**
+    ```bash
+    dsync --remote 192.168.1.10:8080 --destination ./local_copy.bin --pull
+    ```
 
 ### 3. Secure Network Synchronization (SSH)
-Easiest way to sync securely between servers without opening extra firewall ports. `dsync` automatically spawns an SSH tunnel and executes itself on the remote side.
+Easiest way to sync securely between servers. `dsync` automatically spawns an SSH tunnel.
 
-**Automatic SSH (recommended):**
+**Push (Local -> Remote):**
 ```bash
-dsync --source /path/to/old/pgdata --remote user@remote-server:/path/to/new/pgdata
+dsync --source my_file.bin --remote user@remote-server:/path/to/dest/my_file.bin
+```
+
+**Pull (Remote -> Local):**
+```bash
+dsync --remote user@remote-server:/path/to/remote/file.bin --destination ./local_file.bin --pull
 ```
 
 **Manual SSH (using stdio pipe):**
