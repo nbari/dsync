@@ -54,6 +54,9 @@ pub enum Message {
     Handshake {
         version: String,
     },
+    SyncStart {
+        total_size: u64,
+    },
     SyncDir {
         path: String,
         metadata: FileMetadata,
@@ -256,7 +259,7 @@ pub async fn run_sender_listener(
 pub async fn run_pull_client(addr: &str, dst_root: &Path) -> anyhow::Result<()> {
     let stream = TcpStream::connect(addr).await?;
     let mut framed = Framed::new(stream, DsyncCodec);
-    handle_client(&mut framed, dst_root).await
+    handle_client(&mut framed, dst_root, true).await
 }
 
 /// Run the receiver to handle incoming sync connections.
@@ -272,7 +275,7 @@ pub async fn run_receiver(addr: &str, dst_root: &Path) -> anyhow::Result<()> {
         let dst_root = dst_root.to_path_buf();
         tokio::spawn(async move {
             let mut framed = Framed::new(stream, DsyncCodec);
-            if let Err(e) = handle_client(&mut framed, &dst_root).await {
+            if let Err(e) = handle_client(&mut framed, &dst_root, false).await {
                 eprintln!("Error handling client {peer_addr}: {e}");
             }
             eprintln!("Connection with {peer_addr} closed");
@@ -291,7 +294,7 @@ pub async fn run_stdio_receiver(dst_root: &Path) -> anyhow::Result<()> {
     let stdout = tokio::io::stdout();
     let combined = tokio::io::join(stdin, stdout);
     let mut framed = Framed::new(combined, DsyncCodec);
-    handle_client(&mut framed, dst_root).await
+    handle_client(&mut framed, dst_root, false).await
 }
 
 /// Run the receiver over an SSH tunnel (for Pull mode)
@@ -344,7 +347,7 @@ pub async fn run_ssh_receiver(
     {
         let combined = tokio::io::join(stdout, stdin);
         let mut framed = Framed::new(combined, DsyncCodec);
-        handle_client(&mut framed, dst_root).await?;
+        handle_client(&mut framed, dst_root, true).await?;
     }
 
     let status = child.wait().await?;
@@ -450,30 +453,126 @@ where
     Ok(())
 }
 
-async fn handle_block_hashes<T>(
+/// Handle a client connection.
+///
+/// # Errors
+///
+/// Returns an error if synchronization or network I/O fails.
+pub async fn handle_client<T>(
     framed: &mut Framed<T, DsyncCodec>,
-    path: String,
-    hashes: Vec<u64>,
     dst_root: &Path,
+    show_progress: bool,
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let full_path = dst_root.join(&path);
-    let requested = tools::compute_requested_blocks(&full_path, &hashes, BLOCK_SIZE)?;
+    let mut open_files: HashMap<String, std::fs::File> = HashMap::new();
+    let mut pb: Option<Arc<ProgressBar>> = None;
+    let mut current_metadata: Option<FileMetadata> = None;
 
-    if requested.is_empty() {
-        framed
-            .send(serialize_message(&Message::EndOfFile { path })?)
-            .await?;
-    } else {
-        framed
-            .send(serialize_message(&Message::RequestBlocks {
+    while let Some(result) = framed.next().await {
+        let bytes = result?;
+        let msg = deserialize_message(&bytes)?;
+        match msg {
+            Message::Handshake { version } => handle_handshake(framed, version).await?,
+            Message::SyncStart { total_size } => {
+                if show_progress && total_size > 0 {
+                    pb = Some(Arc::new(tools::create_progress_bar(total_size)));
+                }
+            }
+            Message::SyncDir { path, metadata } => {
+                handle_sync_dir(path, metadata, dst_root).await?;
+            }
+            Message::SyncSymlink {
                 path,
-                indices: requested,
-            })?)
-            .await?;
+                target,
+                metadata,
+            } => handle_sync_symlink(path, target, metadata, dst_root).await?,
+            Message::SyncFile {
+                path,
+                metadata,
+                threshold,
+                checksum,
+            } => {
+                current_metadata = Some(metadata);
+                if let Some(ref progress) = pb {
+                    progress.set_message(path.clone());
+                }
+                let full_path = dst_root.join(&path);
+                let mut skipped = false;
+                if full_path.exists() {
+                    let meta = tokio::fs::metadata(&full_path).await?;
+                    #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+                    if meta.len() == metadata.size
+                        && !checksum
+                        && meta.mtime() == metadata.mtime
+                        && (meta.mtime_nsec() as u32) == metadata.mtime_nsec
+                    {
+                        skipped = true;
+                    }
+                }
+
+                handle_sync_file(framed, path, metadata, threshold, checksum, dst_root).await?;
+
+                if skipped {
+                    if let Some(ref progress) = pb {
+                        progress.inc(metadata.size);
+                    }
+                }
+            }
+            Message::BlockHashes { path, hashes } => {
+                let full_path = dst_root.join(&path);
+                let requested = tools::compute_requested_blocks(&full_path, &hashes, BLOCK_SIZE)?;
+
+                if let Some(ref progress) = pb {
+                    // Calculate skipped bytes for delta sync
+                    let total_blocks = u64::try_from(hashes.len())?;
+                    let requested_count = u64::try_from(requested.len())?;
+                    if total_blocks > requested_count && let Some(meta) = current_metadata {
+                        let mut requested_bytes = 0u64;
+                        for &idx in &requested {
+                            let offset = u64::from(idx) * BLOCK_SIZE;
+                            let n = std::cmp::min(BLOCK_SIZE, meta.size - offset);
+                            requested_bytes += n;
+                        }
+                        progress.inc(meta.size - requested_bytes);
+                    }
+                }
+
+                if requested.is_empty() {
+                    framed
+                        .send(serialize_message(&Message::EndOfFile { path })?)
+                        .await?;
+                } else {
+                    framed
+                        .send(serialize_message(&Message::RequestBlocks {
+                            path,
+                            indices: requested,
+                        })?)
+                        .await?;
+                }
+            }
+            Message::ApplyBlocks { path, blocks } => {
+                if let Some(ref progress) = pb {
+                    let bytes_received: u64 = blocks.iter().map(|b| b.data.len() as u64).sum();
+                    progress.inc(bytes_received);
+                }
+                handle_apply_blocks(&mut open_files, &path, blocks, dst_root)?;
+            }
+            Message::ApplyMetadata { path, metadata } => {
+                handle_apply_metadata(framed, &mut open_files, path, metadata, dst_root).await?;
+            }
+            Message::EndOfFile { path } => {
+                open_files.remove(&path);
+            }
+            _ => eprintln!("Unhandled message: {msg:?}"),
+        }
     }
+
+    if let Some(progress) = pb {
+        progress.finish_with_message("Done");
+    }
+
     Ok(())
 }
 
@@ -526,50 +625,6 @@ where
 /// # Errors
 ///
 /// Returns an error if synchronization or network I/O fails.
-pub async fn handle_client<T>(
-    framed: &mut Framed<T, DsyncCodec>,
-    dst_root: &Path,
-) -> anyhow::Result<()>
-where
-    T: AsyncRead + AsyncWrite + Unpin,
-{
-    let mut open_files: HashMap<String, std::fs::File> = HashMap::new();
-    while let Some(result) = framed.next().await {
-        let bytes = result?;
-        let msg = deserialize_message(&bytes)?;
-        match msg {
-            Message::Handshake { version } => handle_handshake(framed, version).await?,
-            Message::SyncDir { path, metadata } => {
-                handle_sync_dir(path, metadata, dst_root).await?;
-            }
-            Message::SyncSymlink {
-                path,
-                target,
-                metadata,
-            } => handle_sync_symlink(path, target, metadata, dst_root).await?,
-            Message::SyncFile {
-                path,
-                metadata,
-                threshold,
-                checksum,
-            } => handle_sync_file(framed, path, metadata, threshold, checksum, dst_root).await?,
-            Message::BlockHashes { path, hashes } => {
-                handle_block_hashes(framed, path, hashes, dst_root).await?;
-            }
-            Message::ApplyBlocks { path, blocks } => {
-                handle_apply_blocks(&mut open_files, &path, blocks, dst_root)?;
-            }
-            Message::ApplyMetadata { path, metadata } => {
-                handle_apply_metadata(framed, &mut open_files, path, metadata, dst_root).await?;
-            }
-            Message::EndOfFile { path } => {
-                open_files.remove(&path);
-            }
-            _ => eprintln!("Unhandled message: {msg:?}"),
-        }
-    }
-    Ok(())
-}
 
 /// Run the sender to coordinate the client-side sync.
 ///
@@ -793,6 +848,12 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     sender_handshake(framed).await?;
+
+    framed
+        .send(serialize_message(&Message::SyncStart {
+            total_size: pb.length().unwrap_or(0),
+        })?)
+        .await?;
 
     for task in tasks {
         match task {

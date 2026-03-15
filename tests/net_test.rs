@@ -61,7 +61,7 @@ async fn test_full_network_sync_simulation() -> anyhow::Result<()> {
     let receiver_handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.map_err(|e| anyhow::anyhow!(e))?;
         let mut framed = Framed::new(stream, DsyncCodec);
-        net::handle_client(&mut framed, &dst_root).await
+        net::handle_client(&mut framed, &dst_root, false).await
     });
 
     // Run sender
