@@ -359,12 +359,11 @@ pub async fn run_ssh_receiver(
 
 async fn handle_handshake<T>(
     framed: &mut Framed<T, DsyncCodec>,
-    version: String,
+    _version: String,
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    tracing::info!("Client connected (version: {version})");
     let resp = Message::Handshake {
         version: env!("CARGO_PKG_VERSION").to_string(),
     };
@@ -407,11 +406,12 @@ async fn handle_sync_file<T>(
     threshold: f32,
     checksum: bool,
     dst_root: &Path,
+    pb: &Option<Arc<ProgressBar>>,
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    tracing::info!("Syncing file: {path} ({} bytes)", metadata.size);
+    tracing::debug!("Syncing file: {path} ({} bytes)", metadata.size);
     let full_path = dst_root.join(&path);
 
     if full_path.exists() {
@@ -431,6 +431,9 @@ where
         if metadata.size > 0
             && tools::should_use_full_copy_meta(metadata.size, &full_path, threshold).await?
         {
+            if let Some(progress) = pb {
+                progress.set_message(format!("Full copy: {path}"));
+            }
             framed
                 .send(serialize_message(&Message::RequestFullCopy { path })?)
                 .await?;
@@ -441,12 +444,18 @@ where
         // Pre-allocate new file
         tools::preallocate(&full_path, metadata.size)?;
 
+        if let Some(progress) = pb {
+            progress.set_message(format!("Full copy: {path}"));
+        }
         framed
             .send(serialize_message(&Message::RequestFullCopy { path })?)
             .await?;
         return Ok(());
     }
 
+    if let Some(progress) = pb {
+        progress.set_message(format!("Hashing: {path}"));
+    }
     framed
         .send(serialize_message(&Message::RequestHashes { path })?)
         .await?;
@@ -474,8 +483,12 @@ where
         let bytes = result?;
         let msg = deserialize_message(&bytes)?;
         match msg {
-            Message::Handshake { version } => handle_handshake(framed, version).await?,
+            Message::Handshake { version } => {
+                tracing::debug!("Client connected (version: {version})");
+                handle_handshake(framed, version).await?;
+            }
             Message::SyncStart { total_size } => {
+                tracing::debug!("Starting sync (total size: {total_size} bytes)");
                 if show_progress && total_size > 0 {
                     pb = Some(Arc::new(tools::create_progress_bar(total_size)));
                 }
@@ -495,7 +508,7 @@ where
                 checksum,
             } => {
                 current_metadata = Some(metadata);
-                if let Some(ref progress) = pb {
+                if let Some(progress) = &pb {
                     progress.set_message(path.clone());
                 }
                 let full_path = dst_root.join(&path);
@@ -512,19 +525,19 @@ where
                     }
                 }
 
-                handle_sync_file(framed, path, metadata, threshold, checksum, dst_root).await?;
-
                 if skipped {
-                    if let Some(ref progress) = pb {
+                    if let Some(progress) = &pb {
                         progress.inc(metadata.size);
                     }
+                } else {
+                    handle_sync_file(framed, path, metadata, threshold, checksum, dst_root, &pb).await?;
                 }
             }
             Message::BlockHashes { path, hashes } => {
                 let full_path = dst_root.join(&path);
                 let requested = tools::compute_requested_blocks(&full_path, &hashes, BLOCK_SIZE)?;
 
-                if let Some(ref progress) = pb {
+                if let Some(progress) = &pb {
                     // Calculate skipped bytes for delta sync
                     let total_blocks = u64::try_from(hashes.len())?;
                     let requested_count = u64::try_from(requested.len())?;
@@ -553,7 +566,7 @@ where
                 }
             }
             Message::ApplyBlocks { path, blocks } => {
-                if let Some(ref progress) = pb {
+                if let Some(progress) = &pb {
                     let bytes_received: u64 = blocks.iter().map(|b| b.data.len() as u64).sum();
                     progress.inc(bytes_received);
                 }
