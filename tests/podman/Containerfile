@@ -1,12 +1,14 @@
-FROM fedora:41
+FROM debian:stable-slim
 
-RUN dnf install -y openssh-server openssh-clients iproute procps-ng && \
-    dnf clean all
+RUN apt-get update && \
+    apt-get install -y openssh-server openssh-client iproute2 procps sudo && \
+    apt-get clean && \
+    rm -rf /var/lib/apt/lists/*
 
 RUN ssh-keygen -A
 
 # Create devops user
-RUN useradd -m devops && \
+RUN useradd -m -s /bin/bash devops && \
     echo "devops:devops" | chpasswd
 
 # Setup SSH for devops user
