@@ -40,132 +40,82 @@ The binary will be available at `./target/release/pxs`.
 
 ```mermaid
 flowchart LR
-    subgraph "Local Machine"
-        SRC[("Source\n/data/pgdata")]
-        DST[("Destination\n/backup/pgdata")]
-        
-        subgraph "pxs Engine"
-            W["Parallel\nFile Walker"]
-            H["Parallel\nBlock Hasher\n(XxHash64)"]
-            C["Block\nComparator"]
-            T["Parallel\nBlock Writer"]
-        end
-    end
-    
-    SRC --> W
-    W --> H
-    H --> C
-    C -->|"Changed blocks only"| T
-    T --> DST
-    
-    style SRC fill:#e1f5fe
-    style DST fill:#c8e6c9
-    style H fill:#fff3e0
-    style T fill:#fff3e0
+    SRC[Source path] --> WALK[Parallel file walker]
+    WALK --> HASH[Parallel block hasher]
+    HASH --> COMPARE[Block comparator]
+    COMPARE -->|Changed blocks only| WRITE[Parallel block writer]
+    WRITE --> DST[Destination path]
 ```
+
+Mermaid source: [`docs/diagrams/local-sync.mmd`](docs/diagrams/local-sync.mmd)
+Fallback image: [`docs/diagrams/local-sync.svg`](docs/diagrams/local-sync.svg)
 
 ### Network Synchronization (Direct TCP)
 
 ```mermaid
 sequenceDiagram
-    box rgb(225, 245, 254) Server 1 (Sender)
-        participant S as pxs Sender
-        participant SF as Source Files
-    end
-    box rgb(200, 230, 201) Server 2 (Receiver)
-        participant R as pxs Receiver
-        participant DF as Dest Files
-    end
+    participant S as Sender
+    participant R as Receiver
 
-    Note over S,R: TCP Connection (Port 8080)
-    
-    S->>R: Handshake (version)
+    S->>R: Handshake
     R->>S: Handshake ACK
-    
+
     loop For each file
-        S->>R: SyncFile (path, metadata, size)
-        
-        alt File exists & size matches
+        S->>R: SyncFile(path, metadata, size)
+        alt Destination can delta sync
             R->>S: RequestHashes
-            S->>R: BlockHashes (128KB chunks)
-            R->>R: Compare with local hashes
-            R->>S: RequestBlocks (changed indices)
-            S->>R: ApplyBlocks (delta data)
-        else New file or size mismatch
+            S->>R: BlockHashes
+            R->>S: RequestBlocks(changed indexes)
+            S->>R: ApplyBlocks(delta data)
+        else Full copy required
             R->>S: RequestFullCopy
-            S->>R: ApplyBlocks (all data)
+            S->>R: ApplyBlocks(all data)
         end
-        
         S->>R: ApplyMetadata
         R->>S: MetadataApplied
     end
 ```
 
+Mermaid source: [`docs/diagrams/direct-tcp.mmd`](docs/diagrams/direct-tcp.mmd)
+Fallback image: [`docs/diagrams/direct-tcp.svg`](docs/diagrams/direct-tcp.svg)
+
 ### SSH Synchronization (Auto-Tunnel)
 
 ```mermaid
-flowchart TB
-    subgraph local["Local Machine"]
-        CLI["pxs --source /data\n--remote user@server:/backup"]
-        STDIN["stdin"]
-        STDOUT["stdout"]
-    end
-    
-    subgraph ssh["SSH Tunnel"]
-        SSH["SSH Process\n(aes128-gcm)"]
-    end
-    
-    subgraph remote["Remote Server"]
-        RPXS["pxs --stdio\n--destination /backup"]
-        RDST[("Destination\n/backup")]
-    end
-    
-    CLI -->|"Spawns"| SSH
-    CLI <-->|"pxs protocol"| STDIN
-    STDIN <--> SSH
-    SSH <-->|"Encrypted"| RPXS
-    STDOUT <--> SSH
-    RPXS --> RDST
-    
-    style local fill:#e3f2fd
-    style ssh fill:#fff8e1
-    style remote fill:#e8f5e9
+flowchart LR
+    CLI[Local pxs CLI] -->|starts| SSH[SSH process]
+    CLI <-->|pxs protocol over stdio| SSH
+    SSH <-->|encrypted transport| REMOTE[Remote pxs --stdio]
+    REMOTE --> DST[Destination path]
 ```
+
+Mermaid source: [`docs/diagrams/ssh-flow.mmd`](docs/diagrams/ssh-flow.mmd)
+Fallback image: [`docs/diagrams/ssh-flow.svg`](docs/diagrams/ssh-flow.svg)
 
 ### Delta Sync Algorithm
 
 ```mermaid
 flowchart TD
-    START([Start Sync]) --> CHECK{File exists\nat dest?}
-    
-    CHECK -->|No| FULL[Full Copy]
-    CHECK -->|Yes| SIZE{Size\nmatches?}
-    
-    SIZE -->|No| THRESH{Dest < threshold%\nof source?}
-    SIZE -->|Yes| MTIME{mtime\nmatches?}
-    
+    START([Start sync]) --> EXISTS{Destination exists?}
+    EXISTS -->|No| FULL[Full copy]
+    EXISTS -->|Yes| SIZE{Size matches?}
+    SIZE -->|No| THRESH{Below threshold?}
     THRESH -->|Yes| FULL
-    THRESH -->|No| DELTA
-    
-    MTIME -->|Yes & !checksum| SKIP[Skip File]
-    MTIME -->|No or checksum| DELTA[Delta Sync]
-    
-    subgraph DELTA[Delta Sync]
-        direction TB
-        D1[Hash source blocks\nin parallel] --> D2[Hash dest blocks\nin parallel]
-        D2 --> D3[Compare hashes]
-        D3 --> D4[Transfer only\nchanged blocks]
-    end
-    
-    FULL --> META[Apply Metadata]
-    DELTA --> META
+    THRESH -->|No| DELTA[Delta sync]
+    SIZE -->|Yes| MTIME{mtime matches and no checksum?}
+    MTIME -->|Yes| SKIP[Skip file]
+    MTIME -->|No| DELTA
+    DELTA --> HASH[Hash source and destination blocks]
+    HASH --> DIFF[Compare block hashes]
+    DIFF --> APPLY[Transfer changed blocks only]
+    FULL --> META[Apply metadata]
+    APPLY --> META
     SKIP --> DONE([Done])
     META --> DONE
-    
-    style SKIP fill:#c8e6c9
-    style FULL fill:#ffcdd2
-    style DELTA fill:#fff3e0
 ```
+
+Mermaid source: [`docs/diagrams/delta-sync.mmd`](docs/diagrams/delta-sync.mmd)
+Fallback image: [`docs/diagrams/delta-sync.svg`](docs/diagrams/delta-sync.svg)
 
 ## Usage
 

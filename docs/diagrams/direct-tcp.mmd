@@ -1,0 +1,21 @@
+sequenceDiagram
+    participant S as Sender
+    participant R as Receiver
+
+    S->>R: Handshake
+    R->>S: Handshake ACK
+
+    loop For each file
+        S->>R: SyncFile(path, metadata, size)
+        alt Destination can delta sync
+            R->>S: RequestHashes
+            S->>R: BlockHashes
+            R->>S: RequestBlocks(changed indexes)
+            S->>R: ApplyBlocks(delta data)
+        else Full copy required
+            R->>S: RequestFullCopy
+            S->>R: ApplyBlocks(all data)
+        end
+        S->>R: ApplyMetadata
+        R->>S: MetadataApplied
+    end
