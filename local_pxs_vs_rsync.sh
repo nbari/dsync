@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# local_dsync_vs_rsync.sh - Optimized Benchmark
-# Compares dsync (fixed-block) vs rsync (rolling-hash)
+# local_pxs_vs_rsync.sh - Optimized Benchmark
+# Compares pxs (fixed-block) vs rsync (rolling-hash)
 
-WORKDIR="${WORKDIR:-/tmp/dsync-bench}"
+WORKDIR="${WORKDIR:-/tmp/pxs-bench}"
 SRC="$WORKDIR/src.bin"
 DST="$WORKDIR/dst.bin"
 DSYNC_CMD="${DSYNC:-cargo run --release --}"
@@ -24,8 +24,8 @@ run_bench() {
     echo "CMD: $cmd"
     
     TIMEFORMAT="  Time: %R seconds"
-    if [[ "$tool" == "dsync" ]]; then
-        # Show dsync output to see the "Summary: X/Y blocks updated"
+    if [[ "$tool" == "pxs" ]]; then
+        # Show pxs output to see the "Summary: X/Y blocks updated"
         time {
             eval "$cmd"
         }
@@ -78,7 +78,7 @@ main() {
     
     setup_baseline
     overwrite_middle
-    run_bench "Aligned-Overwrite" "dsync" "$DSYNC_CMD --source $SRC --destination $DST ${DSYNC_FLAGS[*]}"
+    run_bench "Aligned-Overwrite" "pxs" "$DSYNC_CMD --source $SRC --destination $DST ${DSYNC_FLAGS[*]}"
 
     # Scenario B: Data Shift
     setup_baseline
@@ -87,7 +87,7 @@ main() {
     
     setup_baseline
     prepend_byte
-    run_bench "Data-Shift" "dsync" "$DSYNC_CMD --source $SRC --destination $DST ${DSYNC_FLAGS[*]}"
+    run_bench "Data-Shift" "pxs" "$DSYNC_CMD --source $SRC --destination $DST ${DSYNC_FLAGS[*]}"
 
     echo -e "\nBenchmark complete."
 }

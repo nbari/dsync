@@ -21,8 +21,8 @@ USER root
 # Ensure SSH directory exists and has correct permissions
 RUN mkdir -p /run/sshd && chmod 755 /run/sshd
 
-# Install dsync (we will mount the binary)
-# COPY target/release/dsync /usr/local/bin/dsync
+# Install pxs (we will mount the binary)
+# COPY target/release/pxs /usr/local/bin/pxs
 
 EXPOSE 22
 

@@ -1,4 +1,4 @@
-use crate::dsync::tools;
+use crate::pxs::tools;
 use anyhow::Context;
 use bytes::{Buf, BufMut, BytesMut};
 use filetime::FileTime;
@@ -25,6 +25,7 @@ use tokio::{
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
 const BLOCK_SIZE: u64 = 128 * 1024;
+const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, Copy)]
 pub struct FileMetadata {
@@ -155,9 +156,9 @@ pub fn apply_file_metadata(path: &Path, metadata: &FileMetadata) -> anyhow::Resu
 
 const MAGIC: &[u8; 4] = b"DSYC";
 
-pub struct DsyncCodec;
+pub struct PxsCodec;
 
-impl Decoder for DsyncCodec {
+impl Decoder for PxsCodec {
     type Item = Vec<u8>;
     type Error = anyhow::Error;
 
@@ -188,7 +189,7 @@ impl Decoder for DsyncCodec {
                 return Ok(None);
             }
             let len = u32::from_be_bytes(len_bytes) as usize;
-            if len > 64 * 1024 * 1024 {
+            if len > MAX_FRAME_SIZE {
                 return Err(anyhow::anyhow!("Frame size too big: {len}"));
             }
             if src.len() < 8 + len {
@@ -201,10 +202,10 @@ impl Decoder for DsyncCodec {
     }
 }
 
-impl Encoder<AlignedVec<16>> for DsyncCodec {
+impl Encoder<AlignedVec<16>> for PxsCodec {
     type Error = anyhow::Error;
     fn encode(&mut self, item: AlignedVec<16>, dst: &mut BytesMut) -> Result<(), Self::Error> {
-        if item.len() > 64 * 1024 * 1024 {
+        if item.len() > MAX_FRAME_SIZE {
             return Err(anyhow::anyhow!("Frame size too big: {}", item.len()));
         }
         dst.reserve(8 + item.len());
@@ -239,7 +240,7 @@ pub async fn run_sender_listener(
         let pb = Arc::new(tools::create_progress_bar(total_size));
 
         tokio::spawn(async move {
-            let mut framed = Framed::new(stream, DsyncCodec);
+            let mut framed = Framed::new(stream, PxsCodec);
             if let Err(e) =
                 sender_loop(&mut framed, &src_root, threshold, checksum, &tasks, pb).await
             {
@@ -258,7 +259,7 @@ pub async fn run_sender_listener(
 /// Returns an error if the connection fails or synchronization fails.
 pub async fn run_pull_client(addr: &str, dst_root: &Path) -> anyhow::Result<()> {
     let stream = TcpStream::connect(addr).await?;
-    let mut framed = Framed::new(stream, DsyncCodec);
+    let mut framed = Framed::new(stream, PxsCodec);
     handle_client(&mut framed, dst_root, true).await
 }
 
@@ -274,7 +275,7 @@ pub async fn run_receiver(addr: &str, dst_root: &Path) -> anyhow::Result<()> {
         eprintln!("Accepted connection from {peer_addr}");
         let dst_root = dst_root.to_path_buf();
         tokio::spawn(async move {
-            let mut framed = Framed::new(stream, DsyncCodec);
+            let mut framed = Framed::new(stream, PxsCodec);
             if let Err(e) = handle_client(&mut framed, &dst_root, false).await {
                 eprintln!("Error handling client {peer_addr}: {e}");
             }
@@ -293,7 +294,7 @@ pub async fn run_stdio_receiver(dst_root: &Path) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let combined = tokio::io::join(stdin, stdout);
-    let mut framed = Framed::new(combined, DsyncCodec);
+    let mut framed = Framed::new(combined, PxsCodec);
     handle_client(&mut framed, dst_root, false).await
 }
 
@@ -321,7 +322,7 @@ pub async fn run_ssh_receiver(
         .arg(addr);
 
     let mut remote_cmd =
-        format!("dsync --stdio --sender --source {src_path} --threshold {threshold}");
+        format!("pxs --stdio --sender --source {src_path} --threshold {threshold}");
     if checksum {
         remote_cmd.push_str(" --checksum");
     }
@@ -346,7 +347,7 @@ pub async fn run_ssh_receiver(
 
     {
         let combined = tokio::io::join(stdout, stdin);
-        let mut framed = Framed::new(combined, DsyncCodec);
+        let mut framed = Framed::new(combined, PxsCodec);
         handle_client(&mut framed, dst_root, true).await?;
     }
 
@@ -358,7 +359,7 @@ pub async fn run_ssh_receiver(
 }
 
 async fn handle_handshake<T>(
-    framed: &mut Framed<T, DsyncCodec>,
+    framed: &mut Framed<T, PxsCodec>,
     _version: String,
 ) -> anyhow::Result<()>
 where
@@ -400,7 +401,7 @@ async fn handle_sync_symlink(
 }
 
 async fn handle_sync_file<T>(
-    framed: &mut Framed<T, DsyncCodec>,
+    framed: &mut Framed<T, PxsCodec>,
     path: String,
     metadata: FileMetadata,
     threshold: f32,
@@ -468,7 +469,7 @@ where
 ///
 /// Returns an error if synchronization or network I/O fails.
 pub async fn handle_client<T>(
-    framed: &mut Framed<T, DsyncCodec>,
+    framed: &mut Framed<T, PxsCodec>,
     dst_root: &Path,
     show_progress: bool,
 ) -> anyhow::Result<()>
@@ -603,7 +604,7 @@ fn handle_apply_blocks(
 }
 
 async fn handle_apply_metadata<T>(
-    framed: &mut Framed<T, DsyncCodec>,
+    framed: &mut Framed<T, PxsCodec>,
     open_files: &mut HashMap<String, std::fs::File>,
     path: String,
     metadata: FileMetadata,
@@ -623,7 +624,7 @@ where
 
 #[allow(clippy::too_many_arguments)]
 async fn handle_client_sync_file<T>(
-    framed: &mut Framed<T, DsyncCodec>,
+    framed: &mut Framed<T, PxsCodec>,
     path: String,
     metadata: FileMetadata,
     threshold: f32,
@@ -682,7 +683,7 @@ pub async fn run_sender(
         .any(|task| !matches!(task, SyncTask::File { .. }));
     if has_non_file_tasks {
         let stream = TcpStream::connect(addr).await?;
-        let mut framed = Framed::new(stream, DsyncCodec);
+        let mut framed = Framed::new(stream, PxsCodec);
         sender_handshake(&mut framed).await?;
         for task in &tasks {
             match task {
@@ -746,7 +747,7 @@ pub async fn run_sender(
 
         workers.push(tokio::spawn(async move {
             let stream = TcpStream::connect(&addr_owned).await?;
-            let mut framed = Framed::new(stream, DsyncCodec);
+            let mut framed = Framed::new(stream, PxsCodec);
             sender_handshake(&mut framed).await?;
 
             for rel_path in batch {
@@ -790,7 +791,7 @@ pub async fn run_stdio_sender(
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let combined = tokio::io::join(stdin, stdout);
-    let mut framed = Framed::new(combined, DsyncCodec);
+    let mut framed = Framed::new(combined, PxsCodec);
     sender_loop(&mut framed, src_root, threshold, checksum, &tasks, pb).await
 }
 
@@ -818,7 +819,7 @@ pub async fn run_ssh_sender(
         .arg("-o")
         .arg("IPQoS=throughput")
         .arg(addr);
-    let mut remote_cmd = format!("dsync --stdio --destination {dst_path}");
+    let mut remote_cmd = format!("pxs --stdio --destination {dst_path}");
     for pattern in ignores {
         let _ = write!(remote_cmd, " --ignore '{pattern}'");
     }
@@ -837,7 +838,7 @@ pub async fn run_ssh_sender(
         .ok_or_else(|| anyhow::anyhow!("stdout failed"))?;
     {
         let combined = tokio::io::join(stdout, stdin);
-        let mut framed = Framed::new(combined, DsyncCodec);
+        let mut framed = Framed::new(combined, PxsCodec);
         sender_loop(
             &mut framed,
             src_root,
@@ -856,7 +857,7 @@ pub async fn run_ssh_sender(
     Ok(())
 }
 
-async fn sender_handshake<T>(framed: &mut Framed<T, DsyncCodec>) -> anyhow::Result<()>
+async fn sender_handshake<T>(framed: &mut Framed<T, PxsCodec>) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
@@ -873,7 +874,7 @@ where
 }
 
 async fn sender_loop<T>(
-    framed: &mut Framed<T, DsyncCodec>,
+    framed: &mut Framed<T, PxsCodec>,
     src_root: &Path,
     threshold: f32,
     checksum: bool,
@@ -1048,7 +1049,7 @@ async fn collect_sync_tasks(
 /// Returns an error if synchronization fails.
 #[allow(clippy::too_many_lines)]
 pub async fn sync_remote_file<T>(
-    framed: &mut Framed<T, DsyncCodec>,
+    framed: &mut Framed<T, PxsCodec>,
     src_root: &Path,
     path: &Path,
     threshold: f32,

@@ -1,24 +1,24 @@
 # Repository Guidelines
 
 ## Project Structure & Module Organization
-- `src/bin/dsync.rs`: CLI entrypoint.
+- `src/bin/pxs.rs`: CLI entrypoint.
 - `src/cli/`: argument parsing, command dispatch, startup, and telemetry.
-- `src/dsync/`: sync engine modules:
+- `src/pxs/`: sync engine modules:
   - `sync.rs` (local block sync),
   - `net.rs` (protocol + remote transfer),
   - `tools.rs` (shared helpers/utilities).
 - `tests/`: integration-style tests (`sync_test.rs`, `net_test.rs`).
 - `.github/workflows/`: CI for tests and deploy.
-- Benchmark helpers: `benchmark.sh`, `local_dsync_vs_rsync.sh`, `remote_dsync_vs_rsync.sh`.
+- Benchmark helpers: `benchmark.sh`, `local_pxs_vs_rsync.sh`, `remote_pxs_vs_rsync.sh`.
 
 ## Build, Test, and Development Commands
-- `cargo build --release`: build optimized binary (`target/release/dsync`).
+- `cargo build --release`: build optimized binary (`target/release/pxs`).
 - `cargo test`: run all tests.
 - `cargo clippy --all-targets --all-features`: run strict lint checks.
 - `cargo fmt --all`: format code.
 - `just test`: run clippy + tests via `.justfile`.
-- `./local_dsync_vs_rsync.sh`: local rsync vs dsync benchmark.
-- `./remote_dsync_vs_rsync.sh --source <PATH> --host <USER@HOST> --remote-root <PATH>`: remote benchmark.
+- `./local_pxs_vs_rsync.sh`: local rsync vs pxs benchmark.
+- `./remote_pxs_vs_rsync.sh --source <PATH> --host <USER@HOST> --remote-root <PATH>`: remote benchmark.
 
 ## Coding Style & Naming Conventions
 - Language: Rust (edition 2024), standard `rustfmt` formatting (4-space indentation).

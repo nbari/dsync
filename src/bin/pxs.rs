@@ -1,5 +1,5 @@
 use anyhow::Result;
-use dsync::cli::{actions, actions::Action, start};
+use pxs::cli::{actions, actions::Action, start};
 
 // Main function
 #[tokio::main]
@@ -19,7 +19,7 @@ async fn main() -> Result<()> {
         }
     }
 
-    dsync::cli::telemetry::shutdown();
+    pxs::cli::telemetry::shutdown();
 
     Ok(())
 }

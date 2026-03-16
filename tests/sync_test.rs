@@ -1,4 +1,4 @@
-use dsync::dsync::{sync, tools};
+use pxs::pxs::{sync, tools};
 use filetime::{FileTime, set_file_times};
 use std::{
     fs,

@@ -1,15 +1,25 @@
 [package]
-name = "dsync"
-version = "0.1.9"
+name = "pxs"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.85"
 
 authors = ["Nicolas Embriz <nbari@tequila.io>"]
-description = "High-performance, concurrent synchronization tool for massive data transfers."
+description = "pxs (Parallel X-Sync) - High-performance, concurrent file synchronization tool for massive data transfers."
 readme = "README.md"
-repository = "https://github.com/nbari/dsync"
-keywords = ["sync", "performance", "network", "parallel", "postgres"]
-categories = ["command-line-utilities", "network-programming"]
+homepage = "https://github.com/nbari/pxs"
+repository = "https://github.com/nbari/pxs"
+documentation = "https://docs.rs/pxs"
+keywords = ["sync", "rsync", "parallel", "transfer", "backup"]
+categories = ["command-line-utilities", "filesystem"]
 license = "BSD-3-Clause"
+exclude = [
+    "tests/podman/*",
+    "benchmark.sh",
+    "local_pxs_vs_rsync.sh",
+    "remote_pxs_vs_rsync.sh",
+    ".github/*",
+]
 
 [lints.rust]
 warnings = "deny"
@@ -42,7 +52,6 @@ large_stack_arrays = "deny"
 
 [dependencies]
 anyhow = "1"
-blake3 = "1.8.3"
 bytes = "1.11.1"
 chrono = "0.4"
 clap = { version = "4.6", features = ["env"] }
@@ -67,12 +76,12 @@ twox-hash = "2.1.2"
 
 [package.metadata.generate-rpm]
 assets = [
-    { source = "target/release/dsync", dest = "/usr/local/bin/dsync", mode = "0755" },
+    { source = "target/release/pxs", dest = "/usr/local/bin/pxs", mode = "0755" },
 ]
 
 [package.metadata.deb]
 assets = [
-  ["target/release/dsync", "/usr/local/bin/dsync", "755"],
+  ["target/release/pxs", "/usr/local/bin/pxs", "755"],
 ]
 depends = ""
 

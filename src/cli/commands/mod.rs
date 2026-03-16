@@ -1,3 +1,4 @@
+use crate::built_info;
 use clap::{
     Arg, ArgAction, ColorChoice, Command,
     builder::{
@@ -5,7 +6,22 @@ use clap::{
         styling::{AnsiColor, Effects, Styles},
     },
 };
-use std::{env, path::PathBuf};
+use std::path::PathBuf;
+
+/// Generate extended version string with git info
+fn long_version() -> &'static str {
+    let version = built_info::PKG_VERSION;
+    let git_hash = built_info::GIT_COMMIT_HASH_SHORT.unwrap_or("unknown");
+    let git_dirty = if built_info::GIT_DIRTY.unwrap_or(false) {
+        "-dirty"
+    } else {
+        ""
+    };
+
+    let version_string = format!("{version} (git: {git_hash}{git_dirty})");
+    // Leak the string to get a 'static lifetime - this is fine for CLI version string
+    Box::leak(version_string.into_boxed_str())
+}
 
 pub fn validator_path_exists() -> ValueParser {
     ValueParser::from(move |s: &str| -> std::result::Result<PathBuf, String> {
@@ -53,26 +69,26 @@ pub fn new() -> Command {
         .literal(AnsiColor::Blue.on_default() | Effects::BOLD)
         .placeholder(AnsiColor::Green.on_default());
 
-    Command::new("dsync")
-        .about("High-performance, concurrent synchronization tool for massive data transfers.")
+    Command::new("pxs")
+        .about("pxs (Parallel X-Sync) - High-performance, concurrent file synchronization tool.")
         .long_about(
-            "dsync is a multi-threaded file synchronization tool designed to saturate \
-            high-speed networks (10GbE+) and utilize multi-core CPUs for hashing. \
+            "pxs is a multi-threaded file synchronization tool designed to saturate \
+            high-speed networks (10GbE+) and utilize multi-core CPUs for parallel hashing. \
             It uses 128KB fixed-block chunking and XxHash64 for extremely fast comparison, \
             making it ideal for large database files like Postgres PG_DATA.\n\n\
             EXAMPLES:\n\n\
             1. Local Sync (File or Directory):\n\
-               dsync --source /data/old --destination /data/new\n\n\
+               pxs --source /data/old --destination /data/new\n\n\
             2. Network Sync - Receiver (Server 2):\n\
-               dsync --listen 0.0.0.0:8080 --destination /new/pgdata\n\n\
+               pxs --listen 0.0.0.0:8080 --destination /new/pgdata\n\n\
             3. Network Sync - Sender (Server 1):\n\
-               dsync --remote 192.168.1.10:8080 --source /old/pgdata\n\n\
+               pxs --remote 192.168.1.10:8080 --source /old/pgdata\n\n\
             4. Pull Mode (SSH):\n\
-               dsync --remote user@server:/data --destination ./local --pull\n\n\
+               pxs --remote user@server:/data --destination ./local --pull\n\n\
             5. Force Content Verification (Checksum):\n\
-               dsync --source file.bin --destination copy.bin --checksum"
+               pxs --source file.bin --destination copy.bin --checksum"
         )
-        .version(env!("CARGO_PKG_VERSION"))
+        .version(long_version())
         .color(ColorChoice::Auto)
         .styles(styles)
         .arg_required_else_help(true)
@@ -129,7 +145,7 @@ pub fn new() -> Command {
                 .short('c')
                 .long("checksum")
                 .help("Skip based on checksum, not mod-time & size")
-                .long_help("By default, dsync skips files if size and modification time match. Use this to force a block-by-block hash comparison.")
+                .long_help("By default, pxs skips files if size and modification time match. Use this to force a block-by-block hash comparison.")
                 .action(ArgAction::SetTrue),
         )
         .arg(
@@ -144,7 +160,7 @@ pub fn new() -> Command {
                 .short('l')
                 .long("listen")
                 .help("Listen on ADDRESS:PORT for incoming or outgoing sync")
-                .long_help("Starts dsync in server mode. If --destination is used, it receives files. If --source and --sender are used, it serves files to clients.")
+                .long_help("Starts pxs in server mode. If --destination is used, it receives files. If --source and --sender are used, it serves files to clients.")
                 .value_name("ADDR"),
         )
         .arg(
@@ -152,7 +168,7 @@ pub fn new() -> Command {
                 .short('r')
                 .long("remote")
                 .help("Sync with remote ADDRESS:PORT or SSH path")
-                .long_help("Connects to a remote dsync instance. By default, it pushes --source. If --pull is used, it fetches data to --destination.")
+                .long_help("Connects to a remote pxs instance. By default, it pushes --source. If --pull is used, it fetches data to --destination.")
                 .value_name("ADDR"),
         )
         .arg(

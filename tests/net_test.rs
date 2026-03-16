@@ -1,4 +1,4 @@
-use dsync::dsync::net::{self, Block, DsyncCodec, FileMetadata, Message};
+use pxs::pxs::net::{self, Block, PxsCodec, FileMetadata, Message};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio_util::codec::Framed;
@@ -60,7 +60,7 @@ async fn test_full_network_sync_simulation() -> anyhow::Result<()> {
     let dst_root = dst_dir.clone();
     let receiver_handle = tokio::spawn(async move {
         let (stream, _) = listener.accept().await.map_err(|e| anyhow::anyhow!(e))?;
-        let mut framed = Framed::new(stream, DsyncCodec);
+        let mut framed = Framed::new(stream, PxsCodec);
         net::handle_client(&mut framed, &dst_root, false).await
     });
 

@@ -1,4 +1,4 @@
-use crate::dsync::tools;
+use crate::pxs::tools;
 use anyhow::Context;
 use filetime::{FileTime, set_file_times};
 use indicatif::ProgressBar;
@@ -109,7 +109,7 @@ pub async fn sync_dir(
     dry_run: bool,
     ignores: &[String],
 ) -> anyhow::Result<()> {
-    println!("Calculating total size for {}...", src_dir.display());
+    eprintln!("Calculating total size for {}...", src_dir.display());
     let total_size = calculate_total_size(src_dir, ignores)?;
 
     let pb = Arc::new(tools::create_progress_bar(total_size));
@@ -145,7 +145,7 @@ async fn sync_dir_recursive(
     // 1. Create destination root if it doesn't exist
     if !dst_dir.exists() {
         if dry_run {
-            println!("(dry-run) create directory: {}", dst_dir.display());
+            eprintln!("(dry-run) create directory: {}", dst_dir.display());
         } else {
             tokio::fs::create_dir_all(dst_dir).await?;
         }
@@ -174,7 +174,7 @@ async fn sync_dir_recursive(
         .git_exclude(false)
         .ignore(false)
         .parents(false)
-        .overrides(overrides.clone())
+        .overrides(overrides)
         .build();
 
     let mut directory_paths = Vec::new();
@@ -196,7 +196,7 @@ async fn sync_dir_recursive(
             directory_paths.push(src_path.to_path_buf());
             if !dst_path.exists() {
                 if dry_run {
-                    println!("(dry-run) create directory: {}", dst_path.display());
+                    eprintln!("(dry-run) create directory: {}", dst_path.display());
                 } else {
                     tokio::fs::create_dir_all(&dst_path).await?;
                 }
@@ -204,7 +204,7 @@ async fn sync_dir_recursive(
         } else if file_type.is_symlink() {
             let target = tokio::fs::read_link(src_path).await?;
             if dry_run {
-                println!(
+                eprintln!(
                     "(dry-run) symlink {} -> {}",
                     dst_path.display(),
                     target.display()
@@ -236,7 +236,7 @@ async fn sync_dir_recursive(
 
                 if dry_run {
                     let src_size = tools::get_file_size(&src).await?;
-                    println!("(dry-run) sync file: {} ({src_size} bytes)", src.display());
+                    eprintln!("(dry-run) sync file: {} ({src_size} bytes)", src.display());
                     pb_clone.inc(src_size);
                     return Ok::<(), anyhow::Error>(());
                 }

@@ -1,24 +1,24 @@
 #!/usr/bin/env bash
-# ./remote_dsync_vs_rsync.sh \
+# ./remote_pxs_vs_rsync.sh \
 #    --source ./src.bin \
 #    --host devops@10.246.0.54 \
-#    --remote-root /home/devops/dsync_bench/pgdata \
-#    --dsync-bin ./target/release/dsync
+#    --remote-root /home/devops/pxs_bench/pgdata \
+#    --pxs-bin ./target/release/pxs
 
 set -euo pipefail
 
 usage() {
     cat <<'EOF'
 Usage:
-  remote_dsync_vs_rsync.sh --source PATH --host USER@HOST --remote-root PATH [options]
+  remote_pxs_vs_rsync.sh --source PATH --host USER@HOST --remote-root PATH [options]
 
 Required:
   --source PATH         Local source file or directory
   --host USER@HOST      Remote SSH target
-  --remote-root PATH    Remote benchmark root (script uses PATH/dsync and PATH/rsync)
+  --remote-root PATH    Remote benchmark root (script uses PATH/pxs and PATH/rsync)
 
 Options:
-  --dsync-bin PATH      Local dsync binary (default: ./target/release/dsync)
+  --pxs-bin PATH      Local pxs binary (default: ./target/release/pxs)
   --skip-seed           Do not re-seed destinations before incremental rounds
   --no-checksum-round   Skip checksum comparison round
   --ssh-opt OPT         Extra ssh option for rsync/remote setup (repeatable)
@@ -26,7 +26,7 @@ Options:
 
 Notes:
   - The script creates and resets only:
-      REMOTE_ROOT/dsync
+      REMOTE_ROOT/pxs
       REMOTE_ROOT/rsync
   - It does not touch other remote paths.
 EOF
@@ -58,7 +58,7 @@ run_timed() {
 SOURCE=""
 HOST=""
 REMOTE_ROOT=""
-DSYNC_BIN="${DSYNC_BIN:-./target/release/dsync}"
+DSYNC_BIN="${DSYNC_BIN:-./target/release/pxs}"
 SKIP_SEED="false"
 RUN_CHECKSUM_ROUND="true"
 
@@ -83,7 +83,7 @@ while (($#)); do
         REMOTE_ROOT="${2:-}"
         shift 2
         ;;
-    --dsync-bin)
+    --pxs-bin)
         DSYNC_BIN="${2:-}"
         shift 2
         ;;
@@ -113,7 +113,7 @@ done
 [[ -n "$HOST" ]] || fail "--host is required"
 [[ -n "$REMOTE_ROOT" ]] || fail "--remote-root is required"
 [[ -e "$SOURCE" ]] || fail "source path does not exist: $SOURCE"
-[[ -x "$DSYNC_BIN" ]] || fail "dsync binary is not executable: $DSYNC_BIN"
+[[ -x "$DSYNC_BIN" ]] || fail "pxs binary is not executable: $DSYNC_BIN"
 
 if [[ -d "$SOURCE" ]]; then
     RSYNC_SOURCE="${SOURCE%/}/"
@@ -121,7 +121,7 @@ else
     RSYNC_SOURCE="$SOURCE"
 fi
 
-DSYNC_DST="${REMOTE_ROOT%/}/dsync"
+DSYNC_DST="${REMOTE_ROOT%/}/pxs"
 RSYNC_DST="${REMOTE_ROOT%/}/rsync"
 
 SSH_CMD=(ssh "${DEFAULT_SSH_OPTS[@]}" "${EXTRA_SSH_OPTS[@]}")
@@ -137,52 +137,52 @@ echo "== Remote Benchmark Config =="
 echo "source:       $SOURCE"
 echo "host:         $HOST"
 echo "remote root:  $REMOTE_ROOT"
-echo "dsync bin:    $DSYNC_BIN"
+echo "pxs bin:    $DSYNC_BIN"
 echo "skip seed:    $SKIP_SEED"
 echo "checksum rnd: $RUN_CHECKSUM_ROUND"
 echo
 
 command -v rsync >/dev/null || fail "rsync is not installed locally"
-"${SSH_CMD[@]}" "$HOST" "command -v rsync >/dev/null && command -v dsync >/dev/null" ||
-    fail "remote host must have rsync and dsync in PATH"
+"${SSH_CMD[@]}" "$HOST" "command -v rsync >/dev/null && command -v pxs >/dev/null" ||
+    fail "remote host must have rsync and pxs in PATH"
 
 if [[ "$SKIP_SEED" == "false" ]]; then
     echo "== Seeding destinations =="
     "${SSH_CMD[@]}" "$HOST" "mkdir -p '$DSYNC_DST' '$RSYNC_DST'"
-    run_timed "seed_dsync" \
+    run_timed "seed_pxs" \
         rsync -a --delete --inplace --no-whole-file -e "$RSYNC_SSH_CMD" "$RSYNC_SOURCE" "$HOST:$DSYNC_DST/"
     run_timed "seed_rsync" \
         rsync -a --delete --inplace --no-whole-file -e "$RSYNC_SSH_CMD" "$RSYNC_SOURCE" "$HOST:$RSYNC_DST/"
-    echo "seed dsync dst: $(format_ms "${TIMES[seed_dsync]}")"
+    echo "seed pxs dst: $(format_ms "${TIMES[seed_pxs]}")"
     echo "seed rsync dst: $(format_ms "${TIMES[seed_rsync]}")"
     echo
 fi
 
 echo "== No-change Round (no checksum) =="
-run_timed "dsync_no_checksum" \
+run_timed "pxs_no_checksum" \
     "$DSYNC_BIN" -s "$SOURCE" -r "$HOST:$DSYNC_DST"
 run_timed "rsync_no_checksum" \
     rsync -a --inplace --no-whole-file -e "$RSYNC_SSH_CMD" "$RSYNC_SOURCE" "$HOST:$RSYNC_DST/"
-echo "dsync: $(format_ms "${TIMES[dsync_no_checksum]}")"
+echo "pxs: $(format_ms "${TIMES[pxs_no_checksum]}")"
 echo "rsync: $(format_ms "${TIMES[rsync_no_checksum]}")"
 echo
 
 if [[ "$RUN_CHECKSUM_ROUND" == "true" ]]; then
     echo "== No-change Round (checksum) =="
-    run_timed "dsync_checksum" \
+    run_timed "pxs_checksum" \
         "$DSYNC_BIN" -c -s "$SOURCE" -r "$HOST:$DSYNC_DST"
     run_timed "rsync_checksum" \
         rsync -a --checksum --inplace --no-whole-file -e "$RSYNC_SSH_CMD" "$RSYNC_SOURCE" "$HOST:$RSYNC_DST/"
-    echo "dsync -c: $(format_ms "${TIMES[dsync_checksum]}")"
+    echo "pxs -c: $(format_ms "${TIMES[pxs_checksum]}")"
     echo "rsync --checksum: $(format_ms "${TIMES[rsync_checksum]}")"
     echo
 fi
 
 echo "== Summary =="
 printf '%-28s %12s\n' "case" "duration"
-printf '%-28s %12s\n' "dsync (no checksum)" "$(format_ms "${TIMES[dsync_no_checksum]}")"
+printf '%-28s %12s\n' "pxs (no checksum)" "$(format_ms "${TIMES[pxs_no_checksum]}")"
 printf '%-28s %12s\n' "rsync (no checksum)" "$(format_ms "${TIMES[rsync_no_checksum]}")"
 if [[ "$RUN_CHECKSUM_ROUND" == "true" ]]; then
-    printf '%-28s %12s\n' "dsync (-c)" "$(format_ms "${TIMES[dsync_checksum]}")"
+    printf '%-28s %12s\n' "pxs (-c)" "$(format_ms "${TIMES[pxs_checksum]}")"
     printf '%-28s %12s\n' "rsync (--checksum)" "$(format_ms "${TIMES[rsync_checksum]}")"
 fi
