@@ -40,10 +40,8 @@ pub async fn handle(action: Action) -> Result<()> {
         } => {
             if let Some(path) = remote_path {
                 eprintln!("Connecting via SSH to {addr} to sync to {path}");
-                crate::pxs::net::run_ssh_sender(
-                    &addr, &src, &path, threshold, checksum, &ignores,
-                )
-                .await?;
+                crate::pxs::net::run_ssh_sender(&addr, &src, &path, threshold, checksum, &ignores)
+                    .await?;
             } else if addr == "-" {
                 crate::pxs::net::run_stdio_sender(&src, threshold, checksum, &ignores).await?;
             } else {

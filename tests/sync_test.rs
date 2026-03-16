@@ -1,5 +1,5 @@
-use pxs::pxs::{sync, tools};
 use filetime::{FileTime, set_file_times};
+use pxs::pxs::{sync, tools};
 use std::{
     fs,
     io::{Seek, SeekFrom, Write},

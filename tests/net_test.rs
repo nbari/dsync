@@ -1,4 +1,4 @@
-use pxs::pxs::net::{self, Block, PxsCodec, FileMetadata, Message};
+use pxs::pxs::net::{self, Block, FileMetadata, Message, PxsCodec};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio_util::codec::Framed;
