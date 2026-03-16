@@ -2,8 +2,6 @@
 name = "pxs"
 version = "0.2.0"
 edition = "2024"
-rust-version = "1.85"
-
 authors = ["Nicolas Embriz <nbari@tequila.io>"]
 description = "pxs (Parallel X-Sync) - High-performance, concurrent file synchronization tool for massive data transfers."
 readme = "README.md"
@@ -86,7 +84,7 @@ assets = [
 depends = ""
 
 [build-dependencies]
-built = { version = "0.8.0", features = ["git2"] }
+built = { version = "0.8", features = ["git2"] }
 
 [profile.release]
 lto = "fat"
@@ -94,4 +92,4 @@ codegen-units = 1
 strip = "symbols"
 
 [dev-dependencies]
-tempfile = "3.27.0"
+tempfile = "3"

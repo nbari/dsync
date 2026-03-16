@@ -7,11 +7,11 @@ set -euo pipefail
 WORKDIR="${WORKDIR:-/tmp/pxs-bench}"
 SRC="$WORKDIR/src.bin"
 DST="$WORKDIR/dst.bin"
-DSYNC_CMD="${DSYNC:-cargo run --release --}"
+PXS_CMD="${PXS:-cargo run --release --}"
 
 # Use --checksum to FORCE content-based comparison for the benchmark
 RSYNC_FLAGS=(--checksum --no-whole-file --inplace)
-DSYNC_FLAGS=(--checksum)
+PXS_FLAGS=(--checksum)
 
 sha() { sha256sum "$1" | awk '{print $1}'; }
 
@@ -78,7 +78,7 @@ main() {
     
     setup_baseline
     overwrite_middle
-    run_bench "Aligned-Overwrite" "pxs" "$DSYNC_CMD --source $SRC --destination $DST ${DSYNC_FLAGS[*]}"
+    run_bench "Aligned-Overwrite" "pxs" "$PXS_CMD --source $SRC --destination $DST ${PXS_FLAGS[*]}"
 
     # Scenario B: Data Shift
     setup_baseline
@@ -87,7 +87,7 @@ main() {
     
     setup_baseline
     prepend_byte
-    run_bench "Data-Shift" "pxs" "$DSYNC_CMD --source $SRC --destination $DST ${DSYNC_FLAGS[*]}"
+    run_bench "Data-Shift" "pxs" "$PXS_CMD --source $SRC --destination $DST ${PXS_FLAGS[*]}"
 
     echo -e "\nBenchmark complete."
 }
