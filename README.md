@@ -1,10 +1,19 @@
 # pxs
 
-**pxs** (Parallel X-Sync) is a high-performance, concurrent file synchronization tool written in Rust. Designed to saturate high-speed networks (10GbE+) and utilize multi-core CPUs for extremely fast data transfers and incremental updates.
+**pxs** (Parallel X-Sync) is a high-performance, concurrent file
+synchronization tool written in Rust. Designed to saturate high-speed networks
+(10GbE+) and utilize multi-core CPUs for extremely fast data transfers and
+incremental updates.
 
 The name is intentionally short for CLI use: `pxs` stands for **Parallel X-Sync**.
 
-`pxs` is specifically optimized for massive data moves (e.g., 4TB+ Postgres `PG_DATA`) where standard tools like `rsync` often bottleneck on single-threaded hashing or SSH encryption overhead.
+`pxs` is specifically optimized for massive data moves (e.g., 4TB+ Postgres
+`PG_DATA`) where standard tools like `rsync` often bottleneck on
+single-threaded hashing or SSH encryption overhead.
+
+`pxs` is not a drop-in replacement for `rsync`. The goal is narrower: transfer
+large files and datasets faster by focusing on parallelism, fixed-block delta
+sync, and high-throughput transport.
 
 ## Key Features
 
