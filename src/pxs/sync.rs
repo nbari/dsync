@@ -2,7 +2,12 @@ use crate::pxs::tools;
 use anyhow::Context;
 use filetime::{FileTime, set_file_times};
 use indicatif::ProgressBar;
-use std::{hash::Hasher, os::unix::fs::FileExt, path::Path, sync::Arc};
+use std::{
+    hash::Hasher,
+    os::unix::fs::FileExt,
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 use tokio::sync::Semaphore;
 use twox_hash::XxHash64;
 
@@ -14,15 +19,59 @@ pub struct SyncStats {
     pub updated_blocks: usize,
 }
 
+struct DirectorySyncContext<'a> {
+    src_dir: &'a Path,
+    dst_dir: &'a Path,
+    threshold: f32,
+    checksum: bool,
+    dry_run: bool,
+    ignores: &'a [String],
+    pb: Arc<ProgressBar>,
+    fsync: bool,
+}
+
+struct DirectoryWalkState {
+    directory_paths: Vec<PathBuf>,
+    tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    semaphore: Arc<Semaphore>,
+}
+
+struct WorkerContext {
+    chunk_size: u64,
+    src_len: u64,
+    src: Arc<std::fs::File>,
+    dst: Arc<std::fs::File>,
+    pb: Arc<ProgressBar>,
+    semaphore: Arc<Semaphore>,
+    full_copy: bool,
+}
+
+impl DirectoryWalkState {
+    fn new() -> Self {
+        Self {
+            directory_paths: Vec::new(),
+            tasks: Vec::new(),
+            semaphore: Arc::new(Semaphore::new(
+                std::thread::available_parallelism()
+                    .map(std::num::NonZeroUsize::get)
+                    .unwrap_or(8),
+            )),
+        }
+    }
+}
+
 /// Apply metadata (mode, uid, gid, mtime) from src to dst
 ///
 /// # Errors
 ///
 /// Returns an error if any attribute fails to be applied.
 pub fn apply_metadata(src: &Path, dst: &Path) -> anyhow::Result<()> {
-    let meta = std::fs::metadata(src).context("failed to read source metadata")?;
+    let meta = std::fs::symlink_metadata(src).context("failed to read source metadata")?;
     let permissions = meta.permissions();
-    std::fs::set_permissions(dst, permissions).context("failed to set destination permissions")?;
+    if !meta.file_type().is_symlink() {
+        std::fs::set_permissions(dst, permissions)
+            .context("failed to set destination permissions")?;
+    }
 
     // Set ownership if running as root
     #[cfg(unix)]
@@ -41,7 +90,12 @@ pub fn apply_metadata(src: &Path, dst: &Path) -> anyhow::Result<()> {
     // Set mtime
     let mtime = FileTime::from_last_modification_time(&meta);
     let atime = FileTime::from_last_access_time(&meta);
-    set_file_times(dst, atime, mtime).context("failed to set destination file times")?;
+    if meta.file_type().is_symlink() {
+        filetime::set_symlink_file_times(dst, atime, mtime)
+            .context("failed to set destination symlink times")?;
+    } else {
+        set_file_times(dst, atime, mtime).context("failed to set destination file times")?;
+    }
 
     Ok(())
 }
@@ -108,66 +162,46 @@ pub async fn sync_dir(
     checksum: bool,
     dry_run: bool,
     ignores: &[String],
+    fsync: bool,
 ) -> anyhow::Result<()> {
     eprintln!("Calculating total size for {}...", src_dir.display());
     let total_size = calculate_total_size(src_dir, ignores)?;
 
     let pb = Arc::new(tools::create_progress_bar(total_size));
-
-    sync_dir_recursive(
+    let context = DirectorySyncContext {
         src_dir,
         dst_dir,
         threshold,
         checksum,
         dry_run,
         ignores,
-        Arc::clone(&pb),
-    )
-    .await?;
+        pb: Arc::clone(&pb),
+        fsync,
+    };
+
+    sync_dir_recursive(&context).await?;
 
     pb.finish_with_message("Done");
     Ok(())
 }
 
-#[allow(clippy::too_many_lines)]
-async fn sync_dir_recursive(
+fn build_overrides(
     src_dir: &Path,
-    dst_dir: &Path,
-    threshold: f32,
-    checksum: bool,
-    dry_run: bool,
     ignores: &[String],
-    pb: Arc<ProgressBar>,
-) -> anyhow::Result<()> {
-    use ignore::WalkBuilder;
+) -> anyhow::Result<ignore::overrides::Override> {
     use ignore::overrides::OverrideBuilder;
 
-    // 1. Create destination root if it doesn't exist
-    if !dst_dir.exists() {
-        if dry_run {
-            eprintln!("(dry-run) create directory: {}", dst_dir.display());
-        } else {
-            tokio::fs::create_dir_all(dst_dir).await?;
-        }
-    }
-
-    let semaphore = Arc::new(Semaphore::new(
-        std::thread::available_parallelism()
-            .map(std::num::NonZeroUsize::get)
-            .unwrap_or(8),
-    ));
-
-    let mut tasks = Vec::new();
-
-    // Configure overrides for ignores
     let mut override_builder = OverrideBuilder::new(src_dir);
     for pattern in ignores {
         override_builder.add(&format!("!{pattern}"))?;
     }
-    let overrides = override_builder.build()?;
+    Ok(override_builder.build()?)
+}
 
-    // We use WalkBuilder to handle all files and directories
-    let walker = WalkBuilder::new(src_dir)
+fn build_walker(src_dir: &Path, overrides: ignore::overrides::Override) -> ignore::Walk {
+    use ignore::WalkBuilder;
+
+    WalkBuilder::new(src_dir)
         .hidden(false)
         .git_ignore(false)
         .git_global(false)
@@ -175,97 +209,185 @@ async fn sync_dir_recursive(
         .ignore(false)
         .parents(false)
         .overrides(overrides)
-        .build();
+        .build()
+}
 
-    let mut directory_paths = Vec::new();
+async fn ensure_destination_root(context: &DirectorySyncContext<'_>) -> anyhow::Result<()> {
+    if context.dst_dir.exists() {
+        return Ok(());
+    }
 
-    for entry in walker {
-        let entry = entry?;
-        let src_path = entry.path();
-        if src_path == src_dir {
-            continue;
-        }
+    if context.dry_run {
+        eprintln!("(dry-run) create directory: {}", context.dst_dir.display());
+    } else {
+        tokio::fs::create_dir_all(context.dst_dir).await?;
+    }
 
-        let rel_path = src_path.strip_prefix(src_dir)?;
-        let dst_path = dst_dir.join(rel_path);
-        let file_type = entry
-            .file_type()
-            .ok_or_else(|| anyhow::anyhow!("unknown file type"))?;
+    Ok(())
+}
 
-        if file_type.is_dir() {
-            directory_paths.push(src_path.to_path_buf());
-            if !dst_path.exists() {
-                if dry_run {
-                    eprintln!("(dry-run) create directory: {}", dst_path.display());
-                } else {
-                    tokio::fs::create_dir_all(&dst_path).await?;
-                }
-            }
-        } else if file_type.is_symlink() {
-            let target = tokio::fs::read_link(src_path).await?;
-            if dry_run {
-                eprintln!(
-                    "(dry-run) symlink {} -> {}",
-                    dst_path.display(),
-                    target.display()
-                );
-            } else {
-                if dst_path.exists() {
-                    tokio::fs::remove_file(&dst_path).await?;
-                }
-                tokio::fs::symlink(&target, &dst_path).await?;
-                apply_metadata(src_path, &dst_path)?;
-            }
-        } else if file_type.is_file() {
-            let sem = Arc::clone(&semaphore);
-            let src = src_path.to_path_buf();
-            let dst = dst_path.clone();
-            let pb_clone = Arc::clone(&pb);
-
-            tasks.push(tokio::spawn(async move {
-                let _permit = sem
-                    .acquire()
-                    .await
-                    .map_err(|e| anyhow::anyhow!("failed to acquire semaphore: {e}"))?;
-
-                if tools::should_skip_file(&src, &dst, checksum).await? {
-                    let src_size = tools::get_file_size(&src).await?;
-                    pb_clone.inc(src_size);
-                    return Ok::<(), anyhow::Error>(());
-                }
-
-                if dry_run {
-                    let src_size = tools::get_file_size(&src).await?;
-                    eprintln!("(dry-run) sync file: {} ({src_size} bytes)", src.display());
-                    pb_clone.inc(src_size);
-                    return Ok::<(), anyhow::Error>(());
-                }
-
-                pb_clone.set_message(format!("{}", src.display()));
-                let full_copy = tools::should_use_full_copy(&src, &dst, threshold).await?;
-                sync_changed_blocks_with_pb(&src, &dst, full_copy, pb_clone).await?;
-                apply_metadata(&src, &dst)?;
-                Ok::<(), anyhow::Error>(())
-            }));
+async fn handle_directory_entry(
+    context: &DirectorySyncContext<'_>,
+    state: &mut DirectoryWalkState,
+    src_path: &Path,
+    dst_path: &Path,
+) -> anyhow::Result<()> {
+    state.directory_paths.push(src_path.to_path_buf());
+    if !dst_path.exists() {
+        if context.dry_run {
+            eprintln!("(dry-run) create directory: {}", dst_path.display());
+        } else {
+            tokio::fs::create_dir_all(dst_path).await?;
         }
     }
 
+    Ok(())
+}
+
+async fn handle_symlink_entry(
+    context: &DirectorySyncContext<'_>,
+    src_path: &Path,
+    dst_path: &Path,
+) -> anyhow::Result<()> {
+    let target = tokio::fs::read_link(src_path).await?;
+    if context.dry_run {
+        eprintln!(
+            "(dry-run) symlink {} -> {}",
+            dst_path.display(),
+            target.display()
+        );
+        return Ok(());
+    }
+
+    if dst_path.exists() {
+        if dst_path.is_dir() {
+            tokio::fs::remove_dir_all(dst_path).await?;
+        } else {
+            tokio::fs::remove_file(dst_path).await?;
+        }
+    }
+    tokio::fs::symlink(&target, dst_path).await?;
+    apply_metadata(src_path, dst_path)?;
+    Ok(())
+}
+
+fn spawn_file_sync_task(
+    context: &DirectorySyncContext<'_>,
+    semaphore: Arc<Semaphore>,
+    src: PathBuf,
+    dst: PathBuf,
+) -> tokio::task::JoinHandle<anyhow::Result<()>> {
+    let pb = Arc::clone(&context.pb);
+    let checksum = context.checksum;
+    let dry_run = context.dry_run;
+    let threshold = context.threshold;
+    let fsync = context.fsync;
+
+    tokio::spawn(async move {
+        let _permit = semaphore
+            .acquire()
+            .await
+            .map_err(|e| anyhow::anyhow!("failed to acquire semaphore: {e}"))?;
+
+        if tools::should_skip_file(&src, &dst, checksum).await? {
+            let src_size = tools::get_file_size(&src).await?;
+            pb.inc(src_size);
+            return Ok(());
+        }
+
+        if dry_run {
+            let src_size = tools::get_file_size(&src).await?;
+            eprintln!("(dry-run) sync file: {} ({src_size} bytes)", src.display());
+            pb.inc(src_size);
+            return Ok(());
+        }
+
+        pb.set_message(src.display().to_string());
+        let full_copy = tools::should_use_full_copy(&src, &dst, threshold).await?;
+        sync_changed_blocks_with_pb(&src, &dst, full_copy, pb, fsync).await?;
+        apply_metadata(&src, &dst)?;
+        Ok(())
+    })
+}
+
+async fn handle_walk_entry(
+    context: &DirectorySyncContext<'_>,
+    state: &mut DirectoryWalkState,
+    entry: ignore::DirEntry,
+) -> anyhow::Result<()> {
+    let src_path = entry.path();
+    if src_path == context.src_dir {
+        return Ok(());
+    }
+
+    let rel_path = src_path.strip_prefix(context.src_dir)?;
+    let dst_path = context.dst_dir.join(rel_path);
+    let file_type = entry
+        .file_type()
+        .ok_or_else(|| anyhow::anyhow!("unknown file type"))?;
+
+    if file_type.is_dir() {
+        return handle_directory_entry(context, state, src_path, &dst_path).await;
+    }
+
+    if file_type.is_symlink() {
+        return handle_symlink_entry(context, src_path, &dst_path).await;
+    }
+
+    if file_type.is_file() {
+        state.tasks.push(spawn_file_sync_task(
+            context,
+            Arc::clone(&state.semaphore),
+            src_path.to_path_buf(),
+            dst_path,
+        ));
+    }
+
+    Ok(())
+}
+
+async fn wait_for_sync_tasks(
+    tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+) -> anyhow::Result<()> {
     for task in tasks {
         task.await??;
     }
+    Ok(())
+}
 
-    if !dry_run {
-        // Apply metadata to directories from deepest to shallowest to ensure mtimes are preserved
-        directory_paths.sort_by_key(|p| std::cmp::Reverse(p.components().count()));
-        for src_path in directory_paths {
-            let rel_path = src_path.strip_prefix(src_dir)?;
-            let dst_path = dst_dir.join(rel_path);
-            apply_metadata(&src_path, &dst_path)?;
-        }
-        // Finally apply to root
-        apply_metadata(src_dir, dst_dir)?;
+fn apply_directory_metadata(
+    context: &DirectorySyncContext<'_>,
+    mut directory_paths: Vec<PathBuf>,
+) -> anyhow::Result<()> {
+    if context.dry_run {
+        return Ok(());
     }
 
+    // Apply metadata to directories from deepest to shallowest to ensure mtimes are preserved.
+    directory_paths.sort_by_key(|path| std::cmp::Reverse(path.components().count()));
+    for src_path in directory_paths {
+        let rel_path = src_path.strip_prefix(context.src_dir)?;
+        let dst_path = context.dst_dir.join(rel_path);
+        apply_metadata(&src_path, &dst_path)?;
+    }
+    apply_metadata(context.src_dir, context.dst_dir)?;
+
+    Ok(())
+}
+
+async fn sync_dir_recursive(context: &DirectorySyncContext<'_>) -> anyhow::Result<()> {
+    ensure_destination_root(context).await?;
+
+    let overrides = build_overrides(context.src_dir, context.ignores)?;
+    let walker = build_walker(context.src_dir, overrides);
+    let mut state = DirectoryWalkState::new();
+
+    for entry in walker {
+        handle_walk_entry(context, &mut state, entry?).await?;
+    }
+
+    wait_for_sync_tasks(state.tasks).await?;
+    apply_directory_metadata(context, state.directory_paths)?;
     Ok(())
 }
 
@@ -279,6 +401,7 @@ pub async fn sync_changed_blocks_with_pb(
     dst_path: &Path,
     full_copy: bool,
     pb: Arc<ProgressBar>,
+    fsync: bool,
 ) -> anyhow::Result<SyncStats> {
     let src_file = std::fs::File::open(src_path)
         .with_context(|| format!("failed to open source file: {}", src_path.display()))?;
@@ -287,6 +410,10 @@ pub async fn sync_changed_blocks_with_pb(
         .metadata()
         .context("failed to get source metadata")?
         .len();
+
+    if dst_path.is_dir() {
+        tokio::fs::remove_dir_all(dst_path).await?;
+    }
 
     // Pre-allocate space
     tools::preallocate(dst_path, src_len).context("failed to pre-allocate destination space")?;
@@ -329,21 +456,21 @@ pub async fn sync_changed_blocks_with_pb(
         .unwrap_or(8);
 
     let semaphore = Arc::new(Semaphore::new(concurrency));
-    let mut handles = Vec::new();
     let chunk_size: u64 = 1024 * 1024; // 1MB chunks for parallel processing
+    let worker_context = Arc::new(WorkerContext {
+        chunk_size,
+        src_len,
+        src: Arc::clone(&src_arc),
+        dst: Arc::clone(&dst_arc),
+        pb: Arc::clone(&pb),
+        semaphore: Arc::clone(&semaphore),
+        full_copy,
+    });
+    let mut handles = Vec::new();
     let num_chunks = src_len.div_ceil(chunk_size);
 
     for i in 0..num_chunks {
-        let handle = spawn_sync_worker(
-            i,
-            chunk_size,
-            src_len,
-            Arc::clone(&src_arc),
-            Arc::clone(&dst_arc),
-            Arc::clone(&pb),
-            Arc::clone(&semaphore),
-            full_copy,
-        );
+        let handle = spawn_sync_worker(i, Arc::clone(&worker_context));
         handles.push(handle);
     }
 
@@ -363,21 +490,22 @@ pub async fn sync_changed_blocks_with_pb(
             .context("failed to truncate destination file")?;
     }
 
+    if fsync {
+        dst_arc
+            .sync_all()
+            .context("failed to sync destination file to disk")?;
+    }
+
     Ok(stats)
 }
 
-#[allow(clippy::too_many_arguments)]
 fn spawn_sync_worker(
     chunk_index: u64,
-    chunk_size: u64,
-    src_len: u64,
-    src: Arc<std::fs::File>,
-    dst: Arc<std::fs::File>,
-    pb: Arc<ProgressBar>,
-    semaphore: Arc<Semaphore>,
-    full_copy: bool,
+    context: Arc<WorkerContext>,
 ) -> tokio::task::JoinHandle<anyhow::Result<SyncStats>> {
     tokio::spawn(async move {
+        let semaphore = Arc::clone(&context.semaphore);
+        let worker_context = Arc::clone(&context);
         let _permit = semaphore
             .acquire()
             .await
@@ -385,8 +513,11 @@ fn spawn_sync_worker(
             .context("failed to acquire semaphore")?;
 
         tokio::task::spawn_blocking(move || {
-            let start_offset = chunk_index * chunk_size;
-            let end_offset = std::cmp::min(start_offset + chunk_size, src_len);
+            let start_offset = chunk_index * worker_context.chunk_size;
+            let end_offset = std::cmp::min(
+                start_offset + worker_context.chunk_size,
+                worker_context.src_len,
+            );
             let mut offset = start_offset;
             let mut src_buf = vec![0u8; BLOCK_SIZE];
             let mut dst_buf = vec![0u8; BLOCK_SIZE];
@@ -400,16 +531,18 @@ fn spawn_sync_worker(
                 let src_chunk = src_buf
                     .get_mut(..to_read)
                     .ok_or_else(|| anyhow::anyhow!("src_buf too small"))?;
-                src.read_exact_at(src_chunk, offset)
+                worker_context
+                    .src
+                    .read_exact_at(src_chunk, offset)
                     .context("failed to read from source")?;
 
-                let needs_write = if full_copy {
+                let needs_write = if worker_context.full_copy {
                     true
                 } else {
                     let dst_chunk = dst_buf
                         .get_mut(..to_read)
                         .ok_or_else(|| anyhow::anyhow!("dst_buf too small"))?;
-                    let dst_read_result = dst.read_exact_at(dst_chunk, offset);
+                    let dst_read_result = worker_context.dst.read_exact_at(dst_chunk, offset);
                     match dst_read_result {
                         Ok(()) => {
                             let src_hash = fast_hash_block(src_chunk);
@@ -421,13 +554,15 @@ fn spawn_sync_worker(
                 };
 
                 if needs_write {
-                    dst.write_all_at(src_chunk, offset)
+                    worker_context
+                        .dst
+                        .write_all_at(src_chunk, offset)
                         .context("failed to write to destination")?;
                     chunk_updated += 1;
                 }
 
                 chunk_total += 1;
-                pb.inc(to_read as u64);
+                worker_context.pb.inc(to_read_u64);
                 offset += to_read as u64;
             }
             Ok::<SyncStats, anyhow::Error>(SyncStats {
@@ -448,9 +583,10 @@ pub async fn sync_changed_blocks(
     src_path: &Path,
     dst_path: &Path,
     full_copy: bool,
+    fsync: bool,
 ) -> anyhow::Result<SyncStats> {
     let pb = Arc::new(ProgressBar::hidden());
-    let stats = sync_changed_blocks_with_pb(src_path, dst_path, full_copy, pb).await?;
+    let stats = sync_changed_blocks_with_pb(src_path, dst_path, full_copy, pb, fsync).await?;
     apply_metadata(src_path, dst_path)?;
     Ok(stats)
 }

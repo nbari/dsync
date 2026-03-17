@@ -43,6 +43,18 @@ The binary will be available at `./target/release/pxs`.
 > [!IMPORTANT]
 > For **Network** or **SSH** synchronization, `pxs` must be installed and available in the `$PATH` on **both** the source and destination servers.
 
+## Platform Support
+
+`pxs` currently targets **Unix-like systems only**:
+
+*   Linux
+*   macOS
+*   BSD
+
+Windows is **not supported**.
+
+For network and `--stdio` transports, `pxs` uses normalized relative POSIX paths in the protocol. Incoming paths are rejected if they are absolute or contain `.` / `..` traversal components. Paths containing `\` are also rejected by the protocol, so filenames with backslashes are not supported for remote sync.
+
 ## How It Works
 
 ### Local Synchronization
@@ -139,6 +151,22 @@ Synchronize a directory:
 pxs --source /path/to/source_dir --destination /path/to/dest_dir
 ```
 
+More local examples:
+
+```bash
+# Copy one local file
+pxs --source ./pg_wal/000000010000000000000001 --destination /backup/000000010000000000000001
+
+# Copy one local directory tree
+pxs --source /var/lib/postgresql/data --destination /srv/replica/base-backup
+
+# Force checksum-based verification
+pxs --source ./dataset.bin --destination /mnt/backup/dataset.bin --checksum
+
+# Flush file data to disk before completion
+pxs --source ./dataset.bin --destination /mnt/backup/dataset.bin --fsync
+```
+
 ### 2. Network Synchronization (Direct TCP)
 Best for high-speed local networks where maximum performance is needed (no encryption overhead).
 
@@ -152,6 +180,19 @@ Best for high-speed local networks where maximum performance is needed (no encry
     pxs --remote 192.168.1.10:8080 --source /old/data/file.bin
     ```
 
+Concrete examples without SSH:
+
+```bash
+# Receiver on host B
+pxs --listen 0.0.0.0:8080 --destination /srv/incoming
+
+# Sender on host A: copy one file to host B
+pxs --remote 192.168.1.10:8080 --source ./archive.tar
+
+# Sender on host A: copy a directory tree to host B
+pxs --remote 192.168.1.10:8080 --source /var/lib/postgresql/data
+```
+
 **B. Pulling from a Sender (You are getting the file)**
 *   **Sender (Server 2):**
     ```bash
@@ -162,6 +203,16 @@ Best for high-speed local networks where maximum performance is needed (no encry
     pxs --remote 192.168.1.10:8080 --destination ./local_copy.bin --pull
     ```
 
+Concrete pull examples without SSH:
+
+```bash
+# Source host serves a file
+pxs --listen 0.0.0.0:8080 --source /srv/export/snapshot.bin --sender
+
+# Destination host pulls it over raw TCP
+pxs --remote 192.168.1.10:8080 --destination ./snapshot.bin --pull
+```
+
 ### 3. Secure Network Synchronization (SSH)
 Easiest way to sync securely between servers. `pxs` automatically spawns an SSH tunnel.
 
@@ -170,9 +221,25 @@ Easiest way to sync securely between servers. `pxs` automatically spawns an SSH 
 pxs --source my_file.bin --remote user@remote-server:/path/to/dest/my_file.bin
 ```
 
+```bash
+# Push one file over SSH
+pxs --source ./backup.tar.zst --remote db2@example.net:/srv/backups/backup.tar.zst
+
+# Push a directory tree over SSH
+pxs --source /var/lib/postgresql/data --remote db2@example.net:/srv/replica/data
+```
+
 **Pull (Remote -> Local):**
 ```bash
 pxs --remote user@remote-server:/path/to/remote/file.bin --destination ./local_file.bin --pull
+```
+
+```bash
+# Pull one file over SSH
+pxs --remote db1@example.net:/srv/export/base.tar.zst --destination ./base.tar.zst --pull
+
+# Pull a directory tree over SSH
+pxs --remote db1@example.net:/var/lib/postgresql/data --destination /srv/restore/data --pull
 ```
 
 **Manual SSH (using stdio pipe):**
@@ -184,11 +251,22 @@ ssh user@remote-server "pxs --stdio --destination /path/to/new/data" < <(pxs --r
 ### 4. Advanced Options
 
 *   **`--checksum` (-c)**: Force a block-by-block hash comparison even if size/mtime match.
+*   **`--fsync` (-f)**: Force `fsync(2)` after file writes. Slower, but safer for durability-sensitive copies.
 *   **`--ignore` (-i)**: (Repeatable) Skip files/directories matching a glob pattern (e.g., `-i "*.log"`).
 *   **`--exclude-from` (-E)**: Read exclude patterns from a file (one pattern per line).
 *   **`--threshold` (-t)**: (Default: 0.5) If the destination file is less than X% the size of the source, perform a full copy instead of hashing.
 *   **`--dry-run` (-n)**: Show what would have been transferred without making any changes.
 *   **`--verbose` (-v)**: Increase logging verbosity (use `-vv` for debug).
+
+## Progress Output
+
+`pxs` shows a progress bar for:
+
+*   local directory syncs
+*   direct TCP sender/receiver transfers where the receiving side knows total size
+*   SSH and `--stdio` transfers
+
+Currently, a single local file sync does **not** show a visible progress bar; it prints summary information when the copy completes.
 
 ### Exclude Example
 If you want to skip Postgres configuration files during a sync:
@@ -249,6 +327,22 @@ The project includes a robust test suite for both local and network logic:
 ```bash
 # Run all tests
 cargo test
+```
+
+Podman end-to-end tests are also available:
+
+```bash
+# SSH pull end-to-end
+./tests/podman/test_ssh_pull.sh
+
+# SSH pull resume/truncation end-to-end
+./tests/podman/test_ssh_pull_resume.sh
+
+# Direct TCP push end-to-end
+./tests/podman/test_tcp_push.sh
+
+# Direct TCP directory/resume edge cases end-to-end
+./tests/podman/test_tcp_directory_resume.sh
 ```
 
 ## License

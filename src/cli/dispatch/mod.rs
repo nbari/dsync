@@ -7,16 +7,17 @@ pub fn handler(matches: &clap::ArgMatches) -> Action {
     let threshold = *matches.get_one::<f32>("threshold").unwrap_or(&0.5);
     let checksum = matches.get_flag("checksum");
     let dry_run = matches.get_flag("dry_run");
+    let fsync = matches.get_flag("fsync");
     let ignores = parse_ignores(matches);
 
     if let Some(addr) = matches.get_one::<String>("listen") {
-        return handle_listen(addr, matches, threshold, checksum, ignores);
+        return handle_listen(addr, matches, threshold, checksum, fsync, ignores);
     }
 
     if let Some(addr) = matches.get_one::<String>("remote") {
         let pull = matches.get_flag("pull");
         if pull {
-            return handle_pull(addr, matches, threshold, checksum, ignores);
+            return handle_pull(addr, matches, threshold, checksum, fsync, ignores);
         }
         return handle_remote(addr, matches, threshold, checksum, ignores);
     }
@@ -32,7 +33,7 @@ pub fn handler(matches: &clap::ArgMatches) -> Action {
             };
         }
         let dst = get_destination(matches);
-        return Action::Stdio { dst };
+        return Action::Stdio { dst, fsync };
     }
 
     let src = get_source(matches);
@@ -43,6 +44,7 @@ pub fn handler(matches: &clap::ArgMatches) -> Action {
         threshold,
         checksum,
         dry_run,
+        fsync,
         ignores,
     }
 }
@@ -87,6 +89,7 @@ fn handle_listen(
     matches: &clap::ArgMatches,
     threshold: f32,
     checksum: bool,
+    fsync: bool,
     ignores: Vec<String>,
 ) -> Action {
     if matches.get_flag("sender") {
@@ -103,6 +106,7 @@ fn handle_listen(
     Action::Listen {
         addr: addr.to_string(),
         dst,
+        fsync,
     }
 }
 
@@ -111,6 +115,7 @@ fn handle_pull(
     matches: &clap::ArgMatches,
     threshold: f32,
     checksum: bool,
+    fsync: bool,
     ignores: Vec<String>,
 ) -> Action {
     let dst = get_destination(matches);
@@ -121,6 +126,7 @@ fn handle_pull(
             dst,
             threshold,
             checksum,
+            fsync,
             remote_path: Some(ssh_info.path),
             ignores,
         };
@@ -131,6 +137,7 @@ fn handle_pull(
         dst,
         threshold,
         checksum,
+        fsync,
         remote_path: None,
         ignores,
     }
@@ -211,4 +218,78 @@ fn parse_ssh_address(addr: &str) -> Option<SshInfo> {
         });
     }
     None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::handler;
+    use crate::cli::{actions::Action, commands};
+    use tempfile::tempdir;
+
+    fn parse_action(args: &[&str]) -> anyhow::Result<Action> {
+        let matches = commands::new().try_get_matches_from(args)?;
+        Ok(handler(&matches))
+    }
+
+    #[test]
+    fn test_short_fsync_flag_sets_local_run_action() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("src.txt");
+        let dst = dir.path().join("dst.txt");
+        std::fs::write(&src, "content")?;
+
+        let src_arg = src.to_string_lossy().to_string();
+        let dst_arg = dst.to_string_lossy().to_string();
+        let action = parse_action(&["pxs", "--source", &src_arg, "--destination", &dst_arg, "-f"])?;
+
+        match action {
+            Action::Run { fsync, .. } => assert!(fsync),
+            other => anyhow::bail!("expected Action::Run, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_long_fsync_flag_sets_receiver_modes() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let dst = dir.path().join("dst");
+        std::fs::create_dir_all(&dst)?;
+        let dst_arg = dst.to_string_lossy().to_string();
+
+        let listen = parse_action(&[
+            "pxs",
+            "--listen",
+            "127.0.0.1:9999",
+            "--destination",
+            &dst_arg,
+            "--fsync",
+        ])?;
+        match listen {
+            Action::Listen { fsync, .. } => assert!(fsync),
+            other => anyhow::bail!("expected Action::Listen, got {other:?}"),
+        }
+
+        let pull = parse_action(&[
+            "pxs",
+            "--remote",
+            "127.0.0.1:9999",
+            "--destination",
+            &dst_arg,
+            "--pull",
+            "--fsync",
+        ])?;
+        match pull {
+            Action::Pull { fsync, .. } => assert!(fsync),
+            other => anyhow::bail!("expected Action::Pull, got {other:?}"),
+        }
+
+        let stdio = parse_action(&["pxs", "--stdio", "--destination", &dst_arg, "--fsync"])?;
+        match stdio {
+            Action::Stdio { fsync, .. } => assert!(fsync),
+            other => anyhow::bail!("expected Action::Stdio, got {other:?}"),
+        }
+
+        Ok(())
+    }
 }

@@ -23,7 +23,7 @@ async fn test_incremental_sync_only_writes_changed_blocks() -> anyhow::Result<()
     fs::write(&src_path, &initial_data)?;
 
     // 2. Initial sync (Full copy)
-    let stats = sync::sync_changed_blocks(&src_path, &dst_path, true).await?;
+    let stats = sync::sync_changed_blocks(&src_path, &dst_path, true, false).await?;
     assert_eq!(stats.updated_blocks, 80); // 10MB / 128KB = 80 blocks
 
     // Verify initial sync
@@ -40,7 +40,7 @@ async fn test_incremental_sync_only_writes_changed_blocks() -> anyhow::Result<()
     drop(file);
 
     // 4. Perform incremental sync
-    let stats = sync::sync_changed_blocks(&src_path, &dst_path, false).await?;
+    let stats = sync::sync_changed_blocks(&src_path, &dst_path, false, false).await?;
     assert_eq!(stats.updated_blocks, 1); // Only 1 block should be updated
     assert_eq!(stats.total_blocks, 80);
 
@@ -68,7 +68,7 @@ async fn test_sync_dir_recursive() -> anyhow::Result<()> {
     fs::write(src_dir.join("file1.txt"), "hello")?;
     fs::write(src_dir.join("subdir/file2.txt"), "world")?;
 
-    sync::sync_dir(&src_dir, &dst_dir, 1.0, false, false, &[]).await?;
+    sync::sync_dir(&src_dir, &dst_dir, 1.0, false, false, &[], false).await?;
 
     assert!(dst_dir.join("file1.txt").exists());
     assert!(dst_dir.join("subdir/file2.txt").exists());
@@ -134,6 +134,54 @@ async fn test_threshold_full_copy_decision() -> anyhow::Result<()> {
 
     let full_copy = tools::should_use_full_copy(&src_path, &dst_path, 0.01).await?;
     assert!(!full_copy);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_symlink_over_directory() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    fs::create_dir_all(&src_dir)?;
+    fs::create_dir_all(&dst_dir)?;
+
+    let dst_subdir = dst_dir.join("link");
+    fs::create_dir_all(&dst_subdir)?;
+
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("target", src_dir.join("link"))?;
+    }
+
+    sync::sync_dir(&src_dir, &dst_dir, 1.0, false, false, &[], false).await?;
+
+    let dst_link = dst_dir.join("link");
+    assert!(dst_link.is_symlink());
+    assert_eq!(
+        fs::read_link(&dst_link)?,
+        std::path::PathBuf::from("target")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_file_replaces_directory() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    fs::create_dir_all(&src_dir)?;
+    fs::create_dir_all(dst_dir.join("entry/nested"))?;
+    fs::write(dst_dir.join("entry/nested/file.txt"), "stale")?;
+
+    fs::write(src_dir.join("entry"), "replacement")?;
+
+    sync::sync_dir(&src_dir, &dst_dir, 1.0, false, false, &[], false).await?;
+
+    let dst_entry = dst_dir.join("entry");
+    assert!(dst_entry.is_file());
+    assert_eq!(fs::read_to_string(&dst_entry)?, "replacement");
 
     Ok(())
 }

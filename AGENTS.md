@@ -21,12 +21,13 @@
 - `./remote_pxs_vs_rsync.sh --source <PATH> --host <USER@HOST> --remote-root <PATH>`: remote benchmark.
 
 ## Coding Style & Naming Conventions
-- Language: Rust (edition 2024), standard `rustfmt` formatting (4-space indentation).
-- Follow idiomatic Rust naming:
-  - `snake_case` for functions/modules/variables,
-  - `PascalCase` for structs/enums,
-  - `SCREAMING_SNAKE_CASE` for constants.
-- Lints are strict (`warnings = deny`, Clippy `all` + `pedantic` denied in `Cargo.toml`); avoid `unwrap`, `expect`, and unchecked indexing.
+- All production code should have documentation. Document public modules, types, functions, constants, and any non-obvious internal logic that would otherwise be hard to maintain safely.
+- Rust 2024 edition; defaults to `rustfmt`.
+- Clippy is strict (`all` + `pedantic` deny). Avoid `unwrap`, `expect`, and panics; prefer `?` and typed errors.
+- Do not add `#[allow(...)]` in production code; only acceptable inside test modules when needed.
+- File/module names `snake_case`; types `UpperCamelCase`; constants `SCREAMING_SNAKE_CASE`.
+- Group imports from the same crate/namespace (for example, `use std::{...};`) rather than many single-line imports.
+- Keep functions small; prefer explicit structs over loose maps; use builder-style constructors for configs where appropriate.
 - Keep modules focused: protocol flow in `net.rs`, reusable logic in `tools.rs`.
 
 ## Testing Guidelines
