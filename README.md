@@ -19,10 +19,10 @@ sync, and high-throughput transport.
 
 *   **Multi-threaded Engine**: Parallelizes file walking, block-level hashing, and I/O operations.
 *   **Fixed-Block Synchronization**: Uses **128KB** chunks and **XxHash64** for ultra-fast delta analysis.
-*   **Zero-Copy Networking**: High-speed network protocol using **rkyv** serialization over raw TCP.
+*   **High-Throughput TCP Transport**: Uses a compact binary protocol with **rkyv** serialization over raw TCP.
 *   **Auto-SSH Mode**: Seamlessly tunnels through SSH for secure transfers without manual port forwarding.
 *   **Pull Mode**: Supports both pushing to and pulling from remote servers.
-*   **In-place Updates**: Modifies existing files directly without creating large temporary files.
+*   **Staged Atomic Writes**: Preserves an existing destination until the replacement file is fully written and ready to commit.
 *   **Smart Skipping**: Automatically skips unchanged files based on size and modification time.
 
 ## Installation
@@ -310,19 +310,21 @@ When you provide patterns via `--ignore` or `--exclude-from`, they are applied a
 ### Exclusion Pass-through (SSH)
 When using **Auto-SSH mode**, your local ignore patterns are automatically sent to the remote server. This ensures that the receiver doesn't waste time looking at files you've already decided to skip.
 
-## Why pxs is faster than rsync
+## Why pxs can be faster than rsync for this workload
 
 | Feature | rsync | pxs |
 |---------|-------|-----|
 | File hashing | Single-threaded | **Parallel** (all CPU cores) |
 | Block comparison | Single-threaded | **Parallel** |
-| Network connections | Single | **Multiple workers** |
+| Network transport | rsync protocol over remote shell or daemon | Raw TCP or SSH tunneled `pxs` protocol |
 | Directory walking | Sequential | **Parallel** |
 | Algorithm | Rolling hash | Fixed 128KB blocks |
 
-1.  **Parallelism**: `rsync` is largely single-threaded. `pxs` uses all available CPU cores to hash different parts of your data simultaneously.
-2.  **Algorithm Efficiency**: For database files (like Postgres), data is modified in-place and never "shifted." `pxs` uses a fixed-block algorithm that is much lighter than `rsync`'s rolling hash.
-3.  **No Encryption Bottleneck**: By using raw TCP (when appropriate), `pxs` avoids the CPU overhead of SSH encryption which often caps transfers at ~120MB/s.
+1.  **Parallelism**: `pxs` uses multiple CPU cores for hashing, comparison, and other hot-path work.
+2.  **Algorithm Efficiency**: For workloads like database files, where data is usually modified in place rather than shifted, fixed-block delta sync can be cheaper than a rolling-hash approach.
+3.  **Transport Choice**: On trusted high-speed networks, raw TCP avoids SSH overhead. When SSH is required, `pxs` still keeps its own transfer protocol and delta logic.
+
+These advantages are workload-dependent. `pxs` is aimed at very large files and large datasets on fast links, not at replacing `rsync` for every synchronization scenario.
 
 ## Tests
 
