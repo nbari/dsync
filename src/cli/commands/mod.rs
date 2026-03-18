@@ -26,21 +26,20 @@ const LONG_ABOUT: &str = "pxs is a multi-threaded file synchronization tool desi
     SUPPORTED PLATFORMS:\n\
        Linux, macOS, and BSD.\n\
        Windows is not supported.";
-
-/// Generate extended version string with git info
-fn long_version() -> &'static str {
-    let version = built_info::PKG_VERSION;
-    let git_hash = built_info::GIT_COMMIT_HASH_SHORT.unwrap_or("unknown");
-    let git_dirty = if built_info::GIT_DIRTY.unwrap_or(false) {
-        "-dirty"
-    } else {
-        ""
-    };
-
-    let version_string = format!("{version} (git: {git_hash}{git_dirty})");
-    // Leak the string to get a 'static lifetime - this is fine for CLI version string
-    Box::leak(version_string.into_boxed_str())
-}
+const ABOUT: &str =
+    "pxs (Parallel X-Sync) - High-performance, concurrent file synchronization tool.";
+const SOURCE_LONG_HELP: &str =
+    "The local path to read data from. When using --remote, this is the data sent to the listener.";
+const DESTINATION_LONG_HELP: &str =
+    "The local path to write data to. When using --listen, incoming data is stored here.";
+const THRESHOLD_LONG_HELP: &str = "Value between 0.1 and 1.0. If the destination file size is less than this percentage of the source, a full rewrite is performed.";
+const CHECKSUM_LONG_HELP: &str = "By default, pxs skips files if size and modification time match. Use this to force a block-by-block hash comparison. In network mode, pxs also performs end-to-end BLAKE3 verification after the transfer completes.";
+const FSYNC_LONG_HELP: &str =
+    "Ensures that file data and metadata are flushed to disk before finishing. Slower but safer.";
+const LISTEN_LONG_HELP: &str = "Starts pxs in server mode. If --destination is used, it receives files. If --source and --sender are used, it serves files to clients.";
+const REMOTE_LONG_HELP: &str = "Connects to a remote pxs instance. By default, it pushes --source. If --pull is used, it fetches data to --destination.";
+const PULL_LONG_HELP: &str = "When used with --remote, it initiates a connection to fetch data from the remote source to the local --destination.";
+const MODE_ARGS: [&str; 4] = ["listen", "remote", "source", "destination"];
 
 pub fn validator_path_exists() -> ValueParser {
     ValueParser::from(move |s: &str| -> std::result::Result<PathBuf, String> {
@@ -88,188 +87,135 @@ fn cli_styles() -> Styles {
         .placeholder(AnsiColor::Green.on_default())
 }
 
-fn source_arg() -> Arg {
-    Arg::new("source")
-        .short('s')
-        .long("source")
-        .help("Path to the source file or directory")
-        .long_help(
-            "The local path to read data from. When using --remote, this is the data sent to the listener.",
-        )
-        .value_parser(validator_path_exists())
-        .value_name("SRC")
-}
-
-fn destination_arg() -> Arg {
-    Arg::new("destination")
-        .short('d')
-        .long("destination")
-        .help("Path to the destination file or directory")
-        .long_help(
-            "The local path to write data to. When using --listen, incoming data is stored here.",
-        )
-        .value_parser(validator_parent_exist())
-        .value_name("DST")
-}
-
 fn mode_group() -> ArgGroup {
     ArgGroup::new("mode")
-        .args(["listen", "remote", "source", "destination"])
+        .args(MODE_ARGS)
         .required(true)
         .multiple(true)
 }
 
-fn threshold_arg() -> Arg {
-    Arg::new("threshold")
-        .short('t')
-        .long("threshold")
-        .help("Threshold to determine if a file should be copied")
-        .long_help(
-            "Value between 0.1 and 1.0. If the destination file size is less than this percentage of the source, a full rewrite is performed.",
-        )
-        .value_name("THRESHOLD")
-        .value_parser(clap::builder::ValueParser::from(|s: &str| {
-            let val: f32 = s.parse().map_err(|_| String::from("Invalid float"))?;
-            if (0.1..=1.0).contains(&val) {
-                Ok(val)
-            } else {
-                Err(String::from("Threshold must be between 0.1 and 1.0"))
-            }
-        }))
-        .default_value("0.5")
+fn threshold_parser() -> ValueParser {
+    clap::builder::ValueParser::from(|s: &str| {
+        let val: f32 = s.parse().map_err(|_| String::from("Invalid float"))?;
+        if (0.1..=1.0).contains(&val) {
+            Ok(val)
+        } else {
+            Err(String::from("Threshold must be between 0.1 and 1.0"))
+        }
+    })
 }
 
-fn verbose_arg() -> Arg {
-    Arg::new("verbose")
-        .short('v')
-        .long("verbose")
-        .help("Increase verbosity, -vv for debug")
-        .action(ArgAction::Count)
+fn long_version() -> &'static str {
+    if let Some(git_hash) = built_info::GIT_COMMIT_HASH {
+        Box::leak(format!("{} - {}", env!("CARGO_PKG_VERSION"), git_hash).into_boxed_str())
+    } else {
+        env!("CARGO_PKG_VERSION")
+    }
 }
 
-fn checksum_arg() -> Arg {
-    Arg::new("checksum")
-        .short('c')
-        .long("checksum")
-        .help("Skip based on checksum, not mod-time & size")
-        .long_help(
-            "By default, pxs skips files if size and modification time match. Use this to force a block-by-block hash comparison. In network mode, pxs also performs end-to-end BLAKE3 verification after the transfer completes.",
-        )
-        .action(ArgAction::SetTrue)
-}
-
-fn fsync_arg() -> Arg {
-    Arg::new("fsync")
-        .short('f')
-        .long("fsync")
-        .help("Force fsync after writing files")
-        .long_help(
-            "Ensures that file data and metadata are flushed to disk before finishing. Slower but safer.",
-        )
-        .action(ArgAction::SetTrue)
-}
-
-fn dry_run_arg() -> Arg {
-    Arg::new("dry_run")
-        .short('n')
-        .long("dry-run")
-        .help("Show what would have been transferred")
-        .action(ArgAction::SetTrue)
-}
-
-fn listen_arg() -> Arg {
-    Arg::new("listen")
-        .short('l')
-        .long("listen")
-        .help("Listen on ADDRESS:PORT for incoming or outgoing sync")
-        .long_help(
-            "Starts pxs in server mode. If --destination is used, it receives files. If --source and --sender are used, it serves files to clients.",
-        )
-        .value_name("ADDR")
-}
-
-fn remote_arg() -> Arg {
-    Arg::new("remote")
-        .short('r')
-        .long("remote")
-        .help("Sync with remote ADDRESS:PORT or SSH path")
-        .long_help(
-            "Connects to a remote pxs instance. By default, it pushes --source. If --pull is used, it fetches data to --destination.",
-        )
-        .value_name("ADDR")
-}
-
-fn stdio_arg() -> Arg {
-    Arg::new("stdio")
-        .long("stdio")
-        .help("Use stdin/stdout for communication (internal use for SSH)")
-        .action(ArgAction::SetTrue)
-        .conflicts_with_all(["listen", "remote"])
-}
-
-fn pull_arg() -> Arg {
-    Arg::new("pull")
-        .long("pull")
-        .short('P')
-        .help("Pull files from a remote source")
-        .long_help(
-            "When used with --remote, it initiates a connection to fetch data from the remote source to the local --destination.",
-        )
-        .action(ArgAction::SetTrue)
-        .requires("destination")
-        .conflicts_with("source")
-}
-
-fn sender_arg() -> Arg {
-    Arg::new("sender")
-        .long("sender")
-        .help("Run in sender mode (serves files to clients)")
-        .action(ArgAction::SetTrue)
-}
-
-fn ignore_arg() -> Arg {
-    Arg::new("ignore")
-        .short('i')
-        .long("ignore")
-        .help("Ignore files/directories matching this pattern (glob)")
-        .action(ArgAction::Append)
-        .value_name("PATTERN")
-}
-
-fn exclude_from_arg() -> Arg {
-    Arg::new("exclude_from")
-        .short('E')
-        .long("exclude-from")
-        .help("Read exclude patterns from FILE")
-        .value_name("FILE")
-        .value_parser(validator_path_exists())
+fn base_command() -> Command {
+    Command::new("pxs")
+        .about(ABOUT)
+        .long_about(LONG_ABOUT)
+        .version(env!("CARGO_PKG_VERSION"))
+        .long_version(long_version())
+        .color(ColorChoice::Auto)
+        .styles(cli_styles())
+        .arg_required_else_help(true)
+        .group(mode_group())
 }
 
 /// Build the CLI command definition.
 #[must_use]
 pub fn new() -> Command {
-    Command::new("pxs")
-        .about("pxs (Parallel X-Sync) - High-performance, concurrent file synchronization tool.")
-        .long_about(LONG_ABOUT)
-        .version(long_version())
-        .color(ColorChoice::Auto)
-        .styles(cli_styles())
-        .arg_required_else_help(true)
-        .arg(source_arg())
-        .arg(destination_arg())
-        .group(mode_group())
-        .arg(threshold_arg())
-        .arg(verbose_arg())
-        .arg(checksum_arg())
-        .arg(fsync_arg())
-        .arg(dry_run_arg())
-        .arg(listen_arg())
-        .arg(remote_arg())
-        .arg(stdio_arg())
-        .arg(pull_arg())
-        .arg(sender_arg())
-        .arg(ignore_arg())
-        .arg(exclude_from_arg())
+    let command = base_command();
+    command.args([
+        Arg::new("source")
+            .short('s')
+            .long("source")
+            .help("Path to the source file or directory")
+            .long_help(SOURCE_LONG_HELP)
+            .value_parser(validator_path_exists())
+            .value_name("SRC"),
+        Arg::new("destination")
+            .short('d')
+            .long("destination")
+            .help("Path to the destination file or directory")
+            .long_help(DESTINATION_LONG_HELP)
+            .value_parser(validator_parent_exist())
+            .value_name("DST"),
+        Arg::new("threshold")
+            .short('t')
+            .long("threshold")
+            .help("Threshold to determine if a file should be copied")
+            .long_help(THRESHOLD_LONG_HELP)
+            .value_name("THRESHOLD")
+            .value_parser(threshold_parser())
+            .default_value("0.5"),
+        Arg::new("verbose")
+            .short('v')
+            .long("verbose")
+            .help("Increase verbosity, -vv for debug")
+            .action(ArgAction::Count),
+        Arg::new("checksum")
+            .short('c')
+            .long("checksum")
+            .help("Skip based on checksum, not mod-time & size")
+            .long_help(CHECKSUM_LONG_HELP)
+            .action(ArgAction::SetTrue),
+        Arg::new("fsync")
+            .short('f')
+            .long("fsync")
+            .help("Force fsync after writing files")
+            .long_help(FSYNC_LONG_HELP)
+            .action(ArgAction::SetTrue),
+        Arg::new("dry_run")
+            .short('n')
+            .long("dry-run")
+            .help("Show what would have been transferred")
+            .action(ArgAction::SetTrue),
+        Arg::new("listen")
+            .short('l')
+            .long("listen")
+            .help("Listen on ADDRESS:PORT for incoming or outgoing sync")
+            .long_help(LISTEN_LONG_HELP)
+            .value_name("ADDR"),
+        Arg::new("remote")
+            .short('r')
+            .long("remote")
+            .help("Sync with remote ADDRESS:PORT or SSH path")
+            .long_help(REMOTE_LONG_HELP)
+            .value_name("ADDR"),
+        Arg::new("stdio")
+            .long("stdio")
+            .help("Use stdin/stdout for communication (internal use for SSH)")
+            .action(ArgAction::SetTrue)
+            .conflicts_with_all(["listen", "remote"]),
+        Arg::new("pull")
+            .long("pull")
+            .short('P')
+            .help("Pull files from a remote source")
+            .long_help(PULL_LONG_HELP)
+            .action(ArgAction::SetTrue)
+            .requires("destination")
+            .conflicts_with("source"),
+        Arg::new("sender")
+            .long("sender")
+            .help("Run in sender mode (serves files to clients)")
+            .action(ArgAction::SetTrue),
+        Arg::new("ignore")
+            .short('i')
+            .long("ignore")
+            .help("Ignore files/directories matching this pattern (glob)")
+            .action(ArgAction::Append)
+            .value_name("PATTERN"),
+        Arg::new("exclude_from")
+            .short('E')
+            .long("exclude-from")
+            .help("Read exclude patterns from FILE")
+            .value_name("FILE")
+            .value_parser(validator_path_exists()),
+    ])
 }
 
 #[cfg(test)]

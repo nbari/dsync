@@ -273,7 +273,7 @@ pub fn create_progress_bar(total_size: u64) -> ProgressBar {
     pb.set_style(
         ProgressStyle::default_bar()
             .template(
-                "{spinner:.cyan} [{elapsed_precise}] [{bar:40.cyan/blue}] {bytes}/{total_bytes} ({percent}%) {binary_bytes_per_sec} {eta_precise} {msg}",
+                "{spinner:.green} [{elapsed_precise}] [{bar:40.green/blue}] {bytes}/{total_bytes} ({percent}%) {binary_bytes_per_sec} {eta_precise} {msg}",
             )
             .unwrap_or_else(|_| ProgressStyle::default_bar())
             .progress_chars(PROGRESS_CHARS)

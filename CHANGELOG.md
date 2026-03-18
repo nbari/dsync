@@ -2,6 +2,18 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.1] - 2026-03-18
+
+### Changed
+
+- Simplified build-time metadata generation and made the CLI long version show the git commit only when it is available.
+- Refactored CLI command construction around a shared `base_command()` scaffold while keeping the option list inline in `new()`.
+- Updated the progress bar theme to use a green spinner and green filled bar segments.
+
+### Fixed
+
+- Moved the generated `built.rs` doc-markdown allowance to the shared build info module so strict clippy checks pass without post-processing generated files.
+
 ## [0.3.0] - 2026-03-18
 
 ### Added
