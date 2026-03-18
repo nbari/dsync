@@ -153,7 +153,7 @@ fn checksum_arg() -> Arg {
         .long("checksum")
         .help("Skip based on checksum, not mod-time & size")
         .long_help(
-            "By default, pxs skips files if size and modification time match. Use this to force a block-by-block hash comparison.",
+            "By default, pxs skips files if size and modification time match. Use this to force a block-by-block hash comparison. In network mode, pxs also performs end-to-end BLAKE3 verification after the transfer completes.",
         )
         .action(ArgAction::SetTrue)
 }
@@ -270,4 +270,53 @@ pub fn new() -> Command {
         .arg(sender_arg())
         .arg(ignore_arg())
         .arg(exclude_from_arg())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::new;
+
+    #[test]
+    fn test_verbose_flag_counts_occurrences() -> anyhow::Result<()> {
+        let matches =
+            new().try_get_matches_from(["pxs", "--stdio", "--destination", ".", "-vvv"])?;
+        assert_eq!(matches.get_count("verbose"), 3);
+        Ok(())
+    }
+
+    #[test]
+    fn test_threshold_rejects_out_of_range_values() {
+        let too_small = new().try_get_matches_from([
+            "pxs",
+            "--stdio",
+            "--destination",
+            ".",
+            "--threshold",
+            "0.01",
+        ]);
+        assert!(too_small.is_err());
+
+        let too_large = new().try_get_matches_from([
+            "pxs",
+            "--stdio",
+            "--destination",
+            ".",
+            "--threshold",
+            "1.5",
+        ]);
+        assert!(too_large.is_err());
+    }
+
+    #[test]
+    fn test_stdio_conflicts_with_remote() {
+        let matches = new().try_get_matches_from([
+            "pxs",
+            "--stdio",
+            "--remote",
+            "127.0.0.1:9000",
+            "--destination",
+            ".",
+        ]);
+        assert!(matches.is_err());
+    }
 }

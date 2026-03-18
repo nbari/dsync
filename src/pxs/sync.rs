@@ -1,6 +1,7 @@
 use crate::pxs::tools;
 use anyhow::Context;
 use filetime::{FileTime, set_file_times};
+use futures_util::{StreamExt, stream::FuturesUnordered};
 use indicatif::ProgressBar;
 use std::{
     hash::Hasher,
@@ -12,6 +13,22 @@ use tokio::sync::Semaphore;
 use twox_hash::XxHash64;
 
 const BLOCK_SIZE: usize = 128 * 1024;
+const MAX_PARALLELISM: usize = 64;
+
+fn clamped_parallelism() -> usize {
+    std::thread::available_parallelism()
+        .map(std::num::NonZeroUsize::get)
+        .unwrap_or(8)
+        .min(MAX_PARALLELISM)
+}
+
+fn mapped_chunk(mmap: &memmap2::Mmap, offset: u64, len: usize) -> anyhow::Result<Option<&[u8]>> {
+    let start = usize::try_from(offset).map_err(|e| anyhow::anyhow!(e))?;
+    let end = start
+        .checked_add(len)
+        .ok_or_else(|| anyhow::anyhow!("mapped chunk end overflow"))?;
+    Ok(mmap.get(start..end))
+}
 
 #[derive(Debug, Default, Clone, Copy)]
 pub struct SyncStats {
@@ -32,8 +49,8 @@ struct DirectorySyncContext<'a> {
 
 struct DirectoryWalkState {
     directory_paths: Vec<PathBuf>,
-    tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
-    semaphore: Arc<Semaphore>,
+    tasks: FuturesUnordered<tokio::task::JoinHandle<anyhow::Result<()>>>,
+    max_in_flight: usize,
 }
 
 struct WorkerContext {
@@ -41,6 +58,8 @@ struct WorkerContext {
     src_len: u64,
     src: Arc<std::fs::File>,
     dst: Arc<std::fs::File>,
+    src_mmap: Option<Arc<memmap2::Mmap>>,
+    dst_mmap: Option<Arc<memmap2::Mmap>>,
     pb: Arc<ProgressBar>,
     semaphore: Arc<Semaphore>,
     full_copy: bool,
@@ -50,12 +69,8 @@ impl DirectoryWalkState {
     fn new() -> Self {
         Self {
             directory_paths: Vec::new(),
-            tasks: Vec::new(),
-            semaphore: Arc::new(Semaphore::new(
-                std::thread::available_parallelism()
-                    .map(std::num::NonZeroUsize::get)
-                    .unwrap_or(8),
-            )),
+            tasks: FuturesUnordered::new(),
+            max_in_flight: clamped_parallelism(),
         }
     }
 }
@@ -79,12 +94,13 @@ pub fn apply_metadata(src: &Path, dst: &Path) -> anyhow::Result<()> {
         use std::os::unix::fs::MetadataExt;
         let uid = meta.uid();
         let gid = meta.gid();
-        // Ignoring errors for chown if not root
-        let _ = nix::unistd::chown(
+        if let Err(e) = nix::unistd::chown(
             dst,
             Some(nix::unistd::Uid::from_raw(uid)),
             Some(nix::unistd::Gid::from_raw(gid)),
-        );
+        ) {
+            tracing::debug!("Could not set ownership on {}: {e}", dst.display());
+        }
     }
 
     // Set mtime
@@ -273,7 +289,6 @@ async fn handle_symlink_entry(
 
 fn spawn_file_sync_task(
     context: &DirectorySyncContext<'_>,
-    semaphore: Arc<Semaphore>,
     src: PathBuf,
     dst: PathBuf,
 ) -> tokio::task::JoinHandle<anyhow::Result<()>> {
@@ -284,11 +299,6 @@ fn spawn_file_sync_task(
     let fsync = context.fsync;
 
     tokio::spawn(async move {
-        let _permit = semaphore
-            .acquire()
-            .await
-            .map_err(|e| anyhow::anyhow!("failed to acquire semaphore: {e}"))?;
-
         if tools::should_skip_file(&src, &dst, checksum).await? {
             let src_size = tools::get_file_size(&src).await?;
             pb.inc(src_size);
@@ -305,7 +315,6 @@ fn spawn_file_sync_task(
         pb.set_message(src.display().to_string());
         let full_copy = tools::should_use_full_copy(&src, &dst, threshold).await?;
         sync_changed_blocks_with_pb(&src, &dst, full_copy, pb, fsync).await?;
-        apply_metadata(&src, &dst)?;
         Ok(())
     })
 }
@@ -335,9 +344,11 @@ async fn handle_walk_entry(
     }
 
     if file_type.is_file() {
+        if state.tasks.len() >= state.max_in_flight {
+            wait_for_next_sync_task(&mut state.tasks).await?;
+        }
         state.tasks.push(spawn_file_sync_task(
             context,
-            Arc::clone(&state.semaphore),
             src_path.to_path_buf(),
             dst_path,
         ));
@@ -346,11 +357,24 @@ async fn handle_walk_entry(
     Ok(())
 }
 
-async fn wait_for_sync_tasks(
-    tasks: Vec<tokio::task::JoinHandle<anyhow::Result<()>>>,
+async fn wait_for_next_sync_task(
+    tasks: &mut FuturesUnordered<tokio::task::JoinHandle<anyhow::Result<()>>>,
 ) -> anyhow::Result<()> {
-    for task in tasks {
-        task.await??;
+    let task_result = tasks
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("missing sync task"))?;
+    task_result
+        .map_err(|e| anyhow::anyhow!(e))
+        .context("worker task panicked")??;
+    Ok(())
+}
+
+async fn wait_for_sync_tasks(
+    mut tasks: FuturesUnordered<tokio::task::JoinHandle<anyhow::Result<()>>>,
+) -> anyhow::Result<()> {
+    while !tasks.is_empty() {
+        wait_for_next_sync_task(&mut tasks).await?;
     }
     Ok(())
 }
@@ -403,6 +427,64 @@ pub async fn sync_changed_blocks_with_pb(
     pb: Arc<ProgressBar>,
     fsync: bool,
 ) -> anyhow::Result<SyncStats> {
+    let staged_file = tools::StagedFile::new(dst_path)?;
+    let seed_from_existing = matches!(std::fs::symlink_metadata(dst_path), Ok(meta) if meta.file_type().is_file())
+        && !full_copy;
+    staged_file
+        .prepare(tools::get_file_size(src_path).await?, seed_from_existing)
+        .context("failed to prepare staged destination file")?;
+    let sync_result =
+        sync_changed_blocks_to_staging(src_path, staged_file.path(), full_copy, pb).await;
+
+    let stats = match sync_result {
+        Ok(stats) => stats,
+        Err(error) => {
+            let _ = staged_file.cleanup();
+            return Err(error);
+        }
+    };
+
+    let metadata_result = apply_metadata(src_path, staged_file.path());
+    if let Err(error) = metadata_result {
+        let _ = staged_file.cleanup();
+        return Err(error);
+    }
+
+    if fsync {
+        let staged_handle = std::fs::OpenOptions::new()
+            .read(true)
+            .open(staged_file.path())
+            .with_context(|| {
+                format!(
+                    "failed to open staged destination file: {}",
+                    staged_file.path().display()
+                )
+            })?;
+        staged_handle
+            .sync_all()
+            .context("failed to sync staged destination file to disk")?;
+    }
+
+    let commit_result = staged_file.commit();
+    if let Err(error) = commit_result {
+        let _ = staged_file.cleanup();
+        return Err(error);
+    }
+
+    if fsync {
+        tools::sync_parent_directory(dst_path)
+            .context("failed to sync destination parent directory")?;
+    }
+
+    Ok(stats)
+}
+
+async fn sync_changed_blocks_to_staging(
+    src_path: &Path,
+    staged_path: &Path,
+    full_copy: bool,
+    pb: Arc<ProgressBar>,
+) -> anyhow::Result<SyncStats> {
     let src_file = std::fs::File::open(src_path)
         .with_context(|| format!("failed to open source file: {}", src_path.display()))?;
 
@@ -411,24 +493,20 @@ pub async fn sync_changed_blocks_with_pb(
         .context("failed to get source metadata")?
         .len();
 
-    if dst_path.is_dir() {
-        tokio::fs::remove_dir_all(dst_path).await?;
-    }
-
-    // Pre-allocate space
-    tools::preallocate(dst_path, src_len).context("failed to pre-allocate destination space")?;
-
     let dst_file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
-        .create(true)
-        .truncate(false)
-        .open(dst_path)
-        .with_context(|| format!("failed to open destination file: {}", dst_path.display()))?;
+        .open(staged_path)
+        .with_context(|| {
+            format!(
+                "failed to open staged destination file: {}",
+                staged_path.display()
+            )
+        })?;
 
     let dst_len = dst_file
         .metadata()
-        .context("failed to get destination metadata")?
+        .context("failed to get staged destination metadata")?
         .len();
 
     // Hint sequential access
@@ -450,11 +528,10 @@ pub async fn sync_changed_blocks_with_pb(
 
     let src_arc = Arc::new(src_file);
     let dst_arc = Arc::new(dst_file);
+    let src_mmap = tools::safe_mmap(src_arc.as_ref()).ok().map(Arc::new);
+    let dst_mmap = tools::safe_mmap(dst_arc.as_ref()).ok().map(Arc::new);
 
-    let concurrency = std::thread::available_parallelism()
-        .map(std::num::NonZero::get)
-        .unwrap_or(8);
-
+    let concurrency = clamped_parallelism();
     let semaphore = Arc::new(Semaphore::new(concurrency));
     let chunk_size: u64 = 1024 * 1024; // 1MB chunks for parallel processing
     let worker_context = Arc::new(WorkerContext {
@@ -462,16 +539,17 @@ pub async fn sync_changed_blocks_with_pb(
         src_len,
         src: Arc::clone(&src_arc),
         dst: Arc::clone(&dst_arc),
+        src_mmap,
+        dst_mmap,
         pb: Arc::clone(&pb),
         semaphore: Arc::clone(&semaphore),
         full_copy,
     });
-    let mut handles = Vec::new();
     let num_chunks = src_len.div_ceil(chunk_size);
+    let mut handles = Vec::new();
 
-    for i in 0..num_chunks {
-        let handle = spawn_sync_worker(i, Arc::clone(&worker_context));
-        handles.push(handle);
+    for chunk_index in 0..num_chunks {
+        handles.push(spawn_sync_worker(chunk_index, Arc::clone(&worker_context)));
     }
 
     let mut stats = SyncStats::default();
@@ -488,12 +566,6 @@ pub async fn sync_changed_blocks_with_pb(
         dst_arc
             .set_len(src_len)
             .context("failed to truncate destination file")?;
-    }
-
-    if fsync {
-        dst_arc
-            .sync_all()
-            .context("failed to sync destination file to disk")?;
     }
 
     Ok(stats)
@@ -528,6 +600,48 @@ fn spawn_sync_worker(
                 let to_read_u64 = std::cmp::min(BLOCK_SIZE as u64, end_offset - offset);
                 let to_read = usize::try_from(to_read_u64).map_err(|e| anyhow::anyhow!(e))?;
 
+                let mut write_if_needed =
+                    |src_chunk: &[u8], needs_write: bool| -> anyhow::Result<()> {
+                        if needs_write {
+                            if let Err(e) = worker_context.dst.write_all_at(src_chunk, offset) {
+                                if e.raw_os_error() == Some(nix::libc::ENOSPC) {
+                                    anyhow::bail!(
+                                        "Disk full: not enough space to write to destination"
+                                    );
+                                }
+                                return Err(e).context("failed to write to destination");
+                            }
+                            chunk_updated += 1;
+                        }
+                        Ok(())
+                    };
+
+                if let Some(src_mmap) = &worker_context.src_mmap
+                    && let Some(src_chunk) = mapped_chunk(src_mmap, offset, to_read)?
+                {
+                    let needs_write = if worker_context.full_copy {
+                        true
+                    } else if let Some(dst_mmap) = &worker_context.dst_mmap {
+                        match mapped_chunk(dst_mmap, offset, to_read)? {
+                            Some(dst_chunk) => src_chunk != dst_chunk,
+                            None => true,
+                        }
+                    } else {
+                        let dst_chunk = dst_buf
+                            .get_mut(..to_read)
+                            .ok_or_else(|| anyhow::anyhow!("dst_buf too small"))?;
+                        match worker_context.dst.read_exact_at(dst_chunk, offset) {
+                            Ok(()) => src_chunk != dst_chunk,
+                            Err(_) => true,
+                        }
+                    };
+                    write_if_needed(src_chunk, needs_write)?;
+                    chunk_total += 1;
+                    worker_context.pb.inc(to_read_u64);
+                    offset += to_read as u64;
+                    continue;
+                }
+
                 let src_chunk = src_buf
                     .get_mut(..to_read)
                     .ok_or_else(|| anyhow::anyhow!("src_buf too small"))?;
@@ -542,24 +656,13 @@ fn spawn_sync_worker(
                     let dst_chunk = dst_buf
                         .get_mut(..to_read)
                         .ok_or_else(|| anyhow::anyhow!("dst_buf too small"))?;
-                    let dst_read_result = worker_context.dst.read_exact_at(dst_chunk, offset);
-                    match dst_read_result {
-                        Ok(()) => {
-                            let src_hash = fast_hash_block(src_chunk);
-                            let dst_hash = fast_hash_block(dst_chunk);
-                            src_hash != dst_hash
-                        }
+                    match worker_context.dst.read_exact_at(dst_chunk, offset) {
+                        Ok(()) => src_chunk != dst_chunk,
                         Err(_) => true,
                     }
                 };
 
-                if needs_write {
-                    worker_context
-                        .dst
-                        .write_all_at(src_chunk, offset)
-                        .context("failed to write to destination")?;
-                    chunk_updated += 1;
-                }
+                write_if_needed(src_chunk, needs_write)?;
 
                 chunk_total += 1;
                 worker_context.pb.inc(to_read_u64);
@@ -586,7 +689,5 @@ pub async fn sync_changed_blocks(
     fsync: bool,
 ) -> anyhow::Result<SyncStats> {
     let pb = Arc::new(ProgressBar::hidden());
-    let stats = sync_changed_blocks_with_pb(src_path, dst_path, full_copy, pb, fsync).await?;
-    apply_metadata(src_path, dst_path)?;
-    Ok(stats)
+    sync_changed_blocks_with_pb(src_path, dst_path, full_copy, pb, fsync).await
 }

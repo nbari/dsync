@@ -231,6 +231,10 @@ mod tests {
         Ok(handler(&matches))
     }
 
+    fn assert_threshold(actual: f32, expected: f32) {
+        assert!((actual - expected).abs() < f32::EPSILON);
+    }
+
     #[test]
     fn test_short_fsync_flag_sets_local_run_action() -> anyhow::Result<()> {
         let dir = tempdir()?;
@@ -288,6 +292,251 @@ mod tests {
         match stdio {
             Action::Stdio { fsync, .. } => assert!(fsync),
             other => anyhow::bail!("expected Action::Stdio, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_local_run_propagates_threshold_checksum_and_dry_run() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("src.txt");
+        let dst = dir.path().join("dst.txt");
+        std::fs::write(&src, "content")?;
+
+        let src_arg = src.to_string_lossy().to_string();
+        let dst_arg = dst.to_string_lossy().to_string();
+        let action = parse_action(&[
+            "pxs",
+            "--source",
+            &src_arg,
+            "--destination",
+            &dst_arg,
+            "--threshold",
+            "0.25",
+            "--checksum",
+            "--dry-run",
+        ])?;
+
+        match action {
+            Action::Run {
+                threshold,
+                checksum,
+                dry_run,
+                ..
+            } => {
+                assert_threshold(threshold, 0.25);
+                assert!(checksum);
+                assert!(dry_run);
+            }
+            other => anyhow::bail!("expected Action::Run, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remote_ssh_connect_parses_remote_path() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, "content")?;
+        let src_arg = src.to_string_lossy().to_string();
+
+        let action = parse_action(&[
+            "pxs",
+            "--remote",
+            "user@example:/srv/data",
+            "--source",
+            &src_arg,
+            "--checksum",
+            "--threshold",
+            "0.75",
+        ])?;
+
+        match action {
+            Action::Connect {
+                addr,
+                remote_path,
+                threshold,
+                checksum,
+                ..
+            } => {
+                assert_eq!(addr, "user@example");
+                assert_eq!(remote_path.as_deref(), Some("/srv/data"));
+                assert_threshold(threshold, 0.75);
+                assert!(checksum);
+            }
+            other => anyhow::bail!("expected Action::Connect, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remote_ssh_pull_parses_remote_path_and_flags() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let dst = dir.path().join("dst");
+        std::fs::create_dir_all(&dst)?;
+        let dst_arg = dst.to_string_lossy().to_string();
+
+        let action = parse_action(&[
+            "pxs",
+            "--remote",
+            "user@example:/srv/data",
+            "--destination",
+            &dst_arg,
+            "--pull",
+            "--checksum",
+            "--fsync",
+        ])?;
+
+        match action {
+            Action::Pull {
+                addr,
+                remote_path,
+                checksum,
+                fsync,
+                ..
+            } => {
+                assert_eq!(addr, "user@example");
+                assert_eq!(remote_path.as_deref(), Some("/srv/data"));
+                assert!(checksum);
+                assert!(fsync);
+            }
+            other => anyhow::bail!("expected Action::Pull, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_listen_sender_propagates_threshold_checksum_and_ignores() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("src");
+        std::fs::create_dir_all(&src)?;
+        let src_arg = src.to_string_lossy().to_string();
+
+        let action = parse_action(&[
+            "pxs",
+            "--listen",
+            "127.0.0.1:9999",
+            "--source",
+            &src_arg,
+            "--sender",
+            "--threshold",
+            "0.9",
+            "--checksum",
+            "--ignore",
+            "*.tmp",
+            "--ignore",
+            "*.wal",
+        ])?;
+
+        match action {
+            Action::ListenSender {
+                threshold,
+                checksum,
+                ignores,
+                ..
+            } => {
+                assert_threshold(threshold, 0.9);
+                assert!(checksum);
+                assert_eq!(ignores, vec!["*.tmp", "*.wal"]);
+            }
+            other => anyhow::bail!("expected Action::ListenSender, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_stdio_sender_propagates_threshold_checksum_and_ignores() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, "content")?;
+        let src_arg = src.to_string_lossy().to_string();
+
+        let action = parse_action(&[
+            "pxs",
+            "--stdio",
+            "--sender",
+            "--source",
+            &src_arg,
+            "--threshold",
+            "0.8",
+            "--checksum",
+            "--ignore",
+            "*.tmp",
+        ])?;
+
+        match action {
+            Action::StdioSender {
+                threshold,
+                checksum,
+                ignores,
+                ..
+            } => {
+                assert_threshold(threshold, 0.8);
+                assert!(checksum);
+                assert_eq!(ignores, vec!["*.tmp"]);
+            }
+            other => anyhow::bail!("expected Action::StdioSender, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_ignore_and_exclude_from_patterns_are_merged() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("src");
+        let dst = dir.path().join("dst");
+        std::fs::create_dir_all(&src)?;
+        std::fs::create_dir_all(&dst)?;
+        let exclude_file = dir.path().join("exclude.txt");
+        std::fs::write(&exclude_file, "# comment\n*.log\n\ncache/\n")?;
+
+        let src_arg = src.to_string_lossy().to_string();
+        let dst_arg = dst.to_string_lossy().to_string();
+        let exclude_arg = exclude_file.to_string_lossy().to_string();
+        let action = parse_action(&[
+            "pxs",
+            "--source",
+            &src_arg,
+            "--destination",
+            &dst_arg,
+            "--ignore",
+            "*.tmp",
+            "--exclude-from",
+            &exclude_arg,
+        ])?;
+
+        match action {
+            Action::Run { ignores, .. } => {
+                assert_eq!(ignores, vec!["*.tmp", "*.log", "cache/"]);
+            }
+            other => anyhow::bail!("expected Action::Run, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_remote_dash_maps_to_stdio_connect() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, "content")?;
+        let src_arg = src.to_string_lossy().to_string();
+
+        let action = parse_action(&["pxs", "--remote", "-", "--source", &src_arg])?;
+        match action {
+            Action::Connect {
+                addr, remote_path, ..
+            } => {
+                assert_eq!(addr, "-");
+                assert!(remote_path.is_none());
+            }
+            other => anyhow::bail!("expected Action::Connect, got {other:?}"),
         }
 
         Ok(())

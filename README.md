@@ -43,6 +43,9 @@ The binary will be available at `./target/release/pxs`.
 > [!IMPORTANT]
 > For **Network** or **SSH** synchronization, `pxs` must be installed and available in the `$PATH` on **both** the source and destination servers.
 
+> [!NOTE]
+> **Clock Synchronization**: When using mtime-based skip detection (the default without `--checksum`), ensure source and destination systems have synchronized clocks (e.g., via NTP). Clock skew can cause files to be incorrectly skipped or unnecessarily re-synced. Use `--checksum` to force content-based comparison if clock sync is not guaranteed.
+
 ## Platform Support
 
 `pxs` currently targets **Unix-like systems only**:

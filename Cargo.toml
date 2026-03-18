@@ -1,6 +1,6 @@
 [package]
 name = "pxs"
-version = "0.2.1"
+version = "0.3.0"
 edition = "2024"
 authors = ["Nicolas Embriz <nbari@tequila.io>"]
 description = "pxs (Parallel X-Sync) - High-performance, concurrent file synchronization tool for massive data transfers."
@@ -71,6 +71,7 @@ tracing = "0.1"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 twox-hash = "2.1.2"
+blake3 = { version = "1", features = ["mmap", "rayon"] }
 
 [package.metadata.generate-rpm]
 assets = [

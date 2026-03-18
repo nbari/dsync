@@ -81,6 +81,16 @@ pub enum Message {
         path: String,
         indices: Vec<u32>,
     },
+    VerifyChecksum {
+        path: String,
+        hash: [u8; 32],
+    },
+    ChecksumVerified {
+        path: String,
+    },
+    ChecksumMismatch {
+        path: String,
+    },
     Error(String),
 }
 
@@ -130,11 +140,13 @@ pub fn apply_file_metadata(path: &Path, metadata: &FileMetadata) -> anyhow::Resu
             .context("failed to set permissions")?;
     }
 
-    let _ = nix::unistd::chown(
+    if let Err(e) = nix::unistd::chown(
         path,
         Some(nix::unistd::Uid::from_raw(metadata.uid)),
         Some(nix::unistd::Gid::from_raw(metadata.gid)),
-    );
+    ) {
+        tracing::debug!("Could not set ownership on {}: {e}", path.display());
+    }
 
     let mtime = FileTime::from_unix_time(metadata.mtime, metadata.mtime_nsec);
     if is_symlink {

@@ -9,6 +9,8 @@ mod tasks;
 const BLOCK_SIZE: u64 = 128 * 1024;
 const BLOCK_SIZE_USIZE: usize = 128 * 1024;
 const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
+/// Idle timeout for network operations (5 minutes)
+const IDLE_TIMEOUT_SECS: u64 = 300;
 
 pub use codec::PxsCodec;
 pub use protocol::{

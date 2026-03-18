@@ -2,6 +2,7 @@ use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use indicatif::ProgressBar;
 use pxs::pxs::net::{self, Block, FileMetadata, Message};
+use pxs::pxs::tools;
 use std::{path::PathBuf, sync::Arc, time::Duration};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
@@ -33,6 +34,15 @@ async fn spawn_receiver(
 async fn stop_receiver(receiver_handle: JoinHandle<()>) {
     tokio::time::sleep(Duration::from_millis(100)).await;
     receiver_handle.abort();
+}
+
+fn make_patterned_bytes(len: usize, step: usize, offset: usize) -> anyhow::Result<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(len);
+    for index in 0..len {
+        let value = (index.wrapping_mul(step).wrapping_add(offset)) % 251;
+        bytes.push(u8::try_from(value).map_err(|e| anyhow::anyhow!(e))?);
+    }
+    Ok(bytes)
 }
 
 #[test]
@@ -127,6 +137,28 @@ async fn test_full_network_sync_simulation() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn test_network_sync_full_copy_spans_multiple_batches() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    std::fs::create_dir_all(&src_dir)?;
+    std::fs::create_dir_all(&dst_dir)?;
+
+    let file_path = src_dir.join("large.bin");
+    let content = make_patterned_bytes(18 * 1024 * 1024 + 17, 17, 3)?;
+    std::fs::write(&file_path, &content)?;
+
+    let (addr, receiver_handle) = spawn_receiver(dst_dir.clone()).await?;
+
+    net::run_sender(&addr.to_string(), &src_dir, 0.5, false, &[]).await?;
+    stop_receiver(receiver_handle).await;
+
+    let dst_content = std::fs::read(dst_dir.join("large.bin"))?;
+    assert_eq!(dst_content, content);
+    Ok(())
+}
+
 #[test]
 fn test_block_serialization() -> anyhow::Result<()> {
     let block = Block {
@@ -150,6 +182,31 @@ fn test_block_serialization() -> anyhow::Result<()> {
     } else {
         anyhow::bail!("Block message mismatch");
     }
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_network_sync_delta_requests_multiple_block_batches() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    std::fs::create_dir_all(&src_dir)?;
+    std::fs::create_dir_all(&dst_dir)?;
+
+    let src_file = src_dir.join("delta.bin");
+    let dst_file = dst_dir.join("delta.bin");
+    let src_content = make_patterned_bytes(18 * 1024 * 1024 + 17, 29, 11)?;
+    let dst_content = make_patterned_bytes(src_content.len(), 31, 19)?;
+    std::fs::write(&src_file, &src_content)?;
+    std::fs::write(&dst_file, &dst_content)?;
+
+    let (addr, receiver_handle) = spawn_receiver(dst_dir.clone()).await?;
+
+    net::run_sender(&addr.to_string(), &src_dir, 0.5, false, &[]).await?;
+    stop_receiver(receiver_handle).await;
+
+    let dst_bytes = std::fs::read(&dst_file)?;
+    assert_eq!(dst_bytes, src_content);
     Ok(())
 }
 
@@ -517,6 +574,12 @@ async fn test_handle_client_rejects_unsafe_protocol_paths() -> anyhow::Result<()
 
         let mut sender = Framed::new(client, net::PxsCodec);
         sender
+            .send(net::serialize_message(&Message::Handshake {
+                version: env!("CARGO_PKG_VERSION").to_string(),
+            })?)
+            .await?;
+        let _ = sender.next().await;
+        sender
             .send(net::serialize_message(&Message::SyncDir {
                 path: path.to_string(),
                 metadata,
@@ -531,5 +594,383 @@ async fn test_handle_client_rejects_unsafe_protocol_paths() -> anyhow::Result<()
         assert!(err.to_string().contains("protocol path"));
     }
 
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_sender_rejects_incompatible_handshake_response() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    std::fs::create_dir_all(&src_dir)?;
+    std::fs::write(src_dir.join("file.txt"), "content")?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut framed = Framed::new(stream, net::PxsCodec);
+        let handshake = framed
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("missing handshake"))??;
+        match net::deserialize_message(&handshake)? {
+            Message::Handshake { .. } => {}
+            other => anyhow::bail!("expected handshake, got {other:?}"),
+        }
+        framed
+            .send(net::serialize_message(&Message::Handshake {
+                version: String::from("9.9.0"),
+            })?)
+            .await?;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let err = match net::run_sender(&addr.to_string(), &src_dir, 0.5, false, &[]).await {
+        Ok(()) => anyhow::bail!("expected incompatible handshake error"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("incompatible peer version"));
+    server_task.await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sender_listener_refreshes_source_tree_per_client() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    std::fs::create_dir_all(&src_dir)?;
+    std::fs::create_dir_all(&dst_dir)?;
+    std::fs::write(src_dir.join("file.txt"), "version-one")?;
+
+    let probe = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+
+    let addr_string = addr.to_string();
+    let src_dir_clone = src_dir.clone();
+    let listener_task = tokio::spawn(async move {
+        let ignores = Vec::new();
+        let _ = net::run_sender_listener(&addr_string, &src_dir_clone, 0.5, false, &ignores).await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    net::run_pull_client(&addr.to_string(), &dst_dir, false).await?;
+    assert_eq!(
+        std::fs::read_to_string(dst_dir.join("file.txt"))?,
+        "version-one"
+    );
+
+    std::fs::write(src_dir.join("file.txt"), "version-two-updated")?;
+    std::fs::write(src_dir.join("new.txt"), "fresh-file")?;
+
+    net::run_pull_client(&addr.to_string(), &dst_dir, false).await?;
+    assert_eq!(
+        std::fs::read_to_string(dst_dir.join("file.txt"))?,
+        "version-two-updated"
+    );
+    assert_eq!(
+        std::fs::read_to_string(dst_dir.join("new.txt"))?,
+        "fresh-file"
+    );
+
+    listener_task.abort();
+    let _ = listener_task.await;
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_network_sync_with_checksum_verification() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    std::fs::create_dir_all(&src_dir)?;
+    std::fs::create_dir_all(&dst_dir)?;
+
+    let file_path = src_dir.join("test.bin");
+    let content = (0..256 * 1024)
+        .map(|i| {
+            #[allow(clippy::cast_possible_truncation, clippy::cast_sign_loss)]
+            let val = (i % 256) as u8;
+            val
+        })
+        .collect::<Vec<_>>();
+    std::fs::write(&file_path, &content)?;
+
+    let (addr, receiver_handle) = spawn_receiver(dst_dir.clone()).await?;
+
+    // Run sender with checksum=true to trigger BLAKE3 verification
+    net::run_sender(&addr.to_string(), &src_dir, 0.5, true, &[]).await?;
+    stop_receiver(receiver_handle).await;
+
+    // Verify file was transferred correctly
+    let dst_file_path = dst_dir.join("test.bin");
+    assert!(dst_file_path.exists());
+    let dst_content = std::fs::read(&dst_file_path)?;
+    assert_eq!(content, dst_content);
+
+    // Verify BLAKE3 hashes match
+    let src_hash = tools::blake3_file_hash(&file_path).await?;
+    let dst_hash = tools::blake3_file_hash(&dst_file_path).await?;
+    assert_eq!(src_hash, dst_hash);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_blake3_file_hash() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let file_path = dir.path().join("test.bin");
+
+    let content = b"hello world";
+    std::fs::write(&file_path, content)?;
+
+    let hash = tools::blake3_file_hash(&file_path).await?;
+
+    // Verify against known BLAKE3 hash of "hello world"
+    let expected = blake3::hash(content);
+    assert_eq!(hash, *expected.as_bytes());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_partial_file_cleanup_on_error() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let dst_dir = dir.path().join("dst");
+    std::fs::create_dir_all(&dst_dir)?;
+
+    let (client, server) = tokio::io::duplex(4096);
+    let dst_dir_clone = dst_dir.clone();
+
+    let receiver_task = tokio::spawn(async move {
+        let mut framed = Framed::new(server, net::PxsCodec);
+        net::handle_client(&mut framed, &dst_dir_clone, false, false).await
+    });
+
+    let mut sender = Framed::new(client, net::PxsCodec);
+
+    // Send handshake
+    sender
+        .send(net::serialize_message(&Message::Handshake {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })?)
+        .await?;
+
+    // Wait for handshake response
+    let _ = sender.next().await;
+
+    // Send a file sync message
+    let metadata = FileMetadata {
+        size: 1024,
+        mtime: 0,
+        mtime_nsec: 0,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    sender
+        .send(net::serialize_message(&Message::SyncFile {
+            path: String::from("partial.bin"),
+            metadata,
+            threshold: 0.5,
+            checksum: false,
+        })?)
+        .await?;
+
+    // Wait for RequestFullCopy
+    let _ = sender.next().await;
+
+    // Send partial blocks (not all data)
+    sender
+        .send(net::serialize_message(&Message::ApplyBlocks {
+            path: String::from("partial.bin"),
+            blocks: vec![Block {
+                offset: 0,
+                data: vec![1, 2, 3, 4],
+            }],
+        })?)
+        .await?;
+
+    // Drop sender to simulate connection failure before completion
+    drop(sender);
+
+    // Wait for receiver to finish (with error due to incomplete transfer)
+    let _ = receiver_task.await;
+
+    // Verify partial file was cleaned up
+    let partial_file = dst_dir.join("partial.bin");
+    assert!(
+        !partial_file.exists(),
+        "Partial file should have been removed"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_partial_update_failure_preserves_existing_file() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let dst_dir = dir.path().join("dst");
+    std::fs::create_dir_all(&dst_dir)?;
+    let dst_file = dst_dir.join("partial.bin");
+    let original = b"existing destination".to_vec();
+    std::fs::write(&dst_file, &original)?;
+
+    let (client, server) = tokio::io::duplex(4096);
+    let dst_dir_clone = dst_dir.clone();
+    let receiver_task = tokio::spawn(async move {
+        let mut framed = Framed::new(server, net::PxsCodec);
+        net::handle_client(&mut framed, &dst_dir_clone, false, false).await
+    });
+
+    let mut sender = Framed::new(client, net::PxsCodec);
+    sender
+        .send(net::serialize_message(&Message::Handshake {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })?)
+        .await?;
+    let _ = sender.next().await;
+
+    let metadata = FileMetadata {
+        size: 1024,
+        mtime: 0,
+        mtime_nsec: 0,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    sender
+        .send(net::serialize_message(&Message::SyncFile {
+            path: String::from("partial.bin"),
+            metadata,
+            threshold: 0.5,
+            checksum: false,
+        })?)
+        .await?;
+
+    let request = sender
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("missing full copy request"))??;
+    match net::deserialize_message(&request)? {
+        Message::RequestFullCopy { path } => assert_eq!(path, "partial.bin"),
+        other => anyhow::bail!("expected RequestFullCopy, got {other:?}"),
+    }
+
+    sender
+        .send(net::serialize_message(&Message::ApplyBlocks {
+            path: String::from("partial.bin"),
+            blocks: vec![Block {
+                offset: 0,
+                data: vec![9, 8, 7, 6],
+            }],
+        })?)
+        .await?;
+    drop(sender);
+    let _ = receiver_task.await;
+
+    assert_eq!(std::fs::read(&dst_file)?, original);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_checksum_mismatch_preserves_existing_file() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let dst_dir = dir.path().join("dst");
+    std::fs::create_dir_all(&dst_dir)?;
+    let dst_file = dst_dir.join("checksum.bin");
+    let original = b"keep me".to_vec();
+    std::fs::write(&dst_file, &original)?;
+
+    let (client, server) = tokio::io::duplex(4096);
+    let dst_dir_clone = dst_dir.clone();
+    let receiver_task = tokio::spawn(async move {
+        let mut framed = Framed::new(server, net::PxsCodec);
+        net::handle_client(&mut framed, &dst_dir_clone, false, false).await
+    });
+
+    let mut sender = Framed::new(client, net::PxsCodec);
+    sender
+        .send(net::serialize_message(&Message::Handshake {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })?)
+        .await?;
+    let _ = sender.next().await;
+
+    let source_bytes = *b"fresh payload data";
+    let corrupt_bytes = *b"fresh payload FAIL";
+    let metadata = FileMetadata {
+        size: u64::try_from(source_bytes.len()).map_err(|e| anyhow::anyhow!(e))?,
+        mtime: 0,
+        mtime_nsec: 0,
+        mode: 0o644,
+        uid: 0,
+        gid: 0,
+    };
+    sender
+        .send(net::serialize_message(&Message::SyncFile {
+            path: String::from("checksum.bin"),
+            metadata,
+            threshold: 0.5,
+            checksum: true,
+        })?)
+        .await?;
+
+    let request = sender
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("missing full copy request"))??;
+    match net::deserialize_message(&request)? {
+        Message::RequestFullCopy { path } => assert_eq!(path, "checksum.bin"),
+        other => anyhow::bail!("expected RequestFullCopy, got {other:?}"),
+    }
+
+    sender
+        .send(net::serialize_message(&Message::ApplyBlocks {
+            path: String::from("checksum.bin"),
+            blocks: vec![Block {
+                offset: 0,
+                data: corrupt_bytes.to_vec(),
+            }],
+        })?)
+        .await?;
+    sender
+        .send(net::serialize_message(&Message::ApplyMetadata {
+            path: String::from("checksum.bin"),
+            metadata,
+        })?)
+        .await?;
+
+    let metadata_applied = sender
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("missing MetadataApplied"))??;
+    match net::deserialize_message(&metadata_applied)? {
+        Message::MetadataApplied { path } => assert_eq!(path, "checksum.bin"),
+        other => anyhow::bail!("expected MetadataApplied, got {other:?}"),
+    }
+
+    sender
+        .send(net::serialize_message(&Message::VerifyChecksum {
+            path: String::from("checksum.bin"),
+            hash: *blake3::hash(&source_bytes).as_bytes(),
+        })?)
+        .await?;
+
+    let verify_response = sender
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("missing checksum response"))??;
+    match net::deserialize_message(&verify_response)? {
+        Message::ChecksumMismatch { path } => assert_eq!(path, "checksum.bin"),
+        other => anyhow::bail!("expected ChecksumMismatch, got {other:?}"),
+    }
+
+    drop(sender);
+    let result = receiver_task.await?;
+    assert!(result.is_ok());
+    assert_eq!(std::fs::read(&dst_file)?, original);
     Ok(())
 }
