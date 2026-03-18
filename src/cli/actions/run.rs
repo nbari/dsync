@@ -1,4 +1,4 @@
-use crate::cli::actions::Action;
+use crate::cli::actions::{Action, RemoteEndpoint};
 use crate::pxs::{sync, tools};
 use anyhow::Result;
 use std::path::{Path, PathBuf};
@@ -38,52 +38,60 @@ fn resolve_local_file_destination(src: &Path, dst: &Path) -> Result<PathBuf> {
     Ok(dst.to_path_buf())
 }
 
-async fn handle_connect_action(
-    addr: &str,
+async fn handle_push_action(
+    endpoint: &RemoteEndpoint,
     src: &Path,
     threshold: f32,
     checksum: bool,
-    remote_path: Option<&str>,
     ignores: &[String],
 ) -> Result<()> {
-    if let Some(path) = remote_path {
-        eprintln!("Connecting via SSH to {addr} to sync to {path}");
-        crate::pxs::net::run_ssh_sender(addr, src, path, threshold, checksum, ignores).await?;
-    } else if addr == "-" {
-        crate::pxs::net::run_stdio_sender(src, threshold, checksum, ignores).await?;
-    } else {
-        eprintln!(
-            "Connecting to {addr} to sync from {} (checksum: {checksum})",
-            src.display()
-        );
-        crate::pxs::net::run_sender(addr, src, threshold, checksum, ignores).await?;
+    match endpoint {
+        RemoteEndpoint::Ssh { host, path } => {
+            eprintln!("Connecting via SSH to {host} to sync to {path}");
+            crate::pxs::net::run_ssh_sender(host, src, path, threshold, checksum, ignores).await?;
+        }
+        RemoteEndpoint::Stdio => {
+            crate::pxs::net::run_stdio_sender(src, threshold, checksum, ignores).await?;
+        }
+        RemoteEndpoint::Tcp(addr) => {
+            eprintln!(
+                "Connecting to {addr} to sync from {} (checksum: {checksum})",
+                src.display()
+            );
+            crate::pxs::net::run_sender(addr, src, threshold, checksum, ignores).await?;
+        }
     }
 
     Ok(())
 }
 
 async fn handle_pull_action(
-    addr: &str,
+    endpoint: &RemoteEndpoint,
     dst: &Path,
     threshold: f32,
     checksum: bool,
     fsync: bool,
-    remote_path: Option<&str>,
     ignores: &[String],
 ) -> Result<()> {
-    if let Some(path) = remote_path {
-        eprintln!("Pulling via SSH from {addr}:{path} to {}", dst.display());
-        crate::pxs::net::run_ssh_receiver(addr, dst, path, threshold, checksum, fsync, ignores)
-            .await?;
-    } else {
-        eprintln!("Connecting to {addr} to pull to {}", dst.display());
-        crate::pxs::net::run_pull_client(addr, dst, fsync).await?;
+    match endpoint {
+        RemoteEndpoint::Ssh { host, path } => {
+            eprintln!("Pulling via SSH from {host}:{path} to {}", dst.display());
+            crate::pxs::net::run_ssh_receiver(host, dst, path, threshold, checksum, fsync, ignores)
+                .await?;
+        }
+        RemoteEndpoint::Stdio => {
+            anyhow::bail!("stdio is not supported for pull mode");
+        }
+        RemoteEndpoint::Tcp(addr) => {
+            eprintln!("Connecting to {addr} to pull to {}", dst.display());
+            crate::pxs::net::run_pull_client(addr, dst, fsync).await?;
+        }
     }
 
     Ok(())
 }
 
-async fn handle_local_run(
+async fn handle_local_sync(
     src: &Path,
     dst: &Path,
     threshold: f32,
@@ -151,72 +159,58 @@ async fn handle_local_run(
 #[instrument(skip(action))]
 pub async fn handle(action: Action) -> Result<()> {
     let outcome = match action {
+        Action::Sync {
+            src,
+            dst,
+            threshold,
+            checksum,
+            dry_run,
+            fsync,
+            ignores,
+        } => handle_local_sync(&src, &dst, threshold, checksum, dry_run, fsync, &ignores).await?,
+        Action::Push {
+            endpoint,
+            src,
+            threshold,
+            checksum,
+            ignores,
+        } => {
+            handle_push_action(&endpoint, &src, threshold, checksum, &ignores).await?;
+            HandleOutcome::PrintCompletion
+        }
+        Action::Pull {
+            endpoint,
+            dst,
+            threshold,
+            checksum,
+            fsync,
+            ignores,
+        } => {
+            handle_pull_action(&endpoint, &dst, threshold, checksum, fsync, &ignores).await?;
+            HandleOutcome::PrintCompletion
+        }
         Action::Listen { addr, dst, fsync } => {
             eprintln!("Listening on {addr} for incoming sync to {}", dst.display());
             crate::pxs::net::run_receiver(&addr, &dst, fsync).await?;
             HandleOutcome::PrintCompletion
         }
-        Action::ListenSender {
+        Action::Serve {
             addr,
             src,
             threshold,
             checksum,
             ignores,
         } => {
-            eprintln!(
-                "Listening on {addr} to serve {} (checksum: {checksum})",
-                src.display()
-            );
+            eprintln!("Serving {} on {addr} (checksum: {checksum})", src.display());
             crate::pxs::net::run_sender_listener(&addr, &src, threshold, checksum, &ignores)
                 .await?;
             HandleOutcome::PrintCompletion
         }
-        Action::Connect {
-            addr,
-            src,
-            threshold,
-            checksum,
-            remote_path,
-            ignores,
-        } => {
-            handle_connect_action(
-                &addr,
-                &src,
-                threshold,
-                checksum,
-                remote_path.as_deref(),
-                &ignores,
-            )
-            .await?;
-            HandleOutcome::PrintCompletion
-        }
-        Action::Pull {
-            addr,
-            dst,
-            threshold,
-            checksum,
-            fsync,
-            remote_path,
-            ignores,
-        } => {
-            handle_pull_action(
-                &addr,
-                &dst,
-                threshold,
-                checksum,
-                fsync,
-                remote_path.as_deref(),
-                &ignores,
-            )
-            .await?;
-            HandleOutcome::PrintCompletion
-        }
-
-        Action::Stdio { dst, fsync } => {
+        Action::InternalStdioReceive { dst, fsync } => {
             crate::pxs::net::run_stdio_receiver(&dst, fsync).await?;
             HandleOutcome::PrintCompletion
         }
-        Action::StdioSender {
+        Action::InternalStdioSend {
             src,
             threshold,
             checksum,
@@ -225,15 +219,6 @@ pub async fn handle(action: Action) -> Result<()> {
             crate::pxs::net::run_stdio_sender(&src, threshold, checksum, &ignores).await?;
             HandleOutcome::PrintCompletion
         }
-        Action::Run {
-            src,
-            dst,
-            threshold,
-            checksum,
-            dry_run,
-            fsync,
-            ignores,
-        } => handle_local_run(&src, &dst, threshold, checksum, dry_run, fsync, &ignores).await?,
     };
 
     if matches!(outcome, HandleOutcome::PrintCompletion) {
@@ -265,7 +250,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_local_run_copies_file_into_existing_directory() -> anyhow::Result<()> {
+    async fn test_handle_local_sync_copies_file_into_existing_directory() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("source.txt");
         let dst_dir = dir.path().join("dest");
@@ -273,7 +258,7 @@ mod tests {
         fs::create_dir_all(&dst_dir)?;
         fs::write(dst_dir.join("stale.txt"), "stale")?;
 
-        handle(Action::Run {
+        handle(Action::Sync {
             src: src.clone(),
             dst: dst_dir.clone(),
             threshold: 0.5,
@@ -290,7 +275,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_local_run_rejects_directory_destination_file() -> anyhow::Result<()> {
+    async fn test_handle_local_sync_rejects_directory_destination_file() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let src_dir = dir.path().join("src");
         let dst_file = dir.path().join("dest.txt");
@@ -298,7 +283,7 @@ mod tests {
         fs::write(src_dir.join("nested/file.txt"), "payload")?;
         fs::write(&dst_file, "existing file")?;
 
-        let error = match handle(Action::Run {
+        let error = match handle(Action::Sync {
             src: src_dir,
             dst: dst_file,
             threshold: 0.5,

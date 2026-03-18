@@ -4,13 +4,10 @@ set -euo pipefail
 # Build pxs release
 cargo build --release
 
-# Use podman or docker
 DOCKER=${DOCKER:-podman}
-
-# Image and network
-IMAGE="pxs-tcp-test"
-NETWORK="pxs-tcp-net"
-PORT="7878"
+IMAGE="pxs-tcp-pull-test"
+NETWORK="pxs-tcp-pull-net"
+PORT="7877"
 
 WORK_DIR=$(mktemp -d)
 SRC_DIR="$WORK_DIR/src"
@@ -22,49 +19,42 @@ mkdir -p "$SRC_DIR" "$DST_DIR"
 
 cleanup() {
     echo "Cleaning up..."
-    $DOCKER rm -f pxs-tcp-receiver pxs-tcp-sender 2>/dev/null || true
+    $DOCKER rm -f pxs-tcp-source pxs-tcp-client 2>/dev/null || true
     $DOCKER network rm "$NETWORK" 2>/dev/null || true
     rm -rf "$WORK_DIR"
 }
 trap cleanup EXIT
 
-# Create a deterministic test payload on the host so we can verify it after transfer
-echo "Creating local test file..."
+echo "Creating source file to serve..."
 dd if=/dev/urandom of="$SOURCE_FILE" bs=1M count=64
 SOURCE_HASH=$(sha256sum "$SOURCE_FILE" | awk '{print $1}')
 
-# Create network
 $DOCKER network rm "$NETWORK" 2>/dev/null || true
 $DOCKER network create "$NETWORK"
 
-# Build image
 echo "Building test image..."
 $DOCKER build -t "$IMAGE" -f tests/podman/Containerfile tests/podman/
 
-# Start receiver
-echo "Starting TCP receiver..."
-$DOCKER run -d --name pxs-tcp-receiver \
+echo "Starting TCP serve endpoint..."
+$DOCKER run -d --name pxs-tcp-source \
+    --network "$NETWORK" \
+    -v "$(pwd)/target/release/pxs:/usr/local/bin/pxs:ro" \
+    -v "$SRC_DIR:/srv/export:ro" \
+    "$IMAGE" \
+    bash -lc "pxs serve 0.0.0.0:$PORT /srv/export/test.bin -vv"
+
+echo "Waiting for source server to be ready..."
+sleep 2
+
+echo "Starting client and pulling file..."
+$DOCKER run --name pxs-tcp-client \
+    -t \
     --network "$NETWORK" \
     -v "$(pwd)/target/release/pxs:/usr/local/bin/pxs:ro" \
     -v "$DST_DIR:/data" \
     "$IMAGE" \
-    bash -lc "pxs listen 0.0.0.0:$PORT /data -vv"
+    bash -lc "pxs pull pxs-tcp-source:$PORT /data -vv"
 
-# Wait for listener to be ready
-echo "Waiting for receiver to be ready..."
-sleep 2
-
-# Push file over raw TCP
-echo "Starting sender and pushing file..."
-$DOCKER run --name pxs-tcp-sender \
-    -t \
-    --network "$NETWORK" \
-    -v "$(pwd)/target/release/pxs:/usr/local/bin/pxs:ro" \
-    -v "$SRC_DIR:/src:ro" \
-    "$IMAGE" \
-    bash -lc "pxs push /src/test.bin pxs-tcp-receiver:$PORT -vv"
-
-# Verify copied bytes on the host bind mount
 if [ ! -f "$DEST_FILE" ]; then
     echo "Destination file was not created: $DEST_FILE"
     exit 1
@@ -72,10 +62,10 @@ fi
 
 DEST_HASH=$(sha256sum "$DEST_FILE" | awk '{print $1}')
 if [ "$SOURCE_HASH" != "$DEST_HASH" ]; then
-    echo "Hash mismatch after TCP push"
+    echo "Hash mismatch after TCP pull"
     echo "source: $SOURCE_HASH"
     echo "dest:   $DEST_HASH"
     exit 1
 fi
 
-echo "✅ Direct TCP push test passed!"
+echo "✅ Direct TCP pull test passed!"

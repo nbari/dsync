@@ -18,7 +18,7 @@ pub fn start() -> Result<Action> {
 
     telemetry::init(verbosity_level)?;
 
-    let action = handler(&matches);
+    let action = handler(&matches)?;
 
     Ok(action)
 }

@@ -2,9 +2,22 @@ pub mod run;
 
 use std::path::PathBuf;
 
+/// Remote endpoint selected by a public push or pull command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RemoteEndpoint {
+    /// Raw TCP endpoint such as `host:port`.
+    Tcp(String),
+    /// SSH endpoint such as `user@host:/path`.
+    Ssh { host: String, path: String },
+    /// Standard input/output transport for advanced piping.
+    Stdio,
+}
+
+/// Parsed high-level action selected by the CLI.
 #[derive(Debug)]
 pub enum Action {
-    Run {
+    /// Synchronize a local source path into a local destination path.
+    Sync {
         src: PathBuf,
         dst: PathBuf,
         threshold: f32,
@@ -13,40 +26,41 @@ pub enum Action {
         fsync: bool,
         ignores: Vec<String>,
     },
+    /// Push a local source path to a remote endpoint.
+    Push {
+        endpoint: RemoteEndpoint,
+        src: PathBuf,
+        threshold: f32,
+        checksum: bool,
+        ignores: Vec<String>,
+    },
+    /// Pull from a remote endpoint into a local destination path.
+    Pull {
+        endpoint: RemoteEndpoint,
+        dst: PathBuf,
+        threshold: f32,
+        checksum: bool,
+        fsync: bool,
+        ignores: Vec<String>,
+    },
+    /// Listen for incoming push operations and write them into `dst`.
     Listen {
         addr: String,
         dst: PathBuf,
         fsync: bool,
     },
-    ListenSender {
+    /// Serve `src` to remote pull clients.
+    Serve {
         addr: String,
         src: PathBuf,
         threshold: f32,
         checksum: bool,
         ignores: Vec<String>,
     },
-    Connect {
-        addr: String,
-        src: PathBuf,
-        threshold: f32,
-        checksum: bool,
-        remote_path: Option<String>,
-        ignores: Vec<String>,
-    },
-    Pull {
-        addr: String,
-        dst: PathBuf,
-        threshold: f32,
-        checksum: bool,
-        fsync: bool,
-        remote_path: Option<String>,
-        ignores: Vec<String>,
-    },
-    Stdio {
-        dst: PathBuf,
-        fsync: bool,
-    },
-    StdioSender {
+    /// Internal stdio receiver used by SSH tunneling.
+    InternalStdioReceive { dst: PathBuf, fsync: bool },
+    /// Internal stdio sender used by SSH tunneling.
+    InternalStdioSend {
         src: PathBuf,
         threshold: f32,
         checksum: bool,

@@ -65,9 +65,8 @@ $DOCKER run --name pxs-client \
              chmod 600 /home/devops/.ssh/id_ed25519 && \
              echo -e 'Host pxs-server\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  IdentityFile ~/.ssh/id_ed25519' > /home/devops/.ssh/config && \
              chown devops:devops /home/devops/.ssh/config && \
-             sudo -u devops pxs --remote devops@pxs-server:\"/home/devops/Movies/test.mkv\" \
-             --destination /home/devops/ \
-             --pull \
+             sudo -u devops pxs pull devops@pxs-server:\"/home/devops/Movies/test.mkv\" \
+             /home/devops/ \
              -vv"
 
 # Check exit code of previous command implicitly by 'set -e'

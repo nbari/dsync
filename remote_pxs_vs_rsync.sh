@@ -160,7 +160,7 @@ fi
 
 echo "== No-change Round (no checksum) =="
 run_timed "pxs_no_checksum" \
-    "$PXS_BIN" -s "$SOURCE" -r "$HOST:$PXS_DST"
+    "$PXS_BIN" push "$SOURCE" "$HOST:$PXS_DST"
 run_timed "rsync_no_checksum" \
     rsync -a --inplace --no-whole-file -e "$RSYNC_SSH_CMD" "$RSYNC_SOURCE" "$HOST:$RSYNC_DST/"
 echo "pxs: $(format_ms "${TIMES[pxs_no_checksum]}")"
@@ -170,7 +170,7 @@ echo
 if [[ "$RUN_CHECKSUM_ROUND" == "true" ]]; then
     echo "== No-change Round (checksum) =="
     run_timed "pxs_checksum" \
-        "$PXS_BIN" -c -s "$SOURCE" -r "$HOST:$PXS_DST"
+        "$PXS_BIN" push "$SOURCE" "$HOST:$PXS_DST" -c
     run_timed "rsync_checksum" \
         rsync -a --checksum --inplace --no-whole-file -e "$RSYNC_SSH_CMD" "$RSYNC_SOURCE" "$HOST:$RSYNC_DST/"
     echo "pxs -c: $(format_ms "${TIMES[pxs_checksum]}")"

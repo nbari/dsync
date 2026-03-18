@@ -78,7 +78,7 @@ main() {
     
     setup_baseline
     overwrite_middle
-    run_bench "Aligned-Overwrite" "pxs" "$PXS_CMD --source $SRC --destination $DST ${PXS_FLAGS[*]}"
+    run_bench "Aligned-Overwrite" "pxs" "$PXS_CMD sync $SRC $DST ${PXS_FLAGS[*]}"
 
     # Scenario B: Data Shift
     setup_baseline
@@ -87,7 +87,7 @@ main() {
     
     setup_baseline
     prepend_byte
-    run_bench "Data-Shift" "pxs" "$PXS_CMD --source $SRC --destination $DST ${PXS_FLAGS[*]}"
+    run_bench "Data-Shift" "pxs" "$PXS_CMD sync $SRC $DST ${PXS_FLAGS[*]}"
 
     echo -e "\nBenchmark complete."
 }

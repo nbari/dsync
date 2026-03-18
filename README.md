@@ -4,20 +4,20 @@
 [![Build](https://github.com/nbari/pxs/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/nbari/pxs/actions/workflows/build.yml)
 [![codecov](https://codecov.io/gh/nbari/pxs/branch/main/graph/badge.svg)](https://codecov.io/gh/nbari/pxs)
 
-**pxs** (Parallel X-Sync) is a high-performance, concurrent file
-synchronization tool written in Rust. Designed to saturate high-speed networks
-(10GbE+) and utilize multi-core CPUs for extremely fast data transfers and
-incremental updates.
+**pxs** (Parallel X-Sync) is a file synchronization tool written in Rust for
+the same broad job as `rsync`: move data trees efficiently and refresh existing
+copies with as little work as possible.
 
 The name is intentionally short for CLI use: `pxs` stands for **Parallel X-Sync**.
 
-`pxs` is specifically optimized for massive data moves (e.g., 4TB+ Postgres
-`PG_DATA`) where standard tools like `rsync` often bottleneck on
-single-threaded hashing or SSH encryption overhead.
+`pxs` focuses on modern large-data sync workloads, such as repeated refreshes
+of large PostgreSQL `PGDATA` directories, VM images, and other datasets with
+many unchanged files or large files that are updated in place.
 
-`pxs` is not a drop-in replacement for `rsync`. The goal is narrower: transfer
-large files and datasets faster by focusing on parallelism, fixed-block delta
-sync, and high-throughput transport.
+`rsync` remains the reference point in this space. `pxs` is not a drop-in
+replacement for it. The goal is narrower: use Rust performance, parallelism,
+concurrency, fixed-block delta sync, and high-throughput transport to speed up
+data synchronization for workloads where those choices help.
 
 ## Key Features
 
@@ -147,115 +147,152 @@ Fallback image: [`docs/diagrams/delta-sync.svg`](docs/diagrams/delta-sync.svg)
 
 ## Usage
 
-### 1. Local Synchronization
-Synchronize a single file:
-```bash
-pxs --source file.bin --destination backup.bin
-```
+### `sync`
+Use this when both source and destination are local paths on the same machine.
+`sync` is the default local data-mover: it compares an existing destination and only rewrites changed blocks when delta sync is worthwhile.
 
-Synchronize a directory:
-```bash
-pxs --source /path/to/source_dir --destination /path/to/dest_dir
-```
+Typical use:
+- local file or directory refresh
+- repeated sync of a local `PGDATA` copy
+- local copy where you still want `pxs` block-level behavior instead of `cp`
 
-More local examples:
+Examples:
 
 ```bash
-# Copy one local file
-pxs --source ./pg_wal/000000010000000000000001 --destination /backup/000000010000000000000001
+# Synchronize a single file
+pxs sync file.bin backup.bin
 
-# Copy one local directory tree
-pxs --source /var/lib/postgresql/data --destination /srv/replica/base-backup
+# Synchronize a directory
+pxs sync /path/to/source_dir /path/to/dest_dir
 
 # Force checksum-based verification
-pxs --source ./dataset.bin --destination /mnt/backup/dataset.bin --checksum
+pxs sync ./dataset.bin /mnt/backup/dataset.bin --checksum
 
 # Flush file data to disk before completion
-pxs --source ./dataset.bin --destination /mnt/backup/dataset.bin --fsync
+pxs sync ./dataset.bin /mnt/backup/dataset.bin --fsync
 ```
 
-### 2. Network Synchronization (Direct TCP)
-Best for high-speed local networks where maximum performance is needed (no encryption overhead).
+### `push`
+Use this when the data starts on the local machine and you want to send it somewhere else.
+`push` pairs with `listen` for raw TCP transfers, or it can target an SSH endpoint directly.
 
-**A. Pushing to a Receiver (Remote is getting the file)**
-*   **Receiver (Server 2):**
-    ```bash
-    pxs --listen 0.0.0.0:8080 --destination /new/data
-    ```
-*   **Sender (Server 1):**
-    ```bash
-    pxs --remote 192.168.1.10:8080 --source /old/data/file.bin
-    ```
+Typical use:
+- send local data to a remote receiver over raw TCP
+- push directly to a remote path over SSH
+- benchmark sender-side transfer performance
 
-Concrete examples without SSH:
+Examples:
 
 ```bash
-# Receiver on host B
-pxs --listen 0.0.0.0:8080 --destination /srv/incoming
+# Push one file to a raw TCP receiver
+pxs push ./archive.tar 192.168.1.10:8080
 
-# Sender on host A: copy one file to host B
-pxs --remote 192.168.1.10:8080 --source ./archive.tar
+# Push a directory tree to a raw TCP receiver
+pxs push /var/lib/postgresql/data 192.168.1.10:8080
 
-# Sender on host A: copy a directory tree to host B
-pxs --remote 192.168.1.10:8080 --source /var/lib/postgresql/data
-```
-
-**B. Pulling from a Sender (You are getting the file)**
-*   **Sender (Server 2):**
-    ```bash
-    pxs --listen 0.0.0.0:8080 --source /old/data/file.bin --sender
-    ```
-*   **Receiver (Server 1):**
-    ```bash
-    pxs --remote 192.168.1.10:8080 --destination ./local_copy.bin --pull
-    ```
-
-Concrete pull examples without SSH:
-
-```bash
-# Source host serves a file
-pxs --listen 0.0.0.0:8080 --source /srv/export/snapshot.bin --sender
-
-# Destination host pulls it over raw TCP
-pxs --remote 192.168.1.10:8080 --destination ./snapshot.bin --pull
-```
-
-### 3. Secure Network Synchronization (SSH)
-Easiest way to sync securely between servers. `pxs` automatically spawns an SSH tunnel.
-
-**Push (Local -> Remote):**
-```bash
-pxs --source my_file.bin --remote user@remote-server:/path/to/dest/my_file.bin
-```
-
-```bash
 # Push one file over SSH
-pxs --source ./backup.tar.zst --remote db2@example.net:/srv/backups/backup.tar.zst
+pxs push ./backup.tar.zst db2@example.net:/srv/backups/backup.tar.zst
 
 # Push a directory tree over SSH
-pxs --source /var/lib/postgresql/data --remote db2@example.net:/srv/replica/data
+pxs push /var/lib/postgresql/data db2@example.net:/srv/replica/data
 ```
 
-**Pull (Remote -> Local):**
-```bash
-pxs --remote user@remote-server:/path/to/remote/file.bin --destination ./local_file.bin --pull
-```
+### `pull`
+Use this when the data should end up on the local machine.
+`pull` pairs with `serve` for raw TCP transfers, or it can fetch directly from an SSH endpoint.
+
+Typical use:
+- fetch data from a remote source into a local directory
+- pull a remote snapshot or `PGDATA` tree over SSH
+- run the receiving side locally while the remote side exposes data
+
+Examples:
 
 ```bash
+# Pull from a raw TCP serve endpoint
+pxs pull 192.168.1.10:8080 ./snapshot.bin
+
 # Pull one file over SSH
-pxs --remote db1@example.net:/srv/export/base.tar.zst --destination ./base.tar.zst --pull
+pxs pull db1@example.net:/srv/export/base.tar.zst ./base.tar.zst
 
 # Pull a directory tree over SSH
-pxs --remote db1@example.net:/var/lib/postgresql/data --destination /srv/restore/data --pull
+pxs pull db1@example.net:/var/lib/postgresql/data /srv/restore/data
 ```
 
-**Manual SSH (using stdio pipe):**
-If you need custom SSH flags, you can use the `--stdio` mode manually:
+For raw TCP endpoints, source-side options such as `--checksum`, `--threshold`, and `--ignore` belong on `serve`. For SSH endpoints, `pull` can pass those options through to the remote helper.
+
+### `listen`
+Use this when this machine should receive incoming `push` operations.
+`listen` owns the destination path and waits for another host to push data into it.
+
+Typical use:
+- prepare a destination host for an incoming raw TCP push
+- expose a durable receiving endpoint with `--fsync`
+
+Examples:
+
 ```bash
-ssh user@remote-server "pxs --stdio --destination /path/to/new/data" < <(pxs --remote - --source /path/to/old/data)
+# Receive files into /srv/incoming
+pxs listen 0.0.0.0:8080 /srv/incoming
+
+# Receive into /new/data and fsync committed files
+pxs listen 0.0.0.0:8080 /new/data --fsync
 ```
 
-### 4. Advanced Options
+### `serve`
+Use this when this machine should expose a source tree for remote `pull` clients.
+`serve` is the mirror image of `listen`: it owns the source path and waits for another host to pull from it.
+
+Typical use:
+- serve a local snapshot over raw TCP
+- keep source-side filtering or checksum policy on the source host
+
+Examples:
+
+```bash
+# Serve one file for remote pull clients
+pxs serve 0.0.0.0:8080 /srv/export/snapshot.bin
+
+# Serve a directory tree with checksum verification enabled
+pxs serve 0.0.0.0:8080 /srv/export/pgdata --checksum
+```
+
+### Raw TCP Command Pairs
+Use these pairings for direct TCP flows on trusted networks:
+
+```bash
+# Remote host receives an incoming push
+pxs listen 0.0.0.0:8080 /srv/incoming
+# Local host sends data to it
+pxs push /var/lib/postgresql/data 192.168.1.10:8080
+```
+
+```bash
+# Remote host exposes data for pull clients
+pxs serve 0.0.0.0:8080 /srv/export/snapshot.bin
+# Local host pulls it down
+pxs pull 192.168.1.10:8080 ./snapshot.bin
+```
+
+### SSH Command Pairs
+Use these when you want `pxs` to manage the SSH tunnel automatically:
+
+```bash
+# Push local data to a remote path over SSH
+pxs push my_file.bin user@remote-server:/path/to/dest/my_file.bin
+
+# Pull remote data into a local path over SSH
+pxs pull user@remote-server:/path/to/remote/file.bin ./local_file.bin
+```
+
+### Manual SSH (using stdio pipe)
+If you need custom SSH flags, you can still use the internal `--stdio` transport manually:
+
+```bash
+ssh user@remote-server "pxs --stdio --destination /path/to/new/data" < <(pxs push /path/to/old/data -)
+```
+
+### Advanced Options
 
 *   **`--checksum` (-c)**: Force a block-by-block hash comparison even if size/mtime match.
 *   **`--fsync` (-f)**: Force `fsync(2)` after file writes. Slower, but safer for durability-sensitive copies.
@@ -278,7 +315,7 @@ Currently, a single local file sync does **not** show a visible progress bar; it
 ### Exclude Example
 If you want to skip Postgres configuration files during a sync:
 ```bash
-pxs --source /var/lib/postgresql/data --destination /backup/data \
+pxs sync /var/lib/postgresql/data /backup/data \
   --ignore "postmaster.opts" \
   --ignore "pg_hba.conf" \
   --ignore "postgresql.conf"
@@ -288,7 +325,7 @@ Or using a file:
 ```bash
 echo "postmaster.pid" > excludes.txt
 echo "*.log" >> excludes.txt
-pxs -s /src -d /dst -E excludes.txt
+pxs sync /src /dst -E excludes.txt
 ```
 
 ## How the Ignore Mechanism Works
@@ -314,7 +351,7 @@ When you provide patterns via `--ignore` or `--exclude-from`, they are applied a
 ### Exclusion Pass-through (SSH)
 When using **Auto-SSH mode**, your local ignore patterns are automatically sent to the remote server. This ensures that the receiver doesn't waste time looking at files you've already decided to skip.
 
-## Why pxs can be faster than rsync for this workload
+## Why pxs can be faster than rsync for some workloads
 
 | Feature | rsync | pxs |
 |---------|-------|-----|
@@ -324,11 +361,14 @@ When using **Auto-SSH mode**, your local ignore patterns are automatically sent 
 | Directory walking | Sequential | **Parallel** |
 | Algorithm | Rolling hash | Fixed 128KB blocks |
 
-1.  **Parallelism**: `pxs` uses multiple CPU cores for hashing, comparison, and other hot-path work.
-2.  **Algorithm Efficiency**: For workloads like database files, where data is usually modified in place rather than shifted, fixed-block delta sync can be cheaper than a rolling-hash approach.
-3.  **Transport Choice**: On trusted high-speed networks, raw TCP avoids SSH overhead. When SSH is required, `pxs` still keeps its own transfer protocol and delta logic.
+1.  **Parallelism and concurrency**: `pxs` uses multiple CPU cores for hashing, comparison, file walking, and other hot-path work.
+2.  **Algorithm choice**: For workloads like database files, where data is usually modified in place rather than shifted, fixed-block delta sync can be cheaper than a rolling-hash approach.
+3.  **Transport choice**: On trusted high-speed networks, raw TCP avoids SSH overhead. When SSH is required, `pxs` still keeps its own transfer protocol and delta logic.
 
-These advantages are workload-dependent. `pxs` is aimed at very large files and large datasets on fast links, not at replacing `rsync` for every synchronization scenario.
+These advantages are workload-dependent. `pxs` shares `rsync`'s goal of keeping
+data in sync, but it is aimed at repeated large-file and large-dataset refreshes
+on modern hardware rather than replacing `rsync` for every synchronization
+scenario.
 
 ## Tests
 
@@ -341,6 +381,9 @@ cargo test
 Podman end-to-end tests are also available:
 
 ```bash
+# Direct TCP pull using serve/pull
+./tests/podman/test_tcp_pull.sh
+
 # SSH pull end-to-end
 ./tests/podman/test_ssh_pull.sh
 

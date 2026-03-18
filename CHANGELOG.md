@@ -2,6 +2,39 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.0] - 2026-03-18
+
+### Added
+
+- Added direct TCP `serve` to `pull` Podman end-to-end coverage in `tests/podman/test_tcp_pull.sh`.
+
+### Changed
+
+- Reworked the public CLI around explicit subcommands: `sync`, `push`, `pull`, `listen`, and `serve`.
+- Replaced the previous flat public mode flags such as `--source`, `--destination`, `--remote`, `--listen`, `--pull`, and `--sender` with subcommand-specific positional arguments and options.
+- Reorganized the README usage guide around subcommand intent, including “use this when…” guidance and explicit raw TCP and SSH command pairings.
+- Updated benchmark and Podman helper scripts to use the public subcommand syntax.
+
+### Fixed
+
+- Fixed raw TCP `pull` UX so source-side flags are rejected with a clear error that points users to configure `serve` instead.
+
+### Verification
+
+- `cargo test`
+- `cargo clippy --all-targets --all-features`
+- `./tests/podman/test_tcp_pull.sh`
+- `./tests/podman/test_tcp_push.sh`
+- `./tests/podman/test_tcp_directory_resume.sh`
+- `./tests/podman/test_ssh_pull.sh`
+- `./tests/podman/test_ssh_pull_resume.sh`
+
+### Benchmarks
+
+- Local checksum benchmark (`env PXS=./target/release/pxs ./local_pxs_vs_rsync.sh`):
+  - 100 MiB aligned overwrite: `pxs` about `0.043s`, `rsync` about `0.136s`
+  - 100 MiB prepend-byte shift: `pxs` about `0.051s`, `rsync` about `0.985s`
+
 ## [0.3.2] - 2026-03-18
 
 ### Changed

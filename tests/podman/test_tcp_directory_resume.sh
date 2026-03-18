@@ -66,7 +66,7 @@ $DOCKER run -d --name pxs-tree-receiver \
     -v "$(pwd)/target/release/pxs:/usr/local/bin/pxs:ro" \
     -v "$DST_DIR:/data" \
     "$IMAGE" \
-    bash -lc "pxs --listen 0.0.0.0:$PORT --destination /data -vv"
+    bash -lc "pxs listen 0.0.0.0:$PORT /data -vv"
 
 echo "Waiting for receiver to be ready..."
 sleep 2
@@ -78,7 +78,7 @@ $DOCKER run --name pxs-tree-sender \
     -v "$(pwd)/target/release/pxs:/usr/local/bin/pxs:ro" \
     -v "$SRC_DIR:/src:ro" \
     "$IMAGE" \
-    bash -lc "pxs --remote pxs-tree-receiver:$PORT --source /src -vv"
+    bash -lc "pxs push /src pxs-tree-receiver:$PORT -vv"
 
 if [ "$(sha256sum "$DST_DIR/resume.bin" | awk '{print $1}')" != "$RESUME_HASH" ]; then
     echo "resume.bin hash mismatch after resume sync"
