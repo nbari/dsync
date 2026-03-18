@@ -1,7 +1,7 @@
 use crate::cli::actions::Action;
 use crate::pxs::{sync, tools};
 use anyhow::Result;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use tracing::{info, instrument};
 
 enum HandleOutcome {
@@ -20,6 +20,22 @@ fn format_updated_block_percentage(stats: sync::SyncStats) -> String {
     let whole = basis_points / 100;
     let fractional = basis_points % 100;
     format!("{whole}.{fractional:02}")
+}
+
+/// Resolve the effective local destination path for a single-file sync.
+///
+/// When the requested destination already exists as a directory, local sync
+/// should mirror standard copy semantics and place the source file inside that
+/// directory instead of replacing it.
+fn resolve_local_file_destination(src: &Path, dst: &Path) -> Result<PathBuf> {
+    if dst.is_dir() {
+        let file_name = src
+            .file_name()
+            .ok_or_else(|| anyhow::anyhow!("source file has no name: {}", src.display()))?;
+        return Ok(dst.join(file_name));
+    }
+
+    Ok(dst.to_path_buf())
 }
 
 async fn handle_connect_action(
@@ -84,6 +100,11 @@ async fn handle_local_run(
     let src_meta = tokio::fs::metadata(src).await?;
 
     if src_meta.is_dir() {
+        anyhow::ensure!(
+            !dst.exists() || dst.is_dir(),
+            "destination must be a directory when source is a directory: {}",
+            dst.display()
+        );
         eprintln!(
             "Syncing directory from {} to {}",
             src.display(),
@@ -93,7 +114,9 @@ async fn handle_local_run(
         return Ok(HandleOutcome::PrintCompletion);
     }
 
-    if tools::should_skip_file(src, dst, checksum).await? {
+    let dst = resolve_local_file_destination(src, dst)?;
+
+    if tools::should_skip_file(src, &dst, checksum).await? {
         eprintln!("File {} is already up to date.", src.display());
         return Ok(HandleOutcome::SkipCompletionMessage);
     }
@@ -109,8 +132,8 @@ async fn handle_local_run(
         src.display(),
         dst.display()
     );
-    let full_copy = tools::should_use_full_copy(src, dst, threshold).await?;
-    let stats = sync::sync_changed_blocks(src, dst, full_copy, fsync).await?;
+    let full_copy = tools::should_use_full_copy(src, &dst, threshold).await?;
+    let stats = sync::sync_changed_blocks(src, &dst, full_copy, fsync).await?;
     let percentage = format_updated_block_percentage(stats);
     eprintln!(
         "Summary: {}/{} blocks updated ({percentage}%)",
@@ -218,4 +241,83 @@ pub async fn handle(action: Action) -> Result<()> {
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{handle, resolve_local_file_destination};
+    use crate::cli::actions::Action;
+    use std::fs;
+    use tempfile::tempdir;
+
+    #[test]
+    fn test_resolve_local_file_destination_into_existing_directory() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("source.bin");
+        let dst_dir = dir.path().join("dest");
+        fs::write(&src, "content")?;
+        fs::create_dir_all(&dst_dir)?;
+
+        let resolved = resolve_local_file_destination(&src, &dst_dir)?;
+
+        assert_eq!(resolved, dst_dir.join("source.bin"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_local_run_copies_file_into_existing_directory() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("source.txt");
+        let dst_dir = dir.path().join("dest");
+        fs::write(&src, "payload")?;
+        fs::create_dir_all(&dst_dir)?;
+        fs::write(dst_dir.join("stale.txt"), "stale")?;
+
+        handle(Action::Run {
+            src: src.clone(),
+            dst: dst_dir.clone(),
+            threshold: 0.5,
+            checksum: false,
+            dry_run: false,
+            fsync: false,
+            ignores: Vec::new(),
+        })
+        .await?;
+
+        assert!(dst_dir.is_dir());
+        assert_eq!(fs::read_to_string(dst_dir.join("source.txt"))?, "payload");
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_local_run_rejects_directory_destination_file() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src_dir = dir.path().join("src");
+        let dst_file = dir.path().join("dest.txt");
+        fs::create_dir_all(src_dir.join("nested"))?;
+        fs::write(src_dir.join("nested/file.txt"), "payload")?;
+        fs::write(&dst_file, "existing file")?;
+
+        let error = match handle(Action::Run {
+            src: src_dir,
+            dst: dst_file,
+            threshold: 0.5,
+            checksum: false,
+            dry_run: false,
+            fsync: false,
+            ignores: Vec::new(),
+        })
+        .await
+        {
+            Ok(()) => anyhow::bail!("directory sync should reject file destination"),
+            Err(error) => error,
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("destination must be a directory when source is a directory")
+        );
+        Ok(())
+    }
 }

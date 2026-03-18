@@ -1,5 +1,9 @@
 # pxs
 
+[![Test](https://github.com/nbari/pxs/actions/workflows/test.yml/badge.svg?branch=main)](https://github.com/nbari/pxs/actions/workflows/test.yml)
+[![Build](https://github.com/nbari/pxs/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/nbari/pxs/actions/workflows/build.yml)
+[![codecov](https://codecov.io/gh/nbari/pxs/branch/main/graph/badge.svg)](https://codecov.io/gh/nbari/pxs)
+
 **pxs** (Parallel X-Sync) is a high-performance, concurrent file
 synchronization tool written in Rust. Designed to saturate high-speed networks
 (10GbE+) and utilize multi-core CPUs for extremely fast data transfers and

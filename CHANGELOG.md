@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.3.2] - 2026-03-18
+
+### Changed
+
+- Clarified local directory sync progress reporting to use a single aggregate progress bar across concurrently processed files instead of a separate per-file bar.
+
+### Fixed
+
+- Fixed local single-file sync so an existing destination directory keeps its directory type and receives the source file at `DEST/<filename>` instead of being replaced.
+
 ## [0.3.1] - 2026-03-18
 
 ### Changed
