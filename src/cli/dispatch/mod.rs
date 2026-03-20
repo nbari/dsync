@@ -12,16 +12,18 @@ const PUBLIC_USAGE_HINT: &str = "public CLI now uses subcommands. Examples: \
 ///
 /// Returns an error if the parsed CLI arguments do not form a valid action.
 pub fn handler(matches: &ArgMatches) -> anyhow::Result<Action> {
+    let quiet = matches.get_flag("quiet");
+
     if matches.get_flag("stdio") {
-        return handle_internal_stdio(matches);
+        return handle_internal_stdio(matches, quiet);
     }
 
     match matches.subcommand() {
-        Some(("sync", submatches)) => handle_sync(submatches),
-        Some(("push", submatches)) => handle_push(submatches),
-        Some(("pull", submatches)) => handle_pull(submatches),
-        Some(("listen", submatches)) => handle_listen(submatches),
-        Some(("serve", submatches)) => handle_serve(submatches),
+        Some(("sync", submatches)) => handle_sync(submatches, quiet),
+        Some(("push", submatches)) => handle_push(submatches, quiet),
+        Some(("pull", submatches)) => handle_pull(submatches, quiet),
+        Some(("listen", submatches)) => handle_listen(submatches, quiet),
+        Some(("serve", submatches)) => handle_serve(submatches, quiet),
         Some((other, _)) => anyhow::bail!("unsupported subcommand: {other}"),
         None => anyhow::bail!("{PUBLIC_USAGE_HINT}"),
     }
@@ -66,46 +68,53 @@ fn threshold(matches: &ArgMatches) -> f32 {
     *matches.get_one::<f32>("threshold").unwrap_or(&0.5)
 }
 
-fn parse_remote_endpoint(endpoint: &str) -> RemoteEndpoint {
+fn parse_remote_endpoint(endpoint: &str) -> anyhow::Result<RemoteEndpoint> {
     if endpoint == "-" {
-        return RemoteEndpoint::Stdio;
+        return Ok(RemoteEndpoint::Stdio);
     }
 
-    if let Some(ssh) = parse_ssh_endpoint(endpoint) {
-        return RemoteEndpoint::Ssh {
+    if endpoint.parse::<std::net::SocketAddr>().is_ok() {
+        return Ok(RemoteEndpoint::Tcp(endpoint.to_string()));
+    }
+
+    if let Some(ssh) = parse_ssh_endpoint(endpoint)? {
+        return Ok(RemoteEndpoint::Ssh {
             host: ssh.host,
             path: ssh.path,
-        };
+        });
     }
 
-    RemoteEndpoint::Tcp(endpoint.to_string())
+    Ok(RemoteEndpoint::Tcp(endpoint.to_string()))
 }
 
-fn handle_sync(matches: &ArgMatches) -> anyhow::Result<Action> {
+fn handle_sync(matches: &ArgMatches, quiet: bool) -> anyhow::Result<Action> {
     Ok(Action::Sync {
         src: required_path(matches, "src")?,
         dst: required_path(matches, "dst")?,
         threshold: threshold(matches),
         checksum: matches.get_flag("checksum"),
         dry_run: matches.get_flag("dry_run"),
+        delete: matches.get_flag("delete"),
         fsync: matches.get_flag("fsync"),
         ignores: parse_ignores(matches),
+        quiet,
     })
 }
 
-fn handle_push(matches: &ArgMatches) -> anyhow::Result<Action> {
+fn handle_push(matches: &ArgMatches, quiet: bool) -> anyhow::Result<Action> {
     Ok(Action::Push {
-        endpoint: parse_remote_endpoint(&required_string(matches, "endpoint")?),
+        endpoint: parse_remote_endpoint(&required_string(matches, "endpoint")?)?,
         src: required_path(matches, "src")?,
         threshold: threshold(matches),
         checksum: matches.get_flag("checksum"),
         ignores: parse_ignores(matches),
+        quiet,
     })
 }
 
-fn handle_pull(matches: &ArgMatches) -> anyhow::Result<Action> {
+fn handle_pull(matches: &ArgMatches, quiet: bool) -> anyhow::Result<Action> {
     let endpoint_text = required_string(matches, "endpoint")?;
-    let endpoint = parse_remote_endpoint(&endpoint_text);
+    let endpoint = parse_remote_endpoint(&endpoint_text)?;
     let threshold = threshold(matches);
     let checksum = matches.get_flag("checksum");
     let ignores = parse_ignores(matches);
@@ -125,30 +134,34 @@ fn handle_pull(matches: &ArgMatches) -> anyhow::Result<Action> {
         checksum,
         fsync: matches.get_flag("fsync"),
         ignores,
+        quiet,
     })
 }
 
-fn handle_listen(matches: &ArgMatches) -> anyhow::Result<Action> {
+fn handle_listen(matches: &ArgMatches, quiet: bool) -> anyhow::Result<Action> {
     Ok(Action::Listen {
         addr: required_string(matches, "addr")?,
         dst: required_path(matches, "dst")?,
         fsync: matches.get_flag("fsync"),
+        quiet,
     })
 }
 
-fn handle_serve(matches: &ArgMatches) -> anyhow::Result<Action> {
+fn handle_serve(matches: &ArgMatches, quiet: bool) -> anyhow::Result<Action> {
     Ok(Action::Serve {
         addr: required_string(matches, "addr")?,
         src: required_path(matches, "src")?,
         threshold: threshold(matches),
         checksum: matches.get_flag("checksum"),
         ignores: parse_ignores(matches),
+        quiet,
     })
 }
 
-fn handle_internal_stdio(matches: &ArgMatches) -> anyhow::Result<Action> {
+fn handle_internal_stdio(matches: &ArgMatches, quiet: bool) -> anyhow::Result<Action> {
     let threshold = threshold(matches);
     let checksum = matches.get_flag("checksum");
+    let quiet = quiet || matches.get_flag("quiet");
 
     if matches.get_flag("sender") {
         return Ok(Action::InternalStdioSend {
@@ -156,12 +169,14 @@ fn handle_internal_stdio(matches: &ArgMatches) -> anyhow::Result<Action> {
             threshold,
             checksum,
             ignores: parse_ignores(matches),
+            quiet,
         });
     }
 
     Ok(Action::InternalStdioReceive {
         dst: required_path(matches, "destination")?,
         fsync: matches.get_flag("fsync"),
+        quiet,
     })
 }
 
@@ -183,33 +198,102 @@ struct SshInfo {
     path: String,
 }
 
-fn parse_ssh_endpoint(endpoint: &str) -> Option<SshInfo> {
-    let is_ssh = if endpoint.contains('@') {
-        true
-    } else if let Some((_prefix, suffix)) = endpoint.rsplit_once(':') {
-        if endpoint.parse::<std::net::SocketAddr>().is_ok() {
-            false
-        } else {
-            let is_numeric_port = !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
-            !is_numeric_port
-        }
-    } else {
-        false
-    };
+fn split_endpoint_host_suffix(endpoint: &str) -> anyhow::Result<Option<(&str, &str)>> {
+    let mut bracket_depth = 0_u8;
+    let mut first_colon = None;
 
-    if is_ssh && let Some((prefix, suffix)) = endpoint.split_once(':') {
+    for (index, ch) in endpoint.char_indices() {
+        match ch {
+            '[' => {
+                anyhow::ensure!(
+                    bracket_depth == 0,
+                    "malformed endpoint `{endpoint}`: nested `[` is not allowed"
+                );
+                bracket_depth = 1;
+            }
+            ']' => {
+                anyhow::ensure!(
+                    bracket_depth == 1,
+                    "malformed endpoint `{endpoint}`: unexpected `]`"
+                );
+                bracket_depth = 0;
+            }
+            ':' if bracket_depth == 0 => {
+                if first_colon.is_none() {
+                    first_colon = Some(index);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    anyhow::ensure!(
+        bracket_depth == 0,
+        "malformed endpoint `{endpoint}`: missing closing `]`"
+    );
+
+    if let Some(index) = first_colon {
+        let (host, suffix_with_colon) = endpoint.split_at(index);
+        let suffix = suffix_with_colon
+            .strip_prefix(':')
+            .ok_or_else(|| anyhow::anyhow!("missing endpoint separator after host"))?;
+        anyhow::ensure!(
+            !host.is_empty(),
+            "malformed endpoint `{endpoint}`: missing host before `:`"
+        );
+        return Ok(Some((host, suffix)));
+    }
+
+    if endpoint.starts_with('[') || endpoint.contains("@[") || endpoint.contains(']') {
+        anyhow::bail!(
+            "malformed bracketed endpoint `{endpoint}`: expected `[host]:PORT` or `[host]:PATH`"
+        );
+    }
+
+    Ok(None)
+}
+
+fn parse_ssh_endpoint(endpoint: &str) -> anyhow::Result<Option<SshInfo>> {
+    let host_suffix = split_endpoint_host_suffix(endpoint)?;
+
+    if endpoint.contains('@') {
+        let (host, suffix) = host_suffix.ok_or_else(|| {
+            anyhow::anyhow!("SSH endpoint must use `HOST:PATH` syntax: {endpoint}")
+        })?;
         let path = if suffix.is_empty() {
             ".".to_string()
         } else {
             suffix.to_string()
         };
-        return Some(SshInfo {
-            host: prefix.to_string(),
+        return Ok(Some(SshInfo {
+            host: host.to_string(),
             path,
-        });
+        }));
     }
 
-    None
+    let Some((host, suffix)) = host_suffix else {
+        return Ok(None);
+    };
+
+    let is_numeric_port = !suffix.is_empty() && suffix.chars().all(|c| c.is_ascii_digit());
+    if is_numeric_port {
+        if host.starts_with('[') {
+            anyhow::bail!(
+                "invalid bracketed TCP endpoint `{endpoint}`: expected a valid `[host]:PORT` socket address"
+            );
+        }
+        return Ok(None);
+    }
+
+    let path = if suffix.is_empty() {
+        ".".to_string()
+    } else {
+        suffix.to_string()
+    };
+    Ok(Some(SshInfo {
+        host: host.to_string(),
+        path,
+    }))
 }
 
 #[cfg(test)]
@@ -247,6 +331,7 @@ mod tests {
             "0.25",
             "--checksum",
             "--dry-run",
+            "--delete",
             "--fsync",
         ])?;
 
@@ -255,12 +340,14 @@ mod tests {
                 threshold,
                 checksum,
                 dry_run,
+                delete,
                 fsync,
                 ..
             } => {
                 assert_threshold(threshold, 0.25);
                 assert!(checksum);
                 assert!(dry_run);
+                assert!(delete);
                 assert!(fsync);
             }
             other => anyhow::bail!("expected Action::Sync, got {other:?}"),
@@ -304,6 +391,26 @@ mod tests {
                 assert!(checksum);
             }
             other => anyhow::bail!("expected Action::Push, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_push_tcp_endpoint_preserves_bracketed_ipv6_socket() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, "content")?;
+        let src_arg = src.to_string_lossy().to_string();
+
+        let action = parse_action(&["pxs", "push", &src_arg, "[::1]:7878"])?;
+
+        match action {
+            Action::Push {
+                endpoint: RemoteEndpoint::Tcp(addr),
+                ..
+            } => assert_eq!(addr, "[::1]:7878"),
+            other => anyhow::bail!("expected TCP push endpoint, got {other:?}"),
         }
 
         Ok(())
@@ -375,6 +482,82 @@ mod tests {
     }
 
     #[test]
+    fn test_pull_ssh_endpoint_parses_bracketed_ipv6_host() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let dst = dir.path().join("dst");
+        std::fs::create_dir_all(&dst)?;
+        let dst_arg = dst.to_string_lossy().to_string();
+
+        let action = parse_action(&["pxs", "pull", "[2001:db8::1]:/srv/data", &dst_arg])?;
+
+        match action {
+            Action::Pull { endpoint, .. } => {
+                assert_eq!(
+                    endpoint,
+                    RemoteEndpoint::Ssh {
+                        host: "[2001:db8::1]".to_string(),
+                        path: "/srv/data".to_string(),
+                    }
+                );
+            }
+            other => anyhow::bail!("expected Action::Pull, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_push_ssh_endpoint_defaults_empty_remote_path_to_current_directory() -> anyhow::Result<()>
+    {
+        let dir = tempdir()?;
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, "content")?;
+        let src_arg = src.to_string_lossy().to_string();
+
+        let action = parse_action(&["pxs", "push", &src_arg, "user@example:"])?;
+
+        match action {
+            Action::Push { endpoint, .. } => {
+                assert_eq!(
+                    endpoint,
+                    RemoteEndpoint::Ssh {
+                        host: "user@example".to_string(),
+                        path: ".".to_string(),
+                    }
+                );
+            }
+            other => anyhow::bail!("expected Action::Push, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_push_ssh_endpoint_with_colons_in_path() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, "content")?;
+        let src_arg = src.to_string_lossy().to_string();
+
+        let action = parse_action(&["pxs", "push", &src_arg, "user@example:path:with:colons"])?;
+
+        match action {
+            Action::Push { endpoint, .. } => {
+                assert_eq!(
+                    endpoint,
+                    RemoteEndpoint::Ssh {
+                        host: "user@example".to_string(),
+                        path: "path:with:colons".to_string(),
+                    }
+                );
+            }
+            other => anyhow::bail!("expected Action::Push, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn test_pull_tcp_rejects_source_side_flags() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let dst = dir.path().join("dst");
@@ -387,6 +570,40 @@ mod tests {
         };
 
         assert!(error.to_string().contains("configure `pxs serve` instead"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_push_rejects_malformed_bracketed_endpoint() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, "content")?;
+        let src_arg = src.to_string_lossy().to_string();
+
+        let Err(error) = parse_action(&["pxs", "push", &src_arg, "[::1"]) else {
+            anyhow::bail!("malformed bracketed endpoint should be rejected");
+        };
+
+        assert!(error.to_string().contains("missing closing `]`"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_push_rejects_ssh_endpoint_without_path() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, "content")?;
+        let src_arg = src.to_string_lossy().to_string();
+
+        let Err(error) = parse_action(&["pxs", "push", &src_arg, "user@example"]) else {
+            anyhow::bail!("SSH endpoint without path should be rejected");
+        };
+
+        assert!(
+            error
+                .to_string()
+                .contains("SSH endpoint must use `HOST:PATH` syntax")
+        );
         Ok(())
     }
 

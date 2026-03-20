@@ -2,6 +2,43 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.1] - 2026-03-20
+
+### Added
+
+- Added `--delete` flag to the `sync` subcommand to remove extraneous files from destination directories that do not exist in the source.
+- Added regression tests for directory-vs-file structural mismatches and `--delete` functionality in `tests/sync_test.rs`.
+- Added negotiated LZ4 compression for large, beneficial `ApplyBlocks` batches on raw TCP transports, with fallback to the existing uncompressed path for older peers and incompressible payloads.
+- Added CLI subprocess regression coverage for malformed endpoints, unsupported stdio pull, raw TCP source-side flag rejection, missing source paths, and incompatible peer handshake reporting.
+- Added Podman SSH push end-to-end coverage and strengthened the existing SSH pull script to cover spaced remote paths plus `--checksum` and `--ignore` forwarding.
+
+### Changed
+
+- Standardized the default TCP port in examples and help messages to `8080` (reverting from `7878`) to prioritize firewall compatibility in enterprise and data center environments.
+- Enhanced runtime error reporting by adding `anyhow::Context` to critical filesystem, metadata, and IO operations across the sync engine and CLI dispatch.
+- Refactored `src/pxs/sync.rs` into a structured module directory `src/pxs/sync/` with separate components for directory traversal, file synchronization, metadata application, and extraneous file deletion.
+- Refactored internal synchronization functions to use a shared `SyncOptions` configuration struct to improve maintainability and resolve clippy argument-count warnings.
+- Consolidated hardware-aware concurrency logic into a shared utility with safer fallback defaults (defaulting to single-threaded if CPU detection fails).
+- Improved large file synchronization to use throttled task spawning, ensuring constant memory usage even for multi-terabyte files.
+- Strengthened the network protocol review with regressions for malformed handshakes, invalid receiver-side messages, idle timeouts, codec resynchronization, and optimization-path coverage.
+- Improved SSH transport safety by routing remote internal stdio helpers through `--quiet`, using shell-safe remote command construction, and centralizing SSH child-process cleanup.
+- Tightened public endpoint parsing for bracketed IPv6 TCP/SSH endpoints and malformed bracketed syntax instead of falling through to later address-resolution failures.
+- Expanded end-to-end coverage for manual `--stdio` transport, SSH pull/push flows, and the current Podman TCP/SSH transport matrix.
+
+### Fixed
+
+- Fixed a regression in SSH endpoint parsing where paths containing internal colons (e.g., `user@host:path:with:colons`) were incorrectly split; now accurately isolates the host and path using the first colon outside of brackets.
+- Fixed directory synchronization bug where the sync would fail with "Not a directory" if a file already existed at the destination where a subdirectory needed to be created.
+- Fixed symlink handling to correctly detect and replace broken symlinks at the destination.
+- Fixed directory replacement logic to ensure real directories correctly replace symlinks-to-directories.
+- Fixed security vulnerability where ownership preservation could follow symlinks; now uses `lchown` to safely apply ownership to the link itself.
+- Improved directory traversal robustness by gracefully skipping unsupported file types (sockets, pipes) instead of returning an error.
+- Fixed the public `sync` subcommand so directory sources can replace an existing file at the destination root, matching the already-correct library behavior.
+- Fixed `pxs sync FILE DST --delete` to fail fast with a clear error instead of silently accepting a no-op flag combination.
+- Fixed receiver-side network sync so destination files can be replaced by incoming directories, matching local sync behavior.
+- Fixed network metadata application for symlinks to avoid following the symlink target when preserving ownership.
+- Fixed malformed bracketed endpoints such as `[::1` so they now fail during CLI parsing with a clear error instead of being treated as raw TCP addresses.
+
 ## [0.4.0] - 2026-03-18
 
 ### Added
@@ -18,16 +55,6 @@ All notable changes to this project will be documented in this file.
 ### Fixed
 
 - Fixed raw TCP `pull` UX so source-side flags are rejected with a clear error that points users to configure `serve` instead.
-
-### Verification
-
-- `cargo test`
-- `cargo clippy --all-targets --all-features`
-- `./tests/podman/test_tcp_pull.sh`
-- `./tests/podman/test_tcp_push.sh`
-- `./tests/podman/test_tcp_directory_resume.sh`
-- `./tests/podman/test_ssh_pull.sh`
-- `./tests/podman/test_ssh_pull_resume.sh`
 
 ### Benchmarks
 
@@ -94,15 +121,6 @@ All notable changes to this project will be documented in this file.
 - Reduced local incremental sync scan cost by using mmap-backed slice comparison when available.
 - Reduced sender-side remote transfer overhead by reusing a single opened source file and mmap context across full-copy, hash, and block-request responses.
 - Bounded local directory sync in-flight work to avoid unbounded task buildup on very large trees.
-
-### Verification
-
-- `cargo fmt --all`
-- `cargo test -q`
-- `cargo clippy --all-targets --all-features -- -D warnings`
-- `cargo build --release`
-- `./tests/podman/test_ssh_pull.sh`
-- `./tests/podman/test_ssh_pull_resume.sh`
 
 ### Benchmarks
 

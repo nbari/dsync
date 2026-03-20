@@ -111,6 +111,15 @@ fn verbose_arg() -> Arg {
         .action(ArgAction::Count)
 }
 
+fn quiet_arg() -> Arg {
+    Arg::new("quiet")
+        .short('q')
+        .long("quiet")
+        .help("Do not show progress bar")
+        .global(true)
+        .action(ArgAction::SetTrue)
+}
+
 fn threshold_arg(hidden: bool) -> Arg {
     Arg::new("threshold")
         .short('t')
@@ -148,6 +157,13 @@ fn dry_run_arg() -> Arg {
         .short('n')
         .long("dry-run")
         .help("Show what would have been transferred")
+        .action(ArgAction::SetTrue)
+}
+
+fn delete_arg() -> Arg {
+    Arg::new("delete")
+        .long("delete")
+        .help("Delete extraneous files from destination directories")
         .action(ArgAction::SetTrue)
 }
 
@@ -243,6 +259,7 @@ fn sync_command() -> Command {
             checksum_arg(false),
             fsync_arg(false),
             dry_run_arg(),
+            delete_arg(),
             ignore_arg(false),
             exclude_from_arg(false),
         ])
@@ -305,6 +322,7 @@ fn base_command() -> Command {
         .arg_required_else_help(true)
         .disable_help_subcommand(true)
         .arg(verbose_arg())
+        .arg(quiet_arg())
         .args(internal_stdio_args())
         .subcommands([
             sync_command(),

@@ -3,27 +3,27 @@ use super::{
     codec::PxsCodec,
     path::{resolve_protocol_path, validate_protocol_path},
     protocol::{
-        Block, FileMetadata, Message, apply_file_metadata, deserialize_message, serialize_message,
+        Block, FileMetadata, Message, apply_file_metadata, deserialize_block_batch,
+        deserialize_message, serialize_message,
     },
     shared::{
-        block_bytes, connect_with_retry, recv_with_timeout, skipped_bytes, validate_peer_version,
+        TransportFeatures, block_bytes, connect_with_retry, local_handshake_version,
+        negotiate_transport_features, recv_with_timeout, skipped_bytes,
     },
+    ssh::{ChildSession, build_ssh_command, build_ssh_pull_command},
 };
 use crate::pxs::tools;
 use futures_util::SinkExt;
 use indicatif::ProgressBar;
 use std::{
     collections::HashMap,
-    fmt::Write as _,
     os::unix::fs::{FileExt, MetadataExt},
     path::{Path, PathBuf},
-    process::Stdio,
     sync::Arc,
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::TcpListener,
-    process::Command,
 };
 use tokio_util::codec::Framed;
 
@@ -39,6 +39,7 @@ struct ClientState {
     current_metadata: Option<FileMetadata>,
     dir_metadata: Vec<(String, FileMetadata)>,
     dst_root: PathBuf,
+    transport: TransportFeatures,
     handshake_complete: bool,
 }
 
@@ -50,6 +51,7 @@ impl ClientState {
             current_metadata: None,
             dir_metadata: Vec::new(),
             dst_root: dst_root.to_path_buf(),
+            transport: TransportFeatures::default(),
             handshake_complete: false,
         }
     }
@@ -112,7 +114,7 @@ impl ClientState {
 pub async fn run_pull_client(addr: &str, dst_root: &Path, fsync: bool) -> anyhow::Result<()> {
     let stream = connect_with_retry(addr).await?;
     let mut framed = Framed::new(stream, PxsCodec);
-    handle_client(&mut framed, dst_root, true, fsync).await
+    handle_client_with_transport(&mut framed, dst_root, true, fsync, true).await
 }
 
 /// Run the receiver to handle incoming sync connections.
@@ -128,7 +130,9 @@ pub async fn run_receiver(addr: &str, dst_root: &Path, fsync: bool) -> anyhow::R
         let dst_root = dst_root.to_path_buf();
         tokio::spawn(async move {
             let mut framed = Framed::new(stream, PxsCodec);
-            if let Err(error) = handle_client(&mut framed, &dst_root, false, fsync).await {
+            if let Err(error) =
+                handle_client_with_transport(&mut framed, &dst_root, false, fsync, true).await
+            {
                 eprintln!("Error handling client {peer_addr}: {error}");
             }
             eprintln!("Connection with {peer_addr} closed");
@@ -142,12 +146,12 @@ pub async fn run_receiver(addr: &str, dst_root: &Path, fsync: bool) -> anyhow::R
 /// # Errors
 ///
 /// Returns an error if synchronization fails.
-pub async fn run_stdio_receiver(dst_root: &Path, fsync: bool) -> anyhow::Result<()> {
+pub async fn run_stdio_receiver(dst_root: &Path, fsync: bool, _quiet: bool) -> anyhow::Result<()> {
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let combined = tokio::io::join(stdin, stdout);
     let mut framed = Framed::new(combined, PxsCodec);
-    handle_client(&mut framed, dst_root, false, fsync).await
+    handle_client_with_transport(&mut framed, dst_root, false, fsync, false).await
 }
 
 /// Run the receiver over an SSH tunnel (for pull mode).
@@ -164,72 +168,36 @@ pub async fn run_ssh_receiver(
     fsync: bool,
     ignores: &[String],
 ) -> anyhow::Result<()> {
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-q")
-        .arg("-o")
-        .arg("Compression=no")
-        .arg("-o")
-        .arg("Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-ctr")
-        .arg("-o")
-        .arg("IPQoS=throughput")
-        .arg(addr);
-
-    let mut remote_cmd =
-        format!("pxs --stdio --sender --source {src_path} --threshold {threshold}");
-    if checksum {
-        remote_cmd.push_str(" --checksum");
-    }
-    for pattern in ignores {
-        let _ = write!(remote_cmd, " --ignore '{pattern}'");
-    }
-
-    let mut child = cmd
-        .arg(remote_cmd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("stdin failed"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("stdout failed"))?;
-
-    {
-        let combined = tokio::io::join(stdout, stdin);
-        let mut framed = Framed::new(combined, PxsCodec);
-        handle_client(&mut framed, dst_root, true, fsync).await?;
-    }
-
-    let status = child.wait().await?;
-    if !status.success() {
-        anyhow::bail!("SSH process exited with error: {status}");
-    }
+    let remote_cmd = build_ssh_pull_command(src_path, threshold, checksum, ignores);
+    let mut session = ChildSession::spawn(build_ssh_command(addr, &remote_cmd))?;
+    let result =
+        handle_client_with_transport(session.framed_mut()?, dst_root, true, fsync, false).await;
+    session.finish(result, "SSH process").await?;
     Ok(())
 }
 
 async fn handle_handshake<T>(
     framed: &mut Framed<T, PxsCodec>,
     version: String,
-) -> anyhow::Result<()>
+    allow_lz4: bool,
+) -> anyhow::Result<TransportFeatures>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    if let Err(error) = validate_peer_version(&version) {
-        framed
-            .send(serialize_message(&Message::Error(error.to_string()))?)
-            .await?;
-        return Err(error);
-    }
-
+    let features = match negotiate_transport_features(&version, allow_lz4) {
+        Ok(features) => features,
+        Err(error) => {
+            framed
+                .send(serialize_message(&Message::Error(error.to_string()))?)
+                .await?;
+            return Err(error);
+        }
+    };
     let response = Message::Handshake {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: local_handshake_version(allow_lz4),
     };
     framed.send(serialize_message(&response)?).await?;
-    Ok(())
+    Ok(features)
 }
 
 async fn handle_sync_symlink(
@@ -339,8 +307,16 @@ async fn handle_sync_dir_message(
     metadata: FileMetadata,
 ) -> anyhow::Result<()> {
     let full_path = resolve_protocol_path(dst_root, &path)?;
-    if !full_path.exists() {
-        tokio::fs::create_dir_all(&full_path).await?;
+    match tokio::fs::symlink_metadata(&full_path).await {
+        Ok(existing) if existing.is_dir() => {}
+        Ok(_) => {
+            tokio::fs::remove_file(&full_path).await?;
+            tokio::fs::create_dir_all(&full_path).await?;
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            tokio::fs::create_dir_all(&full_path).await?;
+        }
+        Err(error) => return Err(error.into()),
     }
     state.dir_metadata.push((path, metadata));
     Ok(())
@@ -432,6 +408,7 @@ async fn process_client_message<T>(
     dst_root: &Path,
     show_progress: bool,
     fsync: bool,
+    allow_lz4: bool,
     msg: Message,
 ) -> anyhow::Result<()>
 where
@@ -441,7 +418,7 @@ where
         return match msg {
             Message::Handshake { version } => {
                 tracing::debug!("Client connected (version: {version})");
-                handle_handshake(framed, version).await?;
+                state.transport = handle_handshake(framed, version, allow_lz4).await?;
                 state.handshake_complete = true;
                 Ok(())
             }
@@ -480,6 +457,15 @@ where
         Message::ApplyBlocks { path, blocks } => {
             handle_apply_blocks_message(state, &path, blocks)?;
         }
+        Message::ApplyBlocksCompressed { path, compressed } => {
+            if !state.transport.lz4_block_messages {
+                anyhow::bail!("received compressed block batch without negotiated LZ4 support");
+            }
+            let payload = lz4_flex::decompress_size_prepended(&compressed)
+                .map_err(|error| anyhow::anyhow!("failed to decompress block batch: {error}"))?;
+            let blocks = deserialize_block_batch(&payload)?;
+            handle_apply_blocks_message(state, &path, blocks)?;
+        }
         Message::ApplyMetadata { path, metadata } => {
             handle_apply_metadata(framed, state, path, metadata, dst_root, fsync).await?;
         }
@@ -489,7 +475,15 @@ where
         Message::EndOfFile { path } => {
             handle_end_of_file_message(state, &path)?;
         }
-        _ => eprintln!("Unhandled message: {msg:?}"),
+        Message::RequestFullCopy { .. }
+        | Message::RequestHashes { .. }
+        | Message::RequestBlocks { .. }
+        | Message::MetadataApplied { .. }
+        | Message::ChecksumVerified { .. }
+        | Message::ChecksumMismatch { .. }
+        | Message::Error(_) => {
+            anyhow::bail!("unexpected receiver-side protocol message: {msg:?}");
+        }
     }
 
     Ok(())
@@ -530,9 +524,30 @@ pub async fn handle_client<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    handle_client_with_transport(framed, dst_root, show_progress, fsync, false).await
+}
+
+async fn handle_client_with_transport<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    dst_root: &Path,
+    show_progress: bool,
+    fsync: bool,
+    allow_lz4: bool,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
     let mut state = ClientState::new(dst_root);
 
-    let result = handle_client_inner(framed, &mut state, dst_root, show_progress, fsync).await;
+    let result = handle_client_inner(
+        framed,
+        &mut state,
+        dst_root,
+        show_progress,
+        fsync,
+        allow_lz4,
+    )
+    .await;
 
     if result.is_err() {
         state.cleanup_partial_files();
@@ -547,13 +562,23 @@ async fn handle_client_inner<T>(
     dst_root: &Path,
     show_progress: bool,
     fsync: bool,
+    allow_lz4: bool,
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     while let Some(bytes) = recv_with_timeout(framed).await? {
         let msg = deserialize_message(&bytes)?;
-        process_client_message(framed, state, dst_root, show_progress, fsync, msg).await?;
+        process_client_message(
+            framed,
+            state,
+            dst_root,
+            show_progress,
+            fsync,
+            allow_lz4,
+            msg,
+        )
+        .await?;
     }
 
     // If connection closed while files were still being written, treat as error
@@ -628,7 +653,7 @@ where
             return Ok(());
         }
 
-        let pending_file = state
+        let mut pending_file = state
             .pending_files
             .remove(&path)
             .ok_or_else(|| anyhow::anyhow!("missing pending file for path: {path}"))?;
@@ -677,7 +702,7 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let full_path = resolve_protocol_path(dst_root, path)?;
-    let pending_file = state
+    let mut pending_file = state
         .pending_files
         .remove(path)
         .ok_or_else(|| anyhow::anyhow!("missing pending file for path: {path}"))?;

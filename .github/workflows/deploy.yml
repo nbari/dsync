@@ -48,14 +48,15 @@ jobs:
             exit 1
           fi
 
-  test:
+  quality:
+    name: Quality Checks
     uses: ./.github/workflows/test.yml
     needs: verify-main-status
 
   build:
     name: Build and release
     runs-on: ${{ matrix.os }}
-    needs: test
+    needs: quality
 
     strategy:
       matrix:

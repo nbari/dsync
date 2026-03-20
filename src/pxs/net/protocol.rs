@@ -7,6 +7,43 @@ use rkyv::{
 };
 use std::{os::unix::fs::MetadataExt, path::Path};
 
+#[cfg(unix)]
+fn try_set_ownership(path: &Path, metadata: &FileMetadata, is_symlink: bool) {
+    use std::os::unix::ffi::OsStrExt;
+
+    if is_symlink {
+        match std::ffi::CString::new(path.as_os_str().as_bytes()) {
+            Ok(path_cstr) => {
+                // SAFETY: `path_cstr` is a valid C string for the lifetime of this call.
+                let result =
+                    unsafe { nix::libc::lchown(path_cstr.as_ptr(), metadata.uid, metadata.gid) };
+                if result != 0 {
+                    let error = std::io::Error::last_os_error();
+                    tracing::debug!(
+                        "Could not set ownership on symlink {}: {error}",
+                        path.display()
+                    );
+                }
+            }
+            Err(error) => {
+                tracing::debug!(
+                    "Could not encode symlink path {} for ownership update: {error}",
+                    path.display()
+                );
+            }
+        }
+        return;
+    }
+
+    if let Err(error) = nix::unistd::chown(
+        path,
+        Some(nix::unistd::Uid::from_raw(metadata.uid)),
+        Some(nix::unistd::Gid::from_raw(metadata.gid)),
+    ) {
+        tracing::debug!("Could not set ownership on {}: {error}", path.display());
+    }
+}
+
 #[derive(Archive, Deserialize, Serialize, Debug, Clone, Copy)]
 pub struct FileMetadata {
     pub size: u64,
@@ -67,6 +104,10 @@ pub enum Message {
         path: String,
         blocks: Vec<Block>,
     },
+    ApplyBlocksCompressed {
+        path: String,
+        compressed: Vec<u8>,
+    },
     ApplyMetadata {
         path: String,
         metadata: FileMetadata,
@@ -94,10 +135,15 @@ pub enum Message {
     Error(String),
 }
 
-#[derive(Archive, Deserialize, Serialize, Debug)]
+#[derive(Archive, Deserialize, Serialize, Debug, Clone)]
 pub struct Block {
     pub offset: u64,
     pub data: Vec<u8>,
+}
+
+#[derive(Archive, Deserialize, Serialize, Debug)]
+struct BlockBatchPayload {
+    blocks: Vec<Block>,
 }
 
 /// Serialize a message to a byte vector.
@@ -124,6 +170,34 @@ pub fn deserialize_message(bytes: &[u8]) -> anyhow::Result<Message> {
         .map_err(|e| anyhow::anyhow!("failed to deserialize message: {e}"))
 }
 
+/// Serialize a list of blocks for compressed transport.
+///
+/// # Errors
+///
+/// Returns an error if serialization fails.
+pub(crate) fn serialize_block_batch(blocks: &[Block]) -> anyhow::Result<AlignedVec<16>> {
+    let payload = BlockBatchPayload {
+        blocks: blocks.to_vec(),
+    };
+    let mut vec = AlignedVec::<16>::new();
+    to_bytes_in::<_, rkyv::rancor::Error>(&payload, &mut vec)
+        .map_err(|e| anyhow::anyhow!("failed to serialize block batch: {e}"))?;
+    Ok(vec)
+}
+
+/// Deserialize a compressed block batch payload.
+///
+/// # Errors
+///
+/// Returns an error if deserialization fails.
+pub(crate) fn deserialize_block_batch(bytes: &[u8]) -> anyhow::Result<Vec<Block>> {
+    let mut aligned = AlignedVec::<16>::new();
+    aligned.extend_from_slice(bytes);
+    let payload = rkyv::from_bytes::<BlockBatchPayload, rkyv::rancor::Error>(&aligned)
+        .map_err(|e| anyhow::anyhow!("failed to deserialize block batch: {e}"))?;
+    Ok(payload.blocks)
+}
+
 /// Apply metadata to a local path.
 ///
 /// # Errors
@@ -140,13 +214,8 @@ pub fn apply_file_metadata(path: &Path, metadata: &FileMetadata) -> anyhow::Resu
             .context("failed to set permissions")?;
     }
 
-    if let Err(e) = nix::unistd::chown(
-        path,
-        Some(nix::unistd::Uid::from_raw(metadata.uid)),
-        Some(nix::unistd::Gid::from_raw(metadata.gid)),
-    ) {
-        tracing::debug!("Could not set ownership on {}: {e}", path.display());
-    }
+    #[cfg(unix)]
+    try_set_ownership(path, metadata, is_symlink);
 
     let mtime = FileTime::from_unix_time(metadata.mtime, metadata.mtime_nsec);
     if is_symlink {

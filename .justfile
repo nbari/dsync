@@ -7,6 +7,9 @@ clippy:
 podman-test:
   ./tests/podman/test_ssh_pull.sh
 
+podman-test-ssh-push:
+  ./tests/podman/test_ssh_push.sh
+
 podman-test-tcp:
   ./tests/podman/test_tcp_push.sh
 
@@ -18,6 +21,7 @@ podman-test-ssh-resume:
 
 podman-test-all:
   ./tests/podman/test_ssh_pull.sh
+  ./tests/podman/test_ssh_push.sh
   ./tests/podman/test_ssh_pull_resume.sh
   ./tests/podman/test_tcp_push.sh
   ./tests/podman/test_tcp_directory_resume.sh

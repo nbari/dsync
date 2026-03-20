@@ -289,11 +289,12 @@ pxs pull user@remote-server:/path/to/remote/file.bin ./local_file.bin
 If you need custom SSH flags, you can still use the internal `--stdio` transport manually:
 
 ```bash
-ssh user@remote-server "pxs --stdio --destination /path/to/new/data" < <(pxs push /path/to/old/data -)
+ssh user@remote-server "pxs --stdio --quiet --destination /path/to/new/data" < <(pxs push /path/to/old/data -)
 ```
 
 ### Advanced Options
 
+*   **`--quiet` (-q)**: Suppress all progress bars and status messages.
 *   **`--checksum` (-c)**: Force a block-by-block hash comparison even if size/mtime match.
 *   **`--fsync` (-f)**: Force `fsync(2)` after file writes. Slower, but safer for durability-sensitive copies.
 *   **`--ignore` (-i)**: (Repeatable) Skip files/directories matching a glob pattern (e.g., `-i "*.log"`).
@@ -302,15 +303,30 @@ ssh user@remote-server "pxs --stdio --destination /path/to/new/data" < <(pxs pus
 *   **`--dry-run` (-n)**: Show what would have been transferred without making any changes.
 *   **`--verbose` (-v)**: Increase logging verbosity (use `-vv` for debug).
 
-## Progress Output
+## Progress Output & Quiet Mode
 
-`pxs` shows a progress bar for:
+`pxs` provides a real-time, multi-threaded progress display for local and network synchronizations.
 
-*   local directory syncs
-*   direct TCP sender/receiver transfers where the receiving side knows total size
-*   SSH and `--stdio` transfers
+### Aggregate and Individual Progress
+For directory synchronizations, `pxs` shows:
+1.  **Main Progress Bar (Top)**: An aggregate bar tracking the total bytes processed across the entire directory tree.
+2.  **Worker Bars (Below)**: Individual progress bars for each large file currently being processed by a worker thread.
 
-Currently, a single local file sync does **not** show a visible progress bar; it prints summary information when the copy completes.
+### Throttled Bar Creation (Performance Optimization)
+To ensure maximum performance and terminal readability, `pxs` uses a "smart" progress strategy:
+*   **Small Files (< 1MB)**: Files smaller than 1MB are processed so quickly that creating a progress bar would cause excessive terminal flickering and CPU overhead. These files silently increment the **Main Progress Bar** without showing a dedicated sub-bar.
+*   **Large Files (>= 1MB)**: Files 1MB or larger get a dedicated line in the terminal showing their specific transfer speed and completion percentage.
+*   **Worker Limits**: The number of concurrent file progress bars is limited by your hardware (CPU core count, capped at **64**). This ensures that even when syncing millions of files, the terminal remains clean and the UI overhead stays negligible.
+
+### Quiet Mode
+For use in cron jobs, scripts, or CI/CD pipelines, use the quiet flag to suppress all terminal output:
+
+```bash
+# Sync without any progress bars or status messages
+pxs sync /src /dst --quiet
+# or using the short flag
+pxs sync /src /dst -q
+```
 
 ### Exclude Example
 If you want to skip Postgres configuration files during a sync:
@@ -386,6 +402,9 @@ Podman end-to-end tests are also available:
 
 # SSH pull end-to-end
 ./tests/podman/test_ssh_pull.sh
+
+# SSH push end-to-end
+./tests/podman/test_ssh_push.sh
 
 # SSH pull resume/truncation end-to-end
 ./tests/podman/test_ssh_pull_resume.sh

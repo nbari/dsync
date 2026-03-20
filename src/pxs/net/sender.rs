@@ -2,22 +2,27 @@ use super::{
     BLOCK_SIZE, BLOCK_SIZE_USIZE,
     codec::PxsCodec,
     path::{ensure_expected_protocol_path, relative_protocol_path},
-    protocol::{Block, FileMetadata, Message, deserialize_message, serialize_message},
-    shared::{
-        block_bytes, connect_with_retry, recv_with_timeout, skipped_bytes, validate_peer_version,
+    protocol::{
+        Block, FileMetadata, Message, deserialize_message, serialize_block_batch, serialize_message,
     },
+    shared::{
+        TransportFeatures, block_bytes, connect_with_retry, local_handshake_version,
+        negotiate_transport_features, recv_with_timeout, skipped_bytes,
+    },
+    ssh::{ChildSession, build_ssh_command, build_ssh_push_command},
     tasks::{SyncTask, collect_sync_tasks, source_path_for},
 };
 use crate::pxs::tools;
 use futures_util::SinkExt;
 use indicatif::ProgressBar;
-use std::{fmt::Write as _, os::unix::fs::FileExt, path::Path, process::Stdio, sync::Arc};
+use std::{os::unix::fs::FileExt, path::Path, sync::Arc};
 use tokio::{
     io::{AsyncRead, AsyncWrite},
     net::{TcpListener, TcpStream},
-    process::Command,
 };
 use tokio_util::codec::Framed;
+
+const MIN_COMPRESSED_BATCH_BYTES: u64 = 64 * 1024;
 
 /// Run the listener in sender mode (serves files to clients).
 ///
@@ -50,8 +55,16 @@ pub async fn run_sender_listener(
             };
             let pb = Arc::new(tools::create_progress_bar(total_size));
             let mut framed = Framed::new(stream, PxsCodec);
-            if let Err(error) =
-                sender_loop(&mut framed, &src_root, threshold, checksum, &tasks, pb).await
+            if let Err(error) = sender_loop(
+                &mut framed,
+                &src_root,
+                threshold,
+                checksum,
+                &tasks,
+                pb,
+                true,
+            )
+            .await
             {
                 eprintln!("Error serving client {peer_addr}: {error}");
             }
@@ -142,17 +155,18 @@ async fn run_sender_workers(
         workers.push(tokio::spawn(async move {
             let stream = connect_with_retry(&addr_owned).await?;
             let mut framed = Framed::new(stream, PxsCodec);
-            sender_handshake(&mut framed).await?;
+            let features = sender_handshake(&mut framed, true).await?;
 
             for rel_path in batch {
                 let src_path = source_path_for(&src_root_worker, &rel_path);
-                sync_remote_file(
+                sync_remote_file_with_features(
                     &mut framed,
                     &src_root_worker,
                     &src_path,
                     threshold,
                     checksum,
                     Arc::clone(&progress_worker),
+                    features,
                 )
                 .await?;
             }
@@ -190,7 +204,7 @@ pub async fn run_sender(
     let main_framed = if has_non_file_tasks {
         let stream = connect_with_retry(addr).await?;
         let mut framed = Framed::new(stream, PxsCodec);
-        sender_handshake(&mut framed).await?;
+        let _ = sender_handshake(&mut framed, true).await?;
         send_non_file_tasks(&mut framed, &tasks).await?;
         Some(framed)
     } else {
@@ -233,14 +247,28 @@ pub async fn run_stdio_sender(
     threshold: f32,
     checksum: bool,
     ignores: &[String],
+    quiet: bool,
 ) -> anyhow::Result<()> {
     let (tasks, total_size) = collect_sync_tasks(src_root, ignores).await?;
-    let progress = Arc::new(tools::create_progress_bar(total_size));
+    let progress = Arc::new(if quiet {
+        ProgressBar::hidden()
+    } else {
+        tools::create_progress_bar(total_size)
+    });
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let combined = tokio::io::join(stdin, stdout);
     let mut framed = Framed::new(combined, PxsCodec);
-    sender_loop(&mut framed, src_root, threshold, checksum, &tasks, progress).await
+    sender_loop(
+        &mut framed,
+        src_root,
+        threshold,
+        checksum,
+        &tasks,
+        progress,
+        false,
+    )
+    .await
 }
 
 /// Run the sender over an SSH tunnel.
@@ -258,70 +286,42 @@ pub async fn run_ssh_sender(
 ) -> anyhow::Result<()> {
     let (tasks, total_size) = collect_sync_tasks(src_root, ignores).await?;
     let progress = Arc::new(tools::create_progress_bar(total_size));
-    let mut cmd = Command::new("ssh");
-    cmd.arg("-q")
-        .arg("-o")
-        .arg("Compression=no")
-        .arg("-o")
-        .arg("Ciphers=aes128-gcm@openssh.com,chacha20-poly1305@openssh.com,aes128-ctr")
-        .arg("-o")
-        .arg("IPQoS=throughput")
-        .arg(addr);
-    let mut remote_cmd = format!("pxs --stdio --destination {dst_path}");
-    for pattern in ignores {
-        let _ = write!(remote_cmd, " --ignore '{pattern}'");
-    }
-    let mut child = cmd
-        .arg(remote_cmd)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .spawn()?;
-    let stdin = child
-        .stdin
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("stdin failed"))?;
-    let stdout = child
-        .stdout
-        .take()
-        .ok_or_else(|| anyhow::anyhow!("stdout failed"))?;
-    {
-        let combined = tokio::io::join(stdout, stdin);
-        let mut framed = Framed::new(combined, PxsCodec);
-        sender_loop(
-            &mut framed,
-            src_root,
-            threshold,
-            checksum,
-            &tasks,
-            Arc::clone(&progress),
-        )
-        .await?;
-    }
-    let status = child.wait().await?;
-    if !status.success() {
-        anyhow::bail!("SSH process exited with error: {status}");
-    }
+    let remote_cmd = build_ssh_push_command(dst_path, ignores);
+    let mut session = ChildSession::spawn(build_ssh_command(addr, &remote_cmd))?;
+    let result = sender_loop(
+        session.framed_mut()?,
+        src_root,
+        threshold,
+        checksum,
+        &tasks,
+        Arc::clone(&progress),
+        false,
+    )
+    .await;
+    session.finish(result, "SSH process").await?;
     progress.finish_with_message("Done");
     Ok(())
 }
 
-async fn sender_handshake<T>(framed: &mut Framed<T, PxsCodec>) -> anyhow::Result<()>
+async fn sender_handshake<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    allow_lz4: bool,
+) -> anyhow::Result<TransportFeatures>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let handshake = Message::Handshake {
-        version: env!("CARGO_PKG_VERSION").to_string(),
+        version: local_handshake_version(allow_lz4),
     };
     framed.send(serialize_message(&handshake)?).await?;
     let resp_bytes = recv_with_timeout(framed)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Connection closed during handshake"))?;
     match deserialize_message(&resp_bytes)? {
-        Message::Handshake { version } => validate_peer_version(&version)?,
+        Message::Handshake { version } => negotiate_transport_features(&version, allow_lz4),
         Message::Error(message) => anyhow::bail!("Handshake rejected: {message}"),
         other => anyhow::bail!("Unexpected handshake response: {other:?}"),
     }
-    Ok(())
 }
 
 async fn sender_loop<T>(
@@ -331,11 +331,12 @@ async fn sender_loop<T>(
     checksum: bool,
     tasks: &[SyncTask],
     progress: Arc<ProgressBar>,
+    allow_lz4: bool,
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    sender_handshake(framed).await?;
+    let features = sender_handshake(framed, allow_lz4).await?;
 
     framed
         .send(serialize_message(&Message::SyncStart {
@@ -368,13 +369,14 @@ where
             }
             SyncTask::File { path } => {
                 let src_path = source_path_for(src_root, path);
-                sync_remote_file(
+                sync_remote_file_with_features(
                     framed,
                     src_root,
                     &src_path,
                     threshold,
                     checksum,
                     Arc::clone(&progress),
+                    features,
                 )
                 .await?;
             }
@@ -428,7 +430,11 @@ fn mapped_source_chunk(
     let end = start
         .saturating_add(BLOCK_SIZE_USIZE)
         .min(source_reader.len);
-    Ok(mmap.get(start..end))
+    let chunk = mmap.get(start..end);
+    if chunk.is_some() {
+        tools::record_sender_mmap_read_hit();
+    }
+    Ok(chunk)
 }
 
 async fn open_source_read_context(path: &Path) -> anyhow::Result<Arc<SourceReadContext>> {
@@ -518,11 +524,27 @@ async fn send_block_batch<T>(
     rel_path: &str,
     blocks: Vec<Block>,
     progress: &Arc<ProgressBar>,
+    features: TransportFeatures,
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let bytes_sent = block_bytes(&blocks)?;
+    if features.lz4_block_messages && bytes_sent >= MIN_COMPRESSED_BATCH_BYTES {
+        let serialized = serialize_block_batch(&blocks)?;
+        let compressed = lz4_flex::compress_prepend_size(serialized.as_slice());
+        if compressed.len() < serialized.len() {
+            framed
+                .send(serialize_message(&Message::ApplyBlocksCompressed {
+                    path: rel_path.to_string(),
+                    compressed,
+                })?)
+                .await?;
+            progress.inc(bytes_sent);
+            return Ok(());
+        }
+    }
+
     framed
         .send(serialize_message(&Message::ApplyBlocks {
             path: rel_path.to_string(),
@@ -556,6 +578,7 @@ async fn handle_request_full_copy_message<T>(
     source_reader: Arc<SourceReadContext>,
     metadata: FileMetadata,
     progress: &Arc<ProgressBar>,
+    features: TransportFeatures,
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -583,7 +606,7 @@ where
             if let Some((read_fut, next_start)) = read_future {
                 // Pipeline: send current batch while reading next
                 let (send_result, read_result) = tokio::join!(
-                    send_block_batch(framed, rel_path, blocks, progress),
+                    send_block_batch(framed, rel_path, blocks, progress, features),
                     read_fut
                 );
                 send_result?;
@@ -591,7 +614,7 @@ where
                 start_block = next_start;
             } else {
                 // Last batch, just send
-                send_block_batch(framed, rel_path, blocks, progress).await?;
+                send_block_batch(framed, rel_path, blocks, progress, features).await?;
             }
         } else if let Some((read_fut, next_start)) = read_future {
             // First iteration, just read
@@ -635,6 +658,7 @@ async fn handle_request_blocks_message<T>(
     metadata: FileMetadata,
     indices: Vec<u32>,
     progress: &Arc<ProgressBar>,
+    features: TransportFeatures,
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -648,7 +672,7 @@ where
     for chunk_indices in indices.chunks(128) {
         let blocks =
             read_requested_blocks(Arc::clone(&source_reader), chunk_indices.to_vec()).await?;
-        send_block_batch(framed, rel_path, blocks, progress).await?;
+        send_block_batch(framed, rel_path, blocks, progress, features).await?;
     }
 
     send_apply_metadata(framed, rel_path, metadata).await
@@ -666,6 +690,30 @@ pub async fn sync_remote_file<T>(
     threshold: f32,
     checksum: bool,
     progress: Arc<ProgressBar>,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    sync_remote_file_with_features(
+        framed,
+        src_root,
+        path,
+        threshold,
+        checksum,
+        progress,
+        TransportFeatures::default(),
+    )
+    .await
+}
+
+async fn sync_remote_file_with_features<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    src_root: &Path,
+    path: &Path,
+    threshold: f32,
+    checksum: bool,
+    progress: Arc<ProgressBar>,
+    features: TransportFeatures,
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -690,6 +738,7 @@ where
                     source_reader,
                     metadata,
                     &progress,
+                    features,
                 )
                 .await?;
             }
@@ -713,6 +762,7 @@ where
                     metadata,
                     indices,
                     &progress,
+                    features,
                 )
                 .await?;
             }
@@ -758,4 +808,135 @@ where
     }
 
     anyhow::bail!("Connection closed unexpectedly")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MIN_COMPRESSED_BATCH_BYTES, send_block_batch, sender_handshake};
+    use crate::pxs::net::protocol::deserialize_block_batch;
+    use crate::pxs::net::shared::TransportFeatures;
+    use crate::pxs::net::{Block, Message, PxsCodec, deserialize_message, serialize_message};
+    use futures_util::{SinkExt, StreamExt};
+    use indicatif::ProgressBar;
+    use std::sync::Arc;
+    use tokio_util::codec::Framed;
+
+    #[tokio::test]
+    async fn test_sender_handshake_negotiates_lz4_with_capable_peer() -> anyhow::Result<()> {
+        let (client, server) = tokio::io::duplex(4096);
+        let mut sender_framed = Framed::new(client, PxsCodec);
+        let mut peer_framed = Framed::new(server, PxsCodec);
+
+        let sender_task =
+            tokio::spawn(async move { sender_handshake(&mut sender_framed, true).await });
+
+        let handshake = peer_framed
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("missing sender handshake"))??;
+        match deserialize_message(&handshake)? {
+            Message::Handshake { version } => assert!(version.contains("+caps=lz4-blocks")),
+            other => anyhow::bail!("expected handshake, got {other:?}"),
+        }
+
+        peer_framed
+            .send(serialize_message(&Message::Handshake {
+                version: format!("{}+caps=lz4-blocks", env!("CARGO_PKG_VERSION")),
+            })?)
+            .await?;
+
+        let features = sender_task.await??;
+        assert!(features.lz4_block_messages);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_send_block_batch_uses_compressed_message_when_beneficial() -> anyhow::Result<()> {
+        let (client, server) = tokio::io::duplex(2 * 1024 * 1024);
+        let mut sender_framed = Framed::new(client, PxsCodec);
+        let mut receiver_framed = Framed::new(server, PxsCodec);
+        let progress = Arc::new(ProgressBar::hidden());
+        let blocks = vec![Block {
+            offset: 0,
+            data: vec![
+                b'A';
+                usize::try_from(MIN_COMPRESSED_BATCH_BYTES)
+                    .map_err(|e| anyhow::anyhow!(e))?
+            ],
+        }];
+
+        send_block_batch(
+            &mut sender_framed,
+            "file.bin",
+            blocks,
+            &progress,
+            TransportFeatures {
+                lz4_block_messages: true,
+            },
+        )
+        .await?;
+
+        let msg = receiver_framed
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("missing block batch"))??;
+        match deserialize_message(&msg)? {
+            Message::ApplyBlocksCompressed { path, compressed } => {
+                assert_eq!(path, "file.bin");
+                let payload = lz4_flex::decompress_size_prepended(&compressed)
+                    .map_err(|e| anyhow::anyhow!(e))?;
+                let blocks = deserialize_block_batch(&payload)?;
+                assert_eq!(blocks.len(), 1);
+                assert_eq!(
+                    blocks
+                        .first()
+                        .ok_or_else(|| anyhow::anyhow!("missing decoded block"))?
+                        .offset,
+                    0
+                );
+            }
+            other => anyhow::bail!("expected compressed blocks, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_send_block_batch_falls_back_without_lz4_negotiation() -> anyhow::Result<()> {
+        let (client, server) = tokio::io::duplex(2 * 1024 * 1024);
+        let mut sender_framed = Framed::new(client, PxsCodec);
+        let mut receiver_framed = Framed::new(server, PxsCodec);
+        let progress = Arc::new(ProgressBar::hidden());
+        let blocks = vec![Block {
+            offset: 0,
+            data: vec![
+                b'A';
+                usize::try_from(MIN_COMPRESSED_BATCH_BYTES)
+                    .map_err(|e| anyhow::anyhow!(e))?
+            ],
+        }];
+
+        send_block_batch(
+            &mut sender_framed,
+            "file.bin",
+            blocks,
+            &progress,
+            TransportFeatures::default(),
+        )
+        .await?;
+
+        let msg = receiver_framed
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("missing block batch"))??;
+        match deserialize_message(&msg)? {
+            Message::ApplyBlocks { path, blocks } => {
+                assert_eq!(path, "file.bin");
+                assert_eq!(blocks.len(), 1);
+            }
+            other => anyhow::bail!("expected uncompressed blocks, got {other:?}"),
+        }
+
+        Ok(())
+    }
 }

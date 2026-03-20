@@ -1,6 +1,6 @@
 use crate::cli::actions::{Action, RemoteEndpoint};
 use crate::pxs::{sync, tools};
-use anyhow::Result;
+use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tracing::{info, instrument};
 
@@ -51,7 +51,7 @@ async fn handle_push_action(
             crate::pxs::net::run_ssh_sender(host, src, path, threshold, checksum, ignores).await?;
         }
         RemoteEndpoint::Stdio => {
-            crate::pxs::net::run_stdio_sender(src, threshold, checksum, ignores).await?;
+            crate::pxs::net::run_stdio_sender(src, threshold, checksum, ignores, false).await?;
         }
         RemoteEndpoint::Tcp(addr) => {
             eprintln!(
@@ -94,59 +94,85 @@ async fn handle_pull_action(
 async fn handle_local_sync(
     src: &Path,
     dst: &Path,
-    threshold: f32,
-    checksum: bool,
-    dry_run: bool,
-    fsync: bool,
-    ignores: &[String],
+    options: sync::SyncOptions,
 ) -> Result<HandleOutcome> {
-    info!(
-        "src: {:?}, dst: {:?}, threshold: {:?}, checksum: {checksum}, dry_run: {dry_run}, fsync: {fsync}, ignores: {:?}",
-        &src, &dst, threshold, ignores
-    );
+    if !options.quiet {
+        info!(
+            "src: {:?}, dst: {:?}, threshold: {:?}, checksum: {}, dry_run: {}, delete: {}, fsync: {}, ignores: {:?}",
+            &src,
+            &dst,
+            options.threshold,
+            options.checksum,
+            options.dry_run,
+            options.delete,
+            options.fsync,
+            options.ignores
+        );
+    }
 
-    let src_meta = tokio::fs::metadata(src).await?;
+    let src_meta = tokio::fs::metadata(src)
+        .await
+        .with_context(|| format!("failed to read source metadata for `{}`", src.display()))?;
 
     if src_meta.is_dir() {
-        anyhow::ensure!(
-            !dst.exists() || dst.is_dir(),
-            "destination must be a directory when source is a directory: {}",
-            dst.display()
-        );
-        eprintln!(
-            "Syncing directory from {} to {}",
-            src.display(),
-            dst.display()
-        );
-        sync::sync_dir(src, dst, threshold, checksum, dry_run, ignores, fsync).await?;
+        if !options.quiet {
+            eprintln!(
+                "Syncing directory from {} to {}",
+                src.display(),
+                dst.display()
+            );
+        }
+        let stats = sync::sync_dir(src, dst, &options).await?;
+        if !options.quiet {
+            let percentage = format_updated_block_percentage(stats);
+            eprintln!(
+                "Summary: {}/{} blocks updated ({percentage}%)",
+                stats.updated_blocks, stats.total_blocks
+            );
+        }
         return Ok(HandleOutcome::PrintCompletion);
     }
 
+    anyhow::ensure!(
+        !options.delete,
+        "--delete is only supported when syncing directories"
+    );
+
     let dst = resolve_local_file_destination(src, dst)?;
 
-    if tools::should_skip_file(src, &dst, checksum).await? {
-        eprintln!("File {} is already up to date.", src.display());
+    if tools::should_skip_file(src, &dst, options.checksum).await? {
+        if !options.quiet {
+            eprintln!("File {} is already up to date.", src.display());
+        }
         return Ok(HandleOutcome::SkipCompletionMessage);
     }
 
-    if dry_run {
-        let src_size = tools::get_file_size(src).await?;
-        eprintln!("(dry-run) sync file: {} ({src_size} bytes)", src.display());
+    if options.dry_run {
+        if !options.quiet {
+            let src_size = tools::get_file_size(src).await?;
+            eprintln!("(dry-run) sync file: {} ({src_size} bytes)", src.display());
+        }
         return Ok(HandleOutcome::SkipCompletionMessage);
     }
 
-    eprintln!(
-        "Syncing changed blocks from {} to {}",
-        src.display(),
-        dst.display()
-    );
-    let full_copy = tools::should_use_full_copy(src, &dst, threshold).await?;
-    let stats = sync::sync_changed_blocks(src, &dst, full_copy, fsync).await?;
-    let percentage = format_updated_block_percentage(stats);
-    eprintln!(
-        "Summary: {}/{} blocks updated ({percentage}%)",
-        stats.updated_blocks, stats.total_blocks
-    );
+    if !options.quiet {
+        eprintln!(
+            "Syncing changed blocks from {} to {}",
+            src.display(),
+            dst.display()
+        );
+    }
+    let full_copy = tools::should_use_full_copy(src, &dst, options.threshold).await?;
+    let stats =
+        sync::sync_changed_blocks(src, &dst, full_copy, options.fsync, options.quiet).await?;
+
+    if !options.quiet {
+        let percentage = format_updated_block_percentage(stats);
+        eprintln!(
+            "Summary: {}/{} blocks updated ({percentage}%)",
+            stats.updated_blocks, stats.total_blocks
+        );
+    }
 
     Ok(HandleOutcome::PrintCompletion)
 }
@@ -158,6 +184,7 @@ async fn handle_local_sync(
 /// Returns an error if synchronization fails.
 #[instrument(skip(action))]
 pub async fn handle(action: Action) -> Result<()> {
+    let is_quiet: bool;
     let outcome = match action {
         Action::Sync {
             src,
@@ -165,16 +192,25 @@ pub async fn handle(action: Action) -> Result<()> {
             threshold,
             checksum,
             dry_run,
+            delete,
             fsync,
             ignores,
-        } => handle_local_sync(&src, &dst, threshold, checksum, dry_run, fsync, &ignores).await?,
+            quiet,
+        } => {
+            is_quiet = quiet;
+            let options =
+                sync::SyncOptions::new(threshold, checksum, dry_run, delete, ignores, fsync, quiet);
+            handle_local_sync(&src, &dst, options).await?
+        }
         Action::Push {
             endpoint,
             src,
             threshold,
             checksum,
             ignores,
+            quiet,
         } => {
+            is_quiet = quiet;
             handle_push_action(&endpoint, &src, threshold, checksum, &ignores).await?;
             HandleOutcome::PrintCompletion
         }
@@ -185,12 +221,22 @@ pub async fn handle(action: Action) -> Result<()> {
             checksum,
             fsync,
             ignores,
+            quiet,
         } => {
+            is_quiet = quiet;
             handle_pull_action(&endpoint, &dst, threshold, checksum, fsync, &ignores).await?;
             HandleOutcome::PrintCompletion
         }
-        Action::Listen { addr, dst, fsync } => {
-            eprintln!("Listening on {addr} for incoming sync to {}", dst.display());
+        Action::Listen {
+            addr,
+            dst,
+            fsync,
+            quiet,
+        } => {
+            is_quiet = quiet;
+            if !quiet {
+                eprintln!("Listening on {addr} for incoming sync to {}", dst.display());
+            }
             crate::pxs::net::run_receiver(&addr, &dst, fsync).await?;
             HandleOutcome::PrintCompletion
         }
@@ -200,14 +246,19 @@ pub async fn handle(action: Action) -> Result<()> {
             threshold,
             checksum,
             ignores,
+            quiet,
         } => {
-            eprintln!("Serving {} on {addr} (checksum: {checksum})", src.display());
+            is_quiet = quiet;
+            if !quiet {
+                eprintln!("Serving {} on {addr} (checksum: {checksum})", src.display());
+            }
             crate::pxs::net::run_sender_listener(&addr, &src, threshold, checksum, &ignores)
                 .await?;
             HandleOutcome::PrintCompletion
         }
-        Action::InternalStdioReceive { dst, fsync } => {
-            crate::pxs::net::run_stdio_receiver(&dst, fsync).await?;
+        Action::InternalStdioReceive { dst, fsync, quiet } => {
+            is_quiet = quiet;
+            crate::pxs::net::run_stdio_receiver(&dst, fsync, quiet).await?;
             HandleOutcome::PrintCompletion
         }
         Action::InternalStdioSend {
@@ -215,13 +266,15 @@ pub async fn handle(action: Action) -> Result<()> {
             threshold,
             checksum,
             ignores,
+            quiet,
         } => {
-            crate::pxs::net::run_stdio_sender(&src, threshold, checksum, &ignores).await?;
+            is_quiet = quiet;
+            crate::pxs::net::run_stdio_sender(&src, threshold, checksum, &ignores, quiet).await?;
             HandleOutcome::PrintCompletion
         }
     };
 
-    if matches!(outcome, HandleOutcome::PrintCompletion) {
+    if matches!(outcome, HandleOutcome::PrintCompletion) && !is_quiet {
         eprintln!("Synchronization complete");
     }
 
@@ -264,8 +317,10 @@ mod tests {
             threshold: 0.5,
             checksum: false,
             dry_run: false,
+            delete: false,
             fsync: false,
             ignores: Vec::new(),
+            quiet: false,
         })
         .await?;
 
@@ -275,7 +330,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_local_sync_rejects_directory_destination_file() -> anyhow::Result<()> {
+    async fn test_handle_local_sync_replaces_file_destination_with_directory() -> anyhow::Result<()>
+    {
         let dir = tempdir()?;
         let src_dir = dir.path().join("src");
         let dst_file = dir.path().join("dest.txt");
@@ -283,25 +339,55 @@ mod tests {
         fs::write(src_dir.join("nested/file.txt"), "payload")?;
         fs::write(&dst_file, "existing file")?;
 
-        let error = match handle(Action::Sync {
+        handle(Action::Sync {
             src: src_dir,
-            dst: dst_file,
+            dst: dst_file.clone(),
             threshold: 0.5,
             checksum: false,
             dry_run: false,
+            delete: false,
             fsync: false,
             ignores: Vec::new(),
+            quiet: false,
+        })
+        .await?;
+
+        assert!(dst_file.is_dir());
+        assert_eq!(
+            fs::read_to_string(dst_file.join("nested/file.txt"))?,
+            "payload"
+        );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_local_sync_rejects_delete_for_single_file() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("source.txt");
+        let dst = dir.path().join("dest.txt");
+        fs::write(&src, "payload")?;
+
+        let error = match handle(Action::Sync {
+            src,
+            dst,
+            threshold: 0.5,
+            checksum: false,
+            dry_run: false,
+            delete: true,
+            fsync: false,
+            ignores: Vec::new(),
+            quiet: false,
         })
         .await
         {
-            Ok(()) => anyhow::bail!("directory sync should reject file destination"),
+            Ok(()) => anyhow::bail!("single-file sync should reject --delete"),
             Err(error) => error,
         };
 
         assert!(
             error
                 .to_string()
-                .contains("destination must be a directory when source is a directory")
+                .contains("--delete is only supported when syncing directories")
         );
         Ok(())
     }

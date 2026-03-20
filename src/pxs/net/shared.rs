@@ -11,6 +11,13 @@ const MAX_RETRIES: u32 = 3;
 const INITIAL_BACKOFF_MS: u64 = 500;
 const PROTOCOL_MAJOR: &str = env!("CARGO_PKG_VERSION_MAJOR");
 const PROTOCOL_MINOR: &str = env!("CARGO_PKG_VERSION_MINOR");
+const CAPABILITIES_PREFIX: &str = "caps=";
+const LZ4_BLOCKS_CAPABILITY: &str = "lz4-blocks";
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) struct TransportFeatures {
+    pub(crate) lz4_block_messages: bool,
+}
 
 pub(crate) async fn connect_with_retry(addr: &str) -> anyhow::Result<TcpStream> {
     let mut last_error = None;
@@ -65,6 +72,46 @@ pub(crate) fn validate_peer_version(version: &str) -> anyhow::Result<()> {
     )
 }
 
+fn parse_peer_capabilities(version: &str) -> TransportFeatures {
+    let Some((_, metadata)) = version.split_once('+') else {
+        return TransportFeatures::default();
+    };
+    let Some(raw_capabilities) = metadata.strip_prefix(CAPABILITIES_PREFIX) else {
+        return TransportFeatures::default();
+    };
+
+    let mut features = TransportFeatures::default();
+    for capability in raw_capabilities.split(',') {
+        if capability == LZ4_BLOCKS_CAPABILITY {
+            features.lz4_block_messages = true;
+        }
+    }
+
+    features
+}
+
+pub(crate) fn local_handshake_version(advertise_lz4: bool) -> String {
+    if advertise_lz4 {
+        return format!(
+            "{}+{CAPABILITIES_PREFIX}{LZ4_BLOCKS_CAPABILITY}",
+            env!("CARGO_PKG_VERSION")
+        );
+    }
+
+    env!("CARGO_PKG_VERSION").to_string()
+}
+
+pub(crate) fn negotiate_transport_features(
+    peer_version: &str,
+    allow_lz4: bool,
+) -> anyhow::Result<TransportFeatures> {
+    validate_peer_version(peer_version)?;
+    let peer_features = parse_peer_capabilities(peer_version);
+    Ok(TransportFeatures {
+        lz4_block_messages: allow_lz4 && peer_features.lz4_block_messages,
+    })
+}
+
 /// Read next frame with idle timeout.
 pub(crate) async fn recv_with_timeout<T, C>(
     framed: &mut Framed<T, C>,
@@ -73,7 +120,17 @@ where
     T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
     C: tokio_util::codec::Decoder<Item = Vec<u8>, Error = anyhow::Error>,
 {
-    let timeout = Duration::from_secs(IDLE_TIMEOUT_SECS);
+    recv_with_timeout_for(framed, Duration::from_secs(IDLE_TIMEOUT_SECS)).await
+}
+
+async fn recv_with_timeout_for<T, C>(
+    framed: &mut Framed<T, C>,
+    timeout: Duration,
+) -> anyhow::Result<Option<Vec<u8>>>
+where
+    T: tokio::io::AsyncRead + tokio::io::AsyncWrite + Unpin,
+    C: tokio_util::codec::Decoder<Item = Vec<u8>, Error = anyhow::Error>,
+{
     match tokio::time::timeout(timeout, framed.next()).await {
         Ok(Some(Ok(bytes))) => Ok(Some(bytes)),
         Ok(Some(Err(e))) => Err(e),
@@ -102,4 +159,57 @@ pub(crate) fn block_bytes(blocks: &[Block]) -> anyhow::Result<u64> {
             .checked_add(block_len)
             .ok_or_else(|| anyhow::anyhow!("block byte count overflow"))
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        TransportFeatures, local_handshake_version, negotiate_transport_features,
+        recv_with_timeout_for,
+    };
+    use crate::pxs::net::PxsCodec;
+    use std::time::Duration;
+    use tokio_util::codec::Framed;
+
+    #[tokio::test]
+    async fn test_recv_with_timeout_for_errors_on_idle_stream() -> anyhow::Result<()> {
+        let (_writer, reader) = tokio::io::duplex(64);
+        let mut framed = Framed::new(reader, PxsCodec);
+
+        let Err(err) = recv_with_timeout_for(&mut framed, Duration::from_millis(10)).await else {
+            anyhow::bail!("expected idle timeout");
+        };
+
+        assert!(err.to_string().contains("Connection idle timeout"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_local_handshake_version_advertises_lz4_capability() {
+        let version = local_handshake_version(true);
+        assert!(version.contains("+caps=lz4-blocks"));
+    }
+
+    #[test]
+    fn test_negotiate_transport_features_enables_lz4_when_both_peers_support_it()
+    -> anyhow::Result<()> {
+        let features = negotiate_transport_features(
+            &format!("{}+caps=lz4-blocks", env!("CARGO_PKG_VERSION")),
+            true,
+        )?;
+        assert_eq!(
+            features,
+            TransportFeatures {
+                lz4_block_messages: true,
+            }
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn test_negotiate_transport_features_disables_lz4_without_peer_support() -> anyhow::Result<()> {
+        let features = negotiate_transport_features(env!("CARGO_PKG_VERSION"), true)?;
+        assert_eq!(features, TransportFeatures::default());
+        Ok(())
+    }
 }

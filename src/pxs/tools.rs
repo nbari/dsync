@@ -1,12 +1,15 @@
 use crate::pxs::sync;
-use anyhow::Result;
+use anyhow::{Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
 use std::{
     io,
     ops::Range,
     os::unix::fs::{FileExt, MetadataExt},
     path::{Path, PathBuf},
-    sync::atomic::{AtomicU64, Ordering},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
 };
 use tokio::fs;
 
@@ -14,15 +17,199 @@ use tokio::fs;
 use std::os::fd::AsRawFd;
 
 const THRESHOLD_SCALE: u128 = 1_000_000;
-const MAX_PARALLELISM: usize = 64;
+/// The maximum number of concurrent workers allowed across the system.
+pub const MAX_PARALLELISM: usize = 64;
 static STAGED_FILE_COUNTER: AtomicU64 = AtomicU64::new(0);
 const PROGRESS_CHARS: &str = "█▉▊▋▌▍▎▏  ·";
 const PROGRESS_TICK_STRINGS: &[&str] = &["◜", "◠", "◝", "◞", "◡", "◟", "·"];
 
-fn clamped_parallelism() -> usize {
+#[cfg(test)]
+struct OptimizationProbeState {
+    safe_mmap_successes: AtomicU64,
+    sender_mmap_read_hits: AtomicU64,
+    staged_seed_invocations: AtomicU64,
+    staged_clone_attempts: AtomicU64,
+    staged_clone_successes: AtomicU64,
+    staged_copy_fallbacks: AtomicU64,
+}
+
+#[cfg(test)]
+impl OptimizationProbeState {
+    const fn new() -> Self {
+        Self {
+            safe_mmap_successes: AtomicU64::new(0),
+            sender_mmap_read_hits: AtomicU64::new(0),
+            staged_seed_invocations: AtomicU64::new(0),
+            staged_clone_attempts: AtomicU64::new(0),
+            staged_clone_successes: AtomicU64::new(0),
+            staged_copy_fallbacks: AtomicU64::new(0),
+        }
+    }
+
+    fn snapshot(&self) -> test_support::OptimizationProbeSnapshot {
+        test_support::OptimizationProbeSnapshot {
+            safe_mmap_successes: self.safe_mmap_successes.load(Ordering::Relaxed),
+            sender_mmap_read_hits: self.sender_mmap_read_hits.load(Ordering::Relaxed),
+            staged_seed_invocations: self.staged_seed_invocations.load(Ordering::Relaxed),
+            staged_clone_attempts: self.staged_clone_attempts.load(Ordering::Relaxed),
+            staged_clone_successes: self.staged_clone_successes.load(Ordering::Relaxed),
+            staged_copy_fallbacks: self.staged_copy_fallbacks.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[cfg(test)]
+static ACTIVE_OPTIMIZATION_PROBE: std::sync::Mutex<Option<Arc<OptimizationProbeState>>> =
+    std::sync::Mutex::new(None);
+
+#[cfg(test)]
+fn with_optimization_probe<F>(record: F)
+where
+    F: FnOnce(&OptimizationProbeState),
+{
+    let probe = ACTIVE_OPTIMIZATION_PROBE
+        .lock()
+        .ok()
+        .and_then(|guard| guard.clone());
+    if let Some(probe) = probe {
+        record(probe.as_ref());
+    }
+}
+
+#[cfg(test)]
+fn record_safe_mmap_success() {
+    with_optimization_probe(|probe| {
+        probe.safe_mmap_successes.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[cfg(test)]
+pub(crate) fn record_sender_mmap_read_hit() {
+    with_optimization_probe(|probe| {
+        probe.sender_mmap_read_hits.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[cfg(not(test))]
+pub(crate) fn record_sender_mmap_read_hit() {}
+
+#[cfg(test)]
+fn record_staged_seed_invocation() {
+    with_optimization_probe(|probe| {
+        probe
+            .staged_seed_invocations
+            .fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[cfg(test)]
+fn record_staged_clone_attempt() {
+    with_optimization_probe(|probe| {
+        probe.staged_clone_attempts.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[cfg(test)]
+fn record_staged_clone_success() {
+    with_optimization_probe(|probe| {
+        probe.staged_clone_successes.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+#[cfg(test)]
+fn record_staged_copy_fallback() {
+    with_optimization_probe(|probe| {
+        probe.staged_copy_fallbacks.fetch_add(1, Ordering::Relaxed);
+    });
+}
+
+/// Hidden testing hooks for observing optimization paths without changing runtime behavior.
+#[cfg(test)]
+#[doc(hidden)]
+pub mod test_support {
+    use super::{ACTIVE_OPTIMIZATION_PROBE, Arc, OptimizationProbeState};
+
+    /// Snapshot of optimization events recorded while a probe is active.
+    #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+    pub struct OptimizationProbeSnapshot {
+        /// Number of successful `safe_mmap` creations.
+        pub safe_mmap_successes: u64,
+        /// Number of sender-side block reads served from an mmap.
+        pub sender_mmap_read_hits: u64,
+        /// Number of staged-file preparations seeded from an existing destination.
+        pub staged_seed_invocations: u64,
+        /// Number of filesystem clone attempts made while seeding a staged file.
+        pub staged_clone_attempts: u64,
+        /// Number of successful filesystem clones while seeding a staged file.
+        pub staged_clone_successes: u64,
+        /// Number of byte-copy fallbacks used after staged-file clone was unavailable.
+        pub staged_copy_fallbacks: u64,
+    }
+
+    /// Guard that records optimization events during a scoped test.
+    pub struct OptimizationProbe {
+        state: Arc<OptimizationProbeState>,
+    }
+
+    impl OptimizationProbe {
+        /// Start recording optimization events until this guard is dropped.
+        ///
+        /// # Errors
+        ///
+        /// Returns an error if another optimization probe is already active in
+        /// the current process.
+        pub fn start() -> anyhow::Result<Self> {
+            let state = Arc::new(OptimizationProbeState::new());
+            let mut active = ACTIVE_OPTIMIZATION_PROBE
+                .lock()
+                .map_err(|_| anyhow::anyhow!("optimization probe mutex poisoned"))?;
+            if active.is_some() {
+                anyhow::bail!("optimization probe already active");
+            }
+            *active = Some(Arc::clone(&state));
+            Ok(Self { state })
+        }
+
+        /// Return the counters collected by this probe so far.
+        #[must_use]
+        pub fn snapshot(&self) -> OptimizationProbeSnapshot {
+            self.state.snapshot()
+        }
+    }
+
+    impl Drop for OptimizationProbe {
+        fn drop(&mut self) {
+            if let Ok(mut active) = ACTIVE_OPTIMIZATION_PROBE.lock() {
+                *active = None;
+            }
+        }
+    }
+}
+
+#[cfg(not(test))]
+fn record_safe_mmap_success() {}
+
+#[cfg(not(test))]
+fn record_staged_seed_invocation() {}
+
+#[cfg(all(not(test), target_os = "linux"))]
+fn record_staged_clone_attempt() {}
+
+#[cfg(all(not(test), target_os = "linux"))]
+fn record_staged_clone_success() {}
+
+#[cfg(not(test))]
+fn record_staged_copy_fallback() {}
+
+/// Return the number of logical CPU cores, clamped to a safe maximum.
+///
+/// If the OS fails to report the number of cores, it defaults to 1 (single-threaded)
+/// to ensure safety on restricted or legacy systems.
+#[must_use]
+pub fn clamped_parallelism() -> usize {
     std::thread::available_parallelism()
         .map(std::num::NonZeroUsize::get)
-        .unwrap_or(8)
+        .unwrap_or(1)
         .min(MAX_PARALLELISM)
 }
 
@@ -64,7 +251,42 @@ fn mmap_range(offset: u64, block_size: usize, len: usize) -> anyhow::Result<Opti
 /// file is truncated or modified, the process won't receive SIGBUS - it will just
 /// see stale data, which is acceptable for read-only comparison and hashing.
 pub(crate) fn safe_mmap(file: &std::fs::File) -> Result<memmap2::Mmap, std::io::Error> {
-    unsafe { memmap2::MmapOptions::new().map_copy_read_only(file) }
+    let mmap = unsafe { memmap2::MmapOptions::new().map_copy_read_only(file) };
+    if mmap.is_ok() {
+        record_safe_mmap_success();
+    }
+    mmap
+}
+
+/// A trait to allow abstracting over different progress bar types (e.g. standard vs combined)
+pub trait ProgressBarLike: Send + Sync {
+    fn inc(&self, delta: u64);
+}
+
+impl ProgressBarLike for ProgressBar {
+    fn inc(&self, delta: u64) {
+        self.inc(delta);
+    }
+}
+
+/// A combined progress bar that increments two progress bars simultaneously.
+pub struct CombinedProgressBar {
+    pub main: Arc<ProgressBar>,
+    pub sub: Arc<ProgressBar>,
+}
+
+impl CombinedProgressBar {
+    #[must_use]
+    pub fn new(main: Arc<ProgressBar>, sub: Arc<ProgressBar>) -> Self {
+        Self { main, sub }
+    }
+}
+
+impl ProgressBarLike for CombinedProgressBar {
+    fn inc(&self, delta: u64) {
+        self.main.inc(delta);
+        self.sub.inc(delta);
+    }
 }
 
 /// Best-effort clone of `src` into `dst`.
@@ -73,9 +295,11 @@ pub(crate) fn safe_mmap(file: &std::fs::File) -> Result<memmap2::Mmap, std::io::
 /// filesystems. Other platforms fall back to an ordinary copy.
 #[cfg(target_os = "linux")]
 fn try_clone_existing_file(src: &std::fs::File, dst: &std::fs::File) -> io::Result<bool> {
+    record_staged_clone_attempt();
     let clone_result =
         unsafe { nix::libc::ioctl(dst.as_raw_fd(), nix::libc::FICLONE as _, src.as_raw_fd()) };
     if clone_result == 0 {
+        record_staged_clone_success();
         return Ok(true);
     }
 
@@ -107,6 +331,7 @@ fn try_clone_existing_file(_src: &std::fs::File, _dst: &std::fs::File) -> io::Re
 /// If the destination disappears between scheduling and staging, the caller can
 /// continue as a full copy from an empty file.
 fn seed_staged_file(staged: &mut std::fs::File, final_path: &Path) -> anyhow::Result<()> {
+    record_staged_seed_invocation();
     let mut existing = match std::fs::File::open(final_path) {
         Ok(file) => file,
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
@@ -117,15 +342,17 @@ fn seed_staged_file(staged: &mut std::fs::File, final_path: &Path) -> anyhow::Re
         return Ok(());
     }
 
+    record_staged_copy_fallback();
     std::io::copy(&mut existing, staged)?;
     Ok(())
 }
 
 /// Temporary file used to stage an atomic replacement of a destination path.
-#[derive(Debug, Clone)]
+#[derive(Debug)]
 pub struct StagedFile {
     final_path: PathBuf,
     staged_path: PathBuf,
+    committed: bool,
 }
 
 impl StagedFile {
@@ -162,6 +389,7 @@ impl StagedFile {
                     return Ok(Self {
                         final_path: final_path.to_path_buf(),
                         staged_path,
+                        committed: false,
                     });
                 }
                 Err(e) => return Err(e.into()),
@@ -185,14 +413,21 @@ impl StagedFile {
     /// Returns an error if the staging file cannot be created or initialized.
     pub fn prepare(&self, size: u64, seed_from_existing: bool) -> anyhow::Result<()> {
         if let Some(parent) = self.staged_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("failed to create directory {}", parent.display()))?;
         }
 
         let mut staged = std::fs::OpenOptions::new()
             .read(true)
             .write(true)
             .create_new(true)
-            .open(&self.staged_path)?;
+            .open(&self.staged_path)
+            .with_context(|| {
+                format!(
+                    "failed to create staged file {}",
+                    self.staged_path.display()
+                )
+            })?;
 
         if seed_from_existing {
             seed_staged_file(&mut staged, &self.final_path)?;
@@ -208,7 +443,7 @@ impl StagedFile {
     /// # Errors
     ///
     /// Returns an error if the final path cannot be replaced.
-    pub fn commit(&self) -> anyhow::Result<()> {
+    pub fn commit(&mut self) -> anyhow::Result<()> {
         if let Ok(meta) = std::fs::symlink_metadata(&self.final_path)
             && meta.file_type().is_dir()
         {
@@ -216,6 +451,7 @@ impl StagedFile {
         }
 
         std::fs::rename(&self.staged_path, &self.final_path)?;
+        self.committed = true;
         Ok(())
     }
 
@@ -230,6 +466,14 @@ impl StagedFile {
             Ok(()) => Ok(()),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
             Err(e) => Err(e.into()),
+        }
+    }
+}
+
+impl Drop for StagedFile {
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = self.cleanup();
         }
     }
 }
@@ -631,4 +875,121 @@ pub async fn blake3_file_hash(path: &Path) -> anyhow::Result<[u8; 32]> {
         Ok(*hasher.finalize().as_bytes())
     })
     .await?
+}
+
+#[cfg(test)]
+mod tests {
+    use super::test_support::OptimizationProbe;
+    use crate::pxs::net::{self, PxsCodec};
+    use std::{path::PathBuf, sync::OnceLock, time::Duration};
+    use tempfile::tempdir;
+    use tokio::{net::TcpListener, sync::Mutex, task::JoinHandle};
+    use tokio_util::codec::Framed;
+
+    fn optimization_test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    async fn spawn_receiver(
+        dst_root: PathBuf,
+    ) -> anyhow::Result<(std::net::SocketAddr, JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0").await?;
+        let addr = listener.local_addr()?;
+
+        let receiver_handle = tokio::spawn(async move {
+            while let Ok((stream, _)) = listener.accept().await {
+                let dst_root_clone = dst_root.clone();
+                tokio::spawn(async move {
+                    let mut framed = Framed::new(stream, PxsCodec);
+                    if let Err(error) =
+                        net::handle_client(&mut framed, &dst_root_clone, false, false).await
+                    {
+                        eprintln!("Receiver error: {error}");
+                    }
+                });
+            }
+        });
+
+        Ok((addr, receiver_handle))
+    }
+
+    async fn stop_receiver(receiver_handle: JoinHandle<()>) {
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        receiver_handle.abort();
+    }
+
+    #[tokio::test]
+    async fn test_network_transfer_uses_mmap_source_reads() -> anyhow::Result<()> {
+        let _guard = optimization_test_lock().lock().await;
+
+        let dir = tempdir()?;
+        let src_dir = dir.path().join("src");
+        let dst_dir = dir.path().join("dst");
+        std::fs::create_dir_all(&src_dir)?;
+        std::fs::create_dir_all(&dst_dir)?;
+
+        let file_path = src_dir.join("large.bin");
+        let content = (0..(4 * 128 * 1024))
+            .map(|index| {
+                u8::try_from(index % 251).map_err(|e: std::num::TryFromIntError| anyhow::anyhow!(e))
+            })
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        std::fs::write(&file_path, &content)?;
+
+        let probe = OptimizationProbe::start()?;
+        let (addr, receiver_handle) = spawn_receiver(dst_dir.clone()).await?;
+
+        net::run_sender(&addr.to_string(), &src_dir, 0.5, false, &[]).await?;
+        stop_receiver(receiver_handle).await;
+
+        let snapshot = probe.snapshot();
+        assert!(snapshot.safe_mmap_successes > 0);
+        assert!(snapshot.sender_mmap_read_hits > 0);
+        assert_eq!(std::fs::read(dst_dir.join("large.bin"))?, content);
+
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_network_delta_seeding_attempts_staged_clone() -> anyhow::Result<()> {
+        let _guard = optimization_test_lock().lock().await;
+
+        let dir = tempdir()?;
+        let src_dir = dir.path().join("src");
+        let dst_dir = dir.path().join("dst");
+        std::fs::create_dir_all(&src_dir)?;
+        std::fs::create_dir_all(&dst_dir)?;
+
+        let src_file = src_dir.join("delta.bin");
+        let dst_file = dst_dir.join("delta.bin");
+        let src_content = b"abcdefghZZZZmnop".to_vec();
+        let dst_content = b"abcdefghYYYYmnop".to_vec();
+        std::fs::write(&src_file, &src_content)?;
+        std::fs::write(&dst_file, &dst_content)?;
+
+        filetime::set_file_times(
+            &dst_file,
+            filetime::FileTime::from_unix_time(1_000_000_000, 0),
+            filetime::FileTime::from_unix_time(1_000_000_000, 0),
+        )?;
+
+        let probe = OptimizationProbe::start()?;
+        let (addr, receiver_handle) = spawn_receiver(dst_dir.clone()).await?;
+
+        net::run_sender(&addr.to_string(), &src_dir, 0.5, false, &[]).await?;
+        stop_receiver(receiver_handle).await;
+
+        let snapshot = probe.snapshot();
+        assert!(snapshot.staged_seed_invocations > 0);
+        #[cfg(target_os = "linux")]
+        assert!(snapshot.staged_clone_attempts > 0);
+        assert!(
+            snapshot.staged_clone_successes > 0 || snapshot.staged_copy_fallbacks > 0,
+            "expected clone success or copy fallback while seeding staged file"
+        );
+        assert_eq!(std::fs::read(&dst_file)?, src_content);
+
+        Ok(())
+    }
 }

@@ -23,8 +23,10 @@ pub enum Action {
         threshold: f32,
         checksum: bool,
         dry_run: bool,
+        delete: bool,
         fsync: bool,
         ignores: Vec<String>,
+        quiet: bool,
     },
     /// Push a local source path to a remote endpoint.
     Push {
@@ -33,6 +35,7 @@ pub enum Action {
         threshold: f32,
         checksum: bool,
         ignores: Vec<String>,
+        quiet: bool,
     },
     /// Pull from a remote endpoint into a local destination path.
     Pull {
@@ -42,12 +45,14 @@ pub enum Action {
         checksum: bool,
         fsync: bool,
         ignores: Vec<String>,
+        quiet: bool,
     },
     /// Listen for incoming push operations and write them into `dst`.
     Listen {
         addr: String,
         dst: PathBuf,
         fsync: bool,
+        quiet: bool,
     },
     /// Serve `src` to remote pull clients.
     Serve {
@@ -56,14 +61,20 @@ pub enum Action {
         threshold: f32,
         checksum: bool,
         ignores: Vec<String>,
+        quiet: bool,
     },
     /// Internal stdio receiver used by SSH tunneling.
-    InternalStdioReceive { dst: PathBuf, fsync: bool },
+    InternalStdioReceive {
+        dst: PathBuf,
+        fsync: bool,
+        quiet: bool,
+    },
     /// Internal stdio sender used by SSH tunneling.
     InternalStdioSend {
         src: PathBuf,
         threshold: f32,
         checksum: bool,
         ignores: Vec<String>,
+        quiet: bool,
     },
 }

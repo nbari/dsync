@@ -1,8 +1,10 @@
 use filetime::{FileTime, set_file_times};
-use pxs::pxs::{sync, tools};
+use pxs::pxs::sync::{self, SyncOptions};
+use pxs::pxs::tools;
 use std::{
     fs,
     io::{Seek, SeekFrom, Write},
+    process::Command,
 };
 use tempfile::tempdir;
 
@@ -23,7 +25,7 @@ async fn test_incremental_sync_only_writes_changed_blocks() -> anyhow::Result<()
     fs::write(&src_path, &initial_data)?;
 
     // 2. Initial sync (Full copy)
-    let stats = sync::sync_changed_blocks(&src_path, &dst_path, true, false).await?;
+    let stats = sync::sync_changed_blocks(&src_path, &dst_path, true, false, false).await?;
     assert_eq!(stats.updated_blocks, 80); // 10MB / 128KB = 80 blocks
 
     // Verify initial sync
@@ -40,7 +42,7 @@ async fn test_incremental_sync_only_writes_changed_blocks() -> anyhow::Result<()
     drop(file);
 
     // 4. Perform incremental sync
-    let stats = sync::sync_changed_blocks(&src_path, &dst_path, false, false).await?;
+    let stats = sync::sync_changed_blocks(&src_path, &dst_path, false, false, false).await?;
     assert_eq!(stats.updated_blocks, 1); // Only 1 block should be updated
     assert_eq!(stats.total_blocks, 80);
 
@@ -68,7 +70,8 @@ async fn test_sync_dir_recursive() -> anyhow::Result<()> {
     fs::write(src_dir.join("file1.txt"), "hello")?;
     fs::write(src_dir.join("subdir/file2.txt"), "world")?;
 
-    sync::sync_dir(&src_dir, &dst_dir, 1.0, false, false, &[], false).await?;
+    let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, false);
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
 
     assert!(dst_dir.join("file1.txt").exists());
     assert!(dst_dir.join("subdir/file2.txt").exists());
@@ -154,7 +157,8 @@ async fn test_symlink_over_directory() -> anyhow::Result<()> {
         std::os::unix::fs::symlink("target", src_dir.join("link"))?;
     }
 
-    sync::sync_dir(&src_dir, &dst_dir, 1.0, false, false, &[], false).await?;
+    let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, false);
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
 
     let dst_link = dst_dir.join("link");
     assert!(dst_link.is_symlink());
@@ -177,11 +181,510 @@ async fn test_file_replaces_directory() -> anyhow::Result<()> {
 
     fs::write(src_dir.join("entry"), "replacement")?;
 
-    sync::sync_dir(&src_dir, &dst_dir, 1.0, false, false, &[], false).await?;
+    let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, false);
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
 
     let dst_entry = dst_dir.join("entry");
     assert!(dst_entry.is_file());
     assert_eq!(fs::read_to_string(&dst_entry)?, "replacement");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_directory_replaces_file() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    fs::create_dir_all(&src_dir)?;
+    fs::create_dir_all(&dst_dir)?;
+
+    fs::create_dir_all(src_dir.join("subdir"))?;
+    fs::write(src_dir.join("subdir/file.txt"), "hello")?;
+
+    fs::write(dst_dir.join("subdir"), "i am a file")?;
+
+    let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, false);
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
+
+    assert!(dst_dir.join("subdir").is_dir());
+    assert_eq!(
+        fs::read_to_string(dst_dir.join("subdir/file.txt"))?,
+        "hello"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_dir_root_is_file() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_root = dir.path().join("dst");
+
+    fs::create_dir_all(&src_dir)?;
+    fs::write(src_dir.join("file.txt"), "hello")?;
+
+    fs::write(&dst_root, "i am a file")?;
+
+    let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, false);
+    sync::sync_dir(&src_dir, &dst_root, &options).await?;
+
+    assert!(dst_root.is_dir());
+    assert_eq!(fs::read_to_string(dst_root.join("file.txt"))?, "hello");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_dir_with_delete() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+
+    fs::create_dir_all(src_dir.join("kept"))?;
+    fs::write(src_dir.join("kept/file.txt"), "content")?;
+
+    fs::create_dir_all(dst_dir.join("extraneous"))?;
+    fs::write(dst_dir.join("extraneous/old.txt"), "delete me")?;
+    fs::write(dst_dir.join("stale.txt"), "delete me too")?;
+
+    // Run sync WITHOUT delete first - extraneous files should remain
+    let options_no_delete = SyncOptions::new(1.0, false, false, false, Vec::new(), false, false);
+    sync::sync_dir(&src_dir, &dst_dir, &options_no_delete).await?;
+    assert!(dst_dir.join("extraneous/old.txt").exists());
+    assert!(dst_dir.join("stale.txt").exists());
+
+    // Run sync WITH delete
+    let options_delete = SyncOptions::new(1.0, false, false, true, Vec::new(), false, false);
+    sync::sync_dir(&src_dir, &dst_dir, &options_delete).await?;
+    assert!(!dst_dir.join("extraneous").exists());
+    assert!(!dst_dir.join("stale.txt").exists());
+    assert!(dst_dir.join("kept/file.txt").exists());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_dir_with_delete_and_ignore() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+
+    fs::create_dir_all(&src_dir)?;
+    fs::create_dir_all(&dst_dir)?;
+    fs::write(src_dir.join("file.txt"), "content")?;
+
+    fs::write(dst_dir.join("ignored.tmp"), "do not delete")?;
+    fs::write(dst_dir.join("stale.txt"), "delete me")?;
+
+    // Run sync WITH delete and ignore
+    let options = SyncOptions::new(
+        1.0,
+        false,
+        false,
+        true,
+        vec!["*.tmp".to_string()],
+        false,
+        false,
+    );
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
+
+    assert!(dst_dir.join("ignored.tmp").exists());
+    assert!(!dst_dir.join("stale.txt").exists());
+    assert!(dst_dir.join("file.txt").exists());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_with_checksum_force() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_path = dir.path().join("src.txt");
+    let dst_path = dir.path().join("dst.txt");
+
+    // 1. Create identical mtime/size but different content
+    fs::write(&src_path, "source content")?;
+    fs::write(&dst_path, "destin content")?; // Same length
+    let time = FileTime::from_unix_time(1_700_000_000, 0);
+    set_file_times(&src_path, time, time)?;
+    set_file_times(&dst_path, time, time)?;
+
+    // 2. Sync WITHOUT checksum - should skip (metadata matches)
+    let skip = tools::should_skip_file(&src_path, &dst_path, false).await?;
+    assert!(skip);
+
+    // 3. Sync WITH checksum - should detect difference
+    // should_skip_file returns false if checksum is true and sizes match
+    let skip = tools::should_skip_file(&src_path, &dst_path, true).await?;
+    assert!(!skip);
+
+    let stats = sync::sync_changed_blocks(&src_path, &dst_path, false, false, false).await?;
+    assert_eq!(stats.updated_blocks, 1);
+    assert_eq!(fs::read_to_string(&dst_path)?, "source content");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_subcommand_with_checksum_updates_matching_metadata_file() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_path = dir.path().join("src.bin");
+    let dst_path = dir.path().join("dst.bin");
+
+    let src_bytes = b"source payload 123";
+    let dst_bytes = b"destin payload 123"; // same length, different content
+    fs::write(&src_path, src_bytes)?;
+    fs::write(&dst_path, dst_bytes)?;
+
+    let time = FileTime::from_unix_time(1_700_000_000, 0);
+    set_file_times(&src_path, time, time)?;
+    set_file_times(&dst_path, time, time)?;
+
+    let output = Command::new(env!("CARGO_BIN_EXE_pxs"))
+        .arg("sync")
+        .arg(&src_path)
+        .arg(&dst_path)
+        .arg("--checksum")
+        .arg("--quiet")
+        .output()?;
+
+    assert!(
+        output.status.success(),
+        "sync failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let src_hash = tools::blake3_file_hash(&src_path).await?;
+    let dst_hash = tools::blake3_file_hash(&dst_path).await?;
+    assert_eq!(src_hash, dst_hash);
+    assert_eq!(fs::read(&dst_path)?, src_bytes);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_dry_run_safety() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    fs::create_dir_all(&src_dir)?;
+    fs::write(src_dir.join("new_file.txt"), "content")?;
+
+    // Run sync with dry-run
+    let options = SyncOptions::new(1.0, false, true, false, Vec::new(), false, false);
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
+
+    // Destination should NOT be created
+    assert!(!dst_dir.exists());
+
+    // Create destination but with a file that would be replaced
+    fs::create_dir_all(&dst_dir)?;
+    fs::write(dst_dir.join("new_file.txt"), "old content")?;
+
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
+    // File should NOT be updated
+    assert_eq!(
+        fs::read_to_string(dst_dir.join("new_file.txt"))?,
+        "old content"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_with_exclude_from_file() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    let exclude_file = dir.path().join("excludes.txt");
+
+    fs::create_dir_all(&src_dir)?;
+    fs::write(src_dir.join("keep.txt"), "keep")?;
+    fs::write(src_dir.join("skip.log"), "skip")?;
+    fs::write(&exclude_file, "*.log\n")?;
+
+    // In a real CLI run, the dispatcher parses the file.
+    // Here we simulate that by passing the parsed patterns.
+    let patterns = vec!["*.log".to_string()];
+    let options = SyncOptions::new(1.0, false, false, false, patterns, false, false);
+
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
+
+    assert!(dst_dir.join("keep.txt").exists());
+    assert!(!dst_dir.join("skip.log").exists());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_broken_symlink_at_destination() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    fs::create_dir_all(&src_dir)?;
+    fs::create_dir_all(&dst_dir)?;
+
+    // 1. Create a real file in source
+    let src_file = src_dir.join("conflict.txt");
+    fs::write(&src_file, "new data")?;
+
+    // 2. Create a broken symlink in destination
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("missing_target", dst_dir.join("conflict.txt"))?;
+    }
+
+    // 3. Sync - should replace broken symlink with real file
+    let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, false);
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
+
+    let dst_file = dst_dir.join("conflict.txt");
+    assert!(dst_file.is_file());
+    assert!(!dst_file.is_symlink());
+    assert_eq!(fs::read_to_string(&dst_file)?, "new data");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_source_broken_symlink() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    fs::create_dir_all(&src_dir)?;
+
+    // 1. Create a broken symlink in source
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("non_existent", src_dir.join("broken_link"))?;
+    }
+
+    // 2. Sync
+    let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, false);
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
+
+    // 3. Destination should have the same broken symlink
+    let dst_link = dst_dir.join("broken_link");
+    assert!(dst_link.is_symlink());
+    assert_eq!(
+        fs::read_link(&dst_link)?,
+        std::path::PathBuf::from("non_existent")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_delete_preserves_broken_symlink_match() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    fs::create_dir_all(&src_dir)?;
+    fs::create_dir_all(&dst_dir)?;
+
+    // 1. Source has a broken symlink
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink("away", src_dir.join("item"))?;
+    }
+
+    // 2. Destination has a matching file (or symlink)
+    fs::write(dst_dir.join("item"), "stale content")?;
+
+    // 3. Sync WITH delete.
+    // It should NOT delete 'item' from destination because it exists in source (as a broken symlink)
+    // Instead it should REPLACE it with the symlink.
+    let options = SyncOptions::new(1.0, false, false, true, Vec::new(), false, false);
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
+
+    let dst_item = dst_dir.join("item");
+    assert!(dst_item.is_symlink());
+    assert!(dst_item.exists() || dst_item.is_symlink()); // exists() is false if broken, but metadata works
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_replace_symlink_dir_with_real_dir() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    fs::create_dir_all(&src_dir)?;
+    fs::create_dir_all(&dst_dir)?;
+
+    // 1. Source has a real directory
+    fs::create_dir_all(src_dir.join("logs"))?;
+    fs::write(src_dir.join("logs/current.log"), "data")?;
+
+    // 2. Destination has a symlink where that directory should be
+    #[cfg(unix)]
+    {
+        let other_dir = dir.path().join("other");
+        fs::create_dir_all(&other_dir)?;
+        std::os::unix::fs::symlink(&other_dir, dst_dir.join("logs"))?;
+    }
+
+    // 3. Sync - should remove symlink and create real directory
+    let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, false);
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
+
+    let dst_logs = dst_dir.join("logs");
+    assert!(dst_logs.is_dir());
+    assert!(!dst_logs.is_symlink());
+    assert!(dst_logs.join("current.log").exists());
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_quiet_mode_smoke() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    fs::create_dir_all(&src_dir)?;
+    fs::write(src_dir.join("file.txt"), "content")?;
+
+    // Just verify it runs without error
+    let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, true);
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
+
+    assert!(dst_dir.join("file.txt").exists());
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_sync_skips_fifo_without_failing() -> anyhow::Result<()> {
+    use nix::sys::stat::Mode;
+    use nix::unistd::mkfifo;
+
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    fs::create_dir_all(&src_dir)?;
+
+    fs::write(src_dir.join("file.txt"), "content")?;
+    let fifo_path = src_dir.join("queue.fifo");
+    mkfifo(&fifo_path, Mode::S_IRUSR | Mode::S_IWUSR)?;
+
+    let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, false);
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
+
+    assert_eq!(fs::read_to_string(dst_dir.join("file.txt"))?, "content");
+    assert!(!dst_dir.join("queue.fifo").exists());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(unix)]
+async fn test_sync_skips_unix_socket_without_failing() -> anyhow::Result<()> {
+    use std::os::unix::net::UnixListener;
+
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    fs::create_dir_all(&src_dir)?;
+
+    fs::write(src_dir.join("file.txt"), "content")?;
+    let socket_path = src_dir.join("service.sock");
+    let _listener = UnixListener::bind(&socket_path)?;
+
+    let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, false);
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
+
+    assert_eq!(fs::read_to_string(dst_dir.join("file.txt"))?, "content");
+    assert!(!dst_dir.join("service.sock").exists());
+
+    Ok(())
+}
+
+#[tokio::test]
+#[cfg(target_os = "linux")]
+async fn test_sync_non_utf8_filename() -> anyhow::Result<()> {
+    use std::os::unix::ffi::OsStringExt;
+
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    fs::create_dir_all(&src_dir)?;
+
+    // Create a filename with invalid UTF-8 (0xFF is not valid UTF-8)
+    let bad_filename = std::ffi::OsString::from_vec(vec![0xFF, 0xFE, 0xFD]);
+    let src_file = src_dir.join(&bad_filename);
+    fs::write(&src_file, "raw bytes")?;
+
+    let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, false);
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
+
+    let dst_file = dst_dir.join(&bad_filename);
+    assert!(dst_file.exists());
+    assert_eq!(fs::read_to_string(&dst_file)?, "raw bytes");
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_staged_file_cleanup_on_error() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    fs::create_dir_all(&src_dir)?;
+    fs::create_dir_all(&dst_dir)?;
+
+    let src_file = src_dir.join("broken.bin");
+    fs::write(&src_file, "some data")?;
+
+    // Create a scenario where sync fails - e.g. destination parent is suddenly removed or made read-only
+    // Actually, a simpler way is to test the drop behavior directly in a small scope
+    {
+        let dst_path = dst_dir.join("target.bin");
+        let staged = pxs::pxs::tools::StagedFile::new(&dst_path)?;
+        staged.prepare(10, false)?;
+        let staged_path = staged.path().to_path_buf();
+        assert!(staged_path.exists());
+        // Scope ends, staged is dropped without commit()
+    }
+
+    // Verify temp file is gone
+    let entries: Vec<_> = fs::read_dir(&dst_dir)?.collect();
+    for entry in entries {
+        let name = entry?.file_name().to_string_lossy().into_owned();
+        assert!(!name.contains(".pxs.") || !name.contains(".tmp"));
+    }
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_stats_aggregation() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    fs::create_dir_all(&src_dir)?;
+    fs::create_dir_all(&dst_dir)?;
+
+    // 1. One updated file (8 blocks)
+    let file1 = src_dir.join("file1.bin");
+    fs::write(&file1, vec![0u8; 1024 * 1024])?; // 1MB = 8 blocks
+
+    // 2. One skipped file
+    let file2 = src_dir.join("file2.bin");
+    fs::write(&file2, "content")?;
+    fs::write(dst_dir.join("file2.bin"), "content")?;
+    let time = FileTime::from_unix_time(1_700_000_000, 0);
+    set_file_times(&file2, time, time)?;
+    set_file_times(dst_dir.join("file2.bin"), time, time)?;
+
+    let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, false);
+    let stats = sync::sync_dir(&src_dir, &dst_dir, &options).await?;
+
+    // 1MB file = 8 blocks (128KB each)
+    // small file = 1 block
+    // Total should be 9 blocks, 8 updated (from file1), 0 updated (from file2)
+    assert_eq!(stats.updated_blocks, 8);
+    assert_eq!(stats.total_blocks, 9);
 
     Ok(())
 }

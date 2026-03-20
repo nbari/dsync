@@ -14,13 +14,20 @@ permissions:
   contents: read
 
 jobs:
-  test:
+  quality:
+    name: Quality Checks
     uses: ./.github/workflows/test.yml
 
+  coverage:
+    name: Coverage
+    uses: ./.github/workflows/coverage.yml
+    secrets:
+      CODECOV_TOKEN: ${{ secrets.CODECOV_TOKEN }}
+
   build:
-    name: Build
+    name: Build (${{ matrix.build }})
     runs-on: ${{ matrix.os }}
-    needs: test
+    needs: quality
 
     strategy:
       fail-fast: false
@@ -70,5 +77,5 @@ jobs:
 
       - name: Verify built binary
         shell: bash
-        run: |
+        run: |-
           test -x "target/${{ matrix.target }}/release/pxs"

@@ -3,10 +3,20 @@
 ## Project Structure & Module Organization
 - `src/bin/pxs.rs`: CLI entrypoint.
 - `src/cli/`: argument parsing, command dispatch, startup, and telemetry.
-- `src/pxs/`: sync engine modules:
-  - `sync.rs` (local block sync),
-  - `net.rs` (protocol + remote transfer),
-  - `tools.rs` (shared helpers/utilities).
+- `src/pxs/`: sync engine root module.
+- `src/pxs/sync/`: local sync logic split by responsibility:
+  - `mod.rs` (public sync API and shared sync types),
+  - `dir.rs` (directory traversal and recursive sync),
+  - `file.rs` (block-level file synchronization),
+  - `meta.rs` (metadata application and hashing helpers),
+  - `delete.rs` (deletion handling).
+- `src/pxs/net/`: network protocol and remote transfer logic:
+  - `mod.rs` (public net API and exports),
+  - `protocol.rs` (wire message definitions and serialization),
+  - `codec.rs` (transport framing),
+  - `sender.rs` / `receiver.rs` (transfer endpoints),
+  - `tasks.rs`, `shared.rs`, `path.rs` (supporting network utilities).
+- `src/pxs/tools.rs`: shared helpers/utilities used across sync and net.
 - `tests/`: integration-style tests (`sync_test.rs`, `net_test.rs`).
 - `.github/workflows/`: CI for tests and deploy.
 - Benchmark helpers: `benchmark.sh`, `local_pxs_vs_rsync.sh`, `remote_pxs_vs_rsync.sh`.
@@ -28,7 +38,7 @@
 - File/module names `snake_case`; types `UpperCamelCase`; constants `SCREAMING_SNAKE_CASE`.
 - Group imports from the same crate/namespace (for example, `use std::{...};`) rather than many single-line imports.
 - Keep functions small; prefer explicit structs over loose maps; use builder-style constructors for configs where appropriate.
-- Keep modules focused: protocol flow in `net.rs`, reusable logic in `tools.rs`.
+- Keep modules focused: local sync flow in `src/pxs/sync/`, protocol and transport flow in `src/pxs/net/`, and reusable helpers in `src/pxs/tools.rs`.
 
 ## Testing Guidelines
 - Prefer integration tests in `tests/` with descriptive `test_*` names.
@@ -46,3 +56,10 @@
   - risk/behavior impact (especially data correctness),
   - commands run (`fmt`, `clippy`, `test`),
   - benchmark evidence for performance claims.
+
+## AI Agent Workflow
+To ensure consistency and quality, all AI agents MUST follow these steps before concluding any task involving code changes:
+1. **Format Code**: Run `cargo fmt --all`.
+2. **Lint Code**: Run `cargo clippy --all-targets --all-features -- -D warnings`.
+3. **Verify Tests**: Run `cargo test --all-features`.
+4. **Self-Review**: Perform a final scan of the changes for any obvious errors or deviations from these guidelines.

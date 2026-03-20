@@ -6,7 +6,7 @@ cargo build --release
 DOCKER=${DOCKER:-podman}
 IMAGE="pxs-tcp-tree-test"
 NETWORK="pxs-tcp-tree-net"
-PORT="7979"
+PORT="8080"
 
 TREE_MTIME=1000000001
 NESTED_MTIME=1000000002

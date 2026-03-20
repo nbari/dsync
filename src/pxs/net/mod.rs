@@ -4,6 +4,7 @@ mod protocol;
 mod receiver;
 mod sender;
 mod shared;
+mod ssh;
 mod tasks;
 
 const BLOCK_SIZE: u64 = 128 * 1024;

@@ -986,6 +986,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5e5032e24019045c762d3c0f28f5b6b8bbf38563a65908389bf7978758920897"
 
 [[package]]
+name = "lz4_flex"
+version = "0.11.6"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "373f5eceeeab7925e0c1098212f2fbc4d416adec9d35051a6ab251e824c1854a"
+dependencies = [
+ "twox-hash",
+]
+
+[[package]]
 name = "matchers"
 version = "0.2.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1313,7 +1322,7 @@ dependencies = [
 
 [[package]]
 name = "pxs"
-version = "0.4.0"
+version = "0.4.1"
 dependencies = [
  "anyhow",
  "blake3",
@@ -1325,6 +1334,7 @@ dependencies = [
  "futures-util",
  "ignore",
  "indicatif",
+ "lz4_flex",
  "memchr",
  "memmap2",
  "nix",

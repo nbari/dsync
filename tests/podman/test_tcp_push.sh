@@ -10,7 +10,7 @@ DOCKER=${DOCKER:-podman}
 # Image and network
 IMAGE="pxs-tcp-test"
 NETWORK="pxs-tcp-net"
-PORT="7878"
+PORT="8080"
 
 WORK_DIR=$(mktemp -d)
 SRC_DIR="$WORK_DIR/src"

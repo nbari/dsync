@@ -3,10 +3,12 @@ use futures_util::{SinkExt, StreamExt};
 use indicatif::ProgressBar;
 use pxs::pxs::net::{self, Block, FileMetadata, Message};
 use pxs::pxs::tools;
-use std::{path::PathBuf, sync::Arc, time::Duration};
+use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
+use tokio::process::Command;
 use tokio::task::JoinHandle;
+use tokio::{io::AsyncReadExt, io::AsyncWriteExt};
 use tokio_util::codec::{Decoder, Encoder, Framed};
 
 async fn spawn_receiver(
@@ -34,6 +36,135 @@ async fn spawn_receiver(
 async fn stop_receiver(receiver_handle: JoinHandle<()>) {
     tokio::time::sleep(Duration::from_millis(100)).await;
     receiver_handle.abort();
+}
+
+fn spawn_stdio_receiver(
+    bin: &str,
+    dst_root: &std::path::Path,
+) -> anyhow::Result<tokio::process::Child> {
+    let mut receiver = Command::new(bin);
+    receiver
+        .arg("--quiet")
+        .arg("--stdio")
+        .arg("--destination")
+        .arg(dst_root)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    receiver.spawn().map_err(Into::into)
+}
+
+fn spawn_stdio_sender(
+    bin: &str,
+    src_root: &std::path::Path,
+    sender_args: &[&str],
+) -> anyhow::Result<tokio::process::Child> {
+    let mut sender = Command::new(bin);
+    sender
+        .arg("--quiet")
+        .arg("--stdio")
+        .arg("--sender")
+        .arg("--source")
+        .arg(src_root)
+        .args(sender_args)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    sender.spawn().map_err(Into::into)
+}
+
+async fn collect_stdio_stderr(
+    stderr: tokio::process::ChildStderr,
+) -> Result<Vec<u8>, std::io::Error> {
+    let mut stderr = stderr;
+    let mut buffer = Vec::new();
+    stderr.read_to_end(&mut buffer).await?;
+    Ok(buffer)
+}
+
+async fn run_stdio_sync(
+    src_root: &std::path::Path,
+    dst_root: &std::path::Path,
+    sender_args: &[&str],
+) -> anyhow::Result<()> {
+    let bin = env!("CARGO_BIN_EXE_pxs");
+    let mut receiver = spawn_stdio_receiver(bin, dst_root)?;
+    let mut sender = spawn_stdio_sender(bin, src_root, sender_args)?;
+
+    let mut receiver_stdin = receiver
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing receiver stdin"))?;
+    let mut receiver_stdout = receiver
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing receiver stdout"))?;
+    let receiver_stderr = receiver
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing receiver stderr"))?;
+
+    let mut sender_stdin = sender
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing sender stdin"))?;
+    let mut sender_stdout = sender
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing sender stdout"))?;
+    let sender_stderr = sender
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing sender stderr"))?;
+
+    let sender_to_receiver = tokio::spawn(async move {
+        tokio::io::copy(&mut sender_stdout, &mut receiver_stdin).await?;
+        receiver_stdin.shutdown().await?;
+        Ok::<(), anyhow::Error>(())
+    });
+    let receiver_to_sender = tokio::spawn(async move {
+        tokio::io::copy(&mut receiver_stdout, &mut sender_stdin).await?;
+        sender_stdin.shutdown().await?;
+        Ok::<(), anyhow::Error>(())
+    });
+    let sender_stderr_task = tokio::spawn(collect_stdio_stderr(sender_stderr));
+    let receiver_stderr_task = tokio::spawn(collect_stdio_stderr(receiver_stderr));
+
+    let (sender_status, receiver_status, sender_err, receiver_err) =
+        tokio::time::timeout(Duration::from_secs(10), async {
+            sender_to_receiver.await??;
+            receiver_to_sender.await??;
+            let sender_status = sender.wait().await?;
+            let receiver_status = receiver.wait().await?;
+            let sender_err = sender_stderr_task.await??;
+            let receiver_err = receiver_stderr_task.await??;
+            Ok::<_, anyhow::Error>((sender_status, receiver_status, sender_err, receiver_err))
+        })
+        .await
+        .map_err(|_| anyhow::anyhow!("stdio sync timed out"))??;
+
+    anyhow::ensure!(
+        sender_status.success(),
+        "stdio sender failed: {}",
+        String::from_utf8_lossy(&sender_err)
+    );
+    anyhow::ensure!(
+        receiver_status.success(),
+        "stdio receiver failed: {}",
+        String::from_utf8_lossy(&receiver_err)
+    );
+    anyhow::ensure!(
+        sender_err.is_empty(),
+        "quiet stdio sender emitted stderr: {}",
+        String::from_utf8_lossy(&sender_err)
+    );
+    anyhow::ensure!(
+        receiver_err.is_empty(),
+        "quiet stdio receiver emitted stderr: {}",
+        String::from_utf8_lossy(&receiver_err)
+    );
+
+    Ok(())
 }
 
 fn make_patterned_bytes(len: usize, step: usize, offset: usize) -> anyhow::Result<Vec<u8>> {
@@ -103,6 +234,64 @@ fn test_codec_uses_pxs_magic() -> anyhow::Result<()> {
     Ok(())
 }
 
+#[test]
+fn test_codec_rejects_oversized_frame() -> anyhow::Result<()> {
+    let mut frame = BytesMut::new();
+    frame.extend_from_slice(b"PXS1");
+    frame.extend_from_slice(&u32::MAX.to_be_bytes());
+
+    let mut codec = net::PxsCodec;
+    let err = match codec.decode(&mut frame) {
+        Ok(Some(_)) => anyhow::bail!("expected oversized frame rejection"),
+        Ok(None) => anyhow::bail!("expected oversized frame error"),
+        Err(err) => err,
+    };
+
+    assert!(err.to_string().contains("Frame size too big"));
+    Ok(())
+}
+
+#[test]
+fn test_codec_returns_none_for_incomplete_payload() -> anyhow::Result<()> {
+    let msg = Message::EndOfFile {
+        path: String::from("test.bin"),
+    };
+    let encoded = net::serialize_message(&msg)?;
+
+    let mut codec = net::PxsCodec;
+    let mut frame = BytesMut::new();
+    codec.encode(encoded, &mut frame)?;
+    let truncated_len = frame.len().saturating_sub(1);
+    frame.truncate(truncated_len);
+
+    assert!(codec.decode(&mut frame)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn test_codec_resynchronizes_after_garbage_prefix() -> anyhow::Result<()> {
+    let msg = Message::EndOfFile {
+        path: String::from("test.bin"),
+    };
+    let encoded = net::serialize_message(&msg)?;
+
+    let mut codec = net::PxsCodec;
+    let mut frame = BytesMut::from(&b"garbage"[..]);
+    codec.encode(encoded, &mut frame)?;
+
+    let decoded = codec
+        .decode(&mut frame)?
+        .ok_or_else(|| anyhow::anyhow!("missing decoded frame after resync"))?;
+    let decoded = net::deserialize_message(&decoded)?;
+
+    match decoded {
+        Message::EndOfFile { path } => assert_eq!(path, "test.bin"),
+        other => anyhow::bail!("expected EndOfFile, got {other:?}"),
+    }
+
+    Ok(())
+}
+
 #[tokio::test]
 async fn test_full_network_sync_simulation() -> anyhow::Result<()> {
     let dir = tempdir()?;
@@ -133,6 +322,80 @@ async fn test_full_network_sync_simulation() -> anyhow::Result<()> {
     assert!(dst_file_path.exists());
     let dst_content = std::fs::read(dst_file_path)?;
     assert_eq!(content, dst_content);
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_raw_tcp_lz4_transfer_succeeds() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    std::fs::create_dir_all(&src_dir)?;
+    std::fs::create_dir_all(&dst_dir)?;
+
+    let file_path = src_dir.join("compressible.bin");
+    let content = vec![b'A'; 4 * 128 * 1024];
+    std::fs::write(&file_path, &content)?;
+
+    let probe = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = probe.local_addr()?;
+    drop(probe);
+
+    let addr_string = addr.to_string();
+    let dst_dir_clone = dst_dir.clone();
+    let receiver_task = tokio::spawn(async move {
+        let _ = net::run_receiver(&addr_string, &dst_dir_clone, false).await;
+    });
+    tokio::time::sleep(Duration::from_millis(100)).await;
+
+    net::run_sender(&addr.to_string(), &src_dir, 0.5, false, &[]).await?;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    receiver_task.abort();
+    let _ = receiver_task.await;
+
+    assert_eq!(std::fs::read(dst_dir.join("compressible.bin"))?, content);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_stdio_transport_end_to_end_sync() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    std::fs::create_dir_all(src_dir.join("nested"))?;
+    std::fs::create_dir_all(&dst_dir)?;
+
+    let large_content = make_patterned_bytes(2 * 1024 * 1024 + 31, 17, 9)?;
+    std::fs::write(src_dir.join("large.bin"), &large_content)?;
+    std::fs::write(src_dir.join("nested/keep.txt"), "nested payload")?;
+    std::fs::write(src_dir.join("ignored.tmp"), "ignored")?;
+
+    let src_same = src_dir.join("same.bin");
+    let dst_same = dst_dir.join("same.bin");
+    let src_bytes = b"source payload 123";
+    let dst_bytes = b"destin payload 123";
+    std::fs::write(&src_same, src_bytes)?;
+    std::fs::write(&dst_same, dst_bytes)?;
+
+    let time = filetime::FileTime::from_unix_time(1_700_000_000, 0);
+    filetime::set_file_times(&src_same, time, time)?;
+    filetime::set_file_times(&dst_same, time, time)?;
+
+    run_stdio_sync(
+        &src_dir,
+        &dst_dir,
+        &["--threshold", "0.5", "--checksum", "--ignore", "*.tmp"],
+    )
+    .await?;
+
+    assert_eq!(std::fs::read(dst_dir.join("large.bin"))?, large_content);
+    assert_eq!(
+        std::fs::read_to_string(dst_dir.join("nested/keep.txt"))?,
+        "nested payload"
+    );
+    assert_eq!(std::fs::read(dst_dir.join("same.bin"))?, src_bytes);
+    assert!(!dst_dir.join("ignored.tmp").exists());
 
     Ok(())
 }
@@ -398,6 +661,31 @@ async fn test_network_sync_file_replaces_directory() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn test_network_sync_directory_replaces_file() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    std::fs::create_dir_all(src_dir.join("entry"))?;
+    std::fs::create_dir_all(&dst_dir)?;
+    std::fs::write(src_dir.join("entry/file.txt"), "replacement")?;
+    std::fs::write(dst_dir.join("entry"), "stale")?;
+
+    let (addr, receiver_handle) = spawn_receiver(dst_dir.clone()).await?;
+
+    net::run_sender(&addr.to_string(), &src_dir, 0.5, true, &[]).await?;
+    stop_receiver(receiver_handle).await;
+
+    let dst_entry = dst_dir.join("entry");
+    assert!(dst_entry.is_dir());
+    assert_eq!(
+        std::fs::read_to_string(dst_entry.join("file.txt"))?,
+        "replacement"
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_network_sync_broken_symlink_replaces_directory() -> anyhow::Result<()> {
     use std::os::unix::fs::MetadataExt;
 
@@ -598,6 +886,112 @@ async fn test_handle_client_rejects_unsafe_protocol_paths() -> anyhow::Result<()
 }
 
 #[tokio::test]
+async fn test_handle_client_rejects_duplicate_handshake() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let (client, server) = tokio::io::duplex(4096);
+    let dst_root = dir.path().to_path_buf();
+
+    let handle = tokio::spawn(async move {
+        let mut framed = Framed::new(server, net::PxsCodec);
+        net::handle_client(&mut framed, &dst_root, false, false).await
+    });
+
+    let mut sender = Framed::new(client, net::PxsCodec);
+    sender
+        .send(net::serialize_message(&Message::Handshake {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })?)
+        .await?;
+    let _ = sender.next().await;
+    sender
+        .send(net::serialize_message(&Message::Handshake {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })?)
+        .await?;
+    drop(sender);
+
+    let err = match handle.await? {
+        Ok(()) => anyhow::bail!("expected duplicate handshake rejection"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("duplicate handshake"));
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_handle_client_rejects_receiver_side_request_message() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let (client, server) = tokio::io::duplex(4096);
+    let dst_root = dir.path().to_path_buf();
+
+    let handle = tokio::spawn(async move {
+        let mut framed = Framed::new(server, net::PxsCodec);
+        net::handle_client(&mut framed, &dst_root, false, false).await
+    });
+
+    let mut sender = Framed::new(client, net::PxsCodec);
+    sender
+        .send(net::serialize_message(&Message::Handshake {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })?)
+        .await?;
+    let _ = sender.next().await;
+    sender
+        .send(net::serialize_message(&Message::RequestFullCopy {
+            path: String::from("file.bin"),
+        })?)
+        .await?;
+    drop(sender);
+
+    let err = match handle.await? {
+        Ok(()) => anyhow::bail!("expected invalid receiver-side request rejection"),
+        Err(err) => err,
+    };
+    assert!(
+        err.to_string()
+            .contains("unexpected receiver-side protocol message")
+    );
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_handle_client_rejects_orphan_verify_checksum() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let (client, server) = tokio::io::duplex(4096);
+    let dst_root = dir.path().to_path_buf();
+
+    let handle = tokio::spawn(async move {
+        let mut framed = Framed::new(server, net::PxsCodec);
+        net::handle_client(&mut framed, &dst_root, false, false).await
+    });
+
+    let mut sender = Framed::new(client, net::PxsCodec);
+    sender
+        .send(net::serialize_message(&Message::Handshake {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })?)
+        .await?;
+    let _ = sender.next().await;
+    sender
+        .send(net::serialize_message(&Message::VerifyChecksum {
+            path: String::from("missing.bin"),
+            hash: *blake3::hash(b"payload").as_bytes(),
+        })?)
+        .await?;
+    drop(sender);
+
+    let err = match handle.await? {
+        Ok(()) => anyhow::bail!("expected orphan checksum verification rejection"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("missing pending file"));
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_run_sender_rejects_incompatible_handshake_response() -> anyhow::Result<()> {
     let dir = tempdir()?;
     let src_dir = dir.path().join("src");
@@ -630,6 +1024,44 @@ async fn test_run_sender_rejects_incompatible_handshake_response() -> anyhow::Re
         Err(err) => err,
     };
     assert!(err.to_string().contains("incompatible peer version"));
+    server_task.await??;
+
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_run_sender_rejects_invalid_handshake_version_format() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    std::fs::create_dir_all(&src_dir)?;
+    std::fs::write(src_dir.join("file.txt"), "content")?;
+
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let server_task = tokio::spawn(async move {
+        let (stream, _) = listener.accept().await?;
+        let mut framed = Framed::new(stream, net::PxsCodec);
+        let handshake = framed
+            .next()
+            .await
+            .ok_or_else(|| anyhow::anyhow!("missing handshake"))??;
+        match net::deserialize_message(&handshake)? {
+            Message::Handshake { .. } => {}
+            other => anyhow::bail!("expected handshake, got {other:?}"),
+        }
+        framed
+            .send(net::serialize_message(&Message::Handshake {
+                version: String::from("invalid-version"),
+            })?)
+            .await?;
+        Ok::<(), anyhow::Error>(())
+    });
+
+    let err = match net::run_sender(&addr.to_string(), &src_dir, 0.5, false, &[]).await {
+        Ok(()) => anyhow::bail!("expected invalid handshake format error"),
+        Err(err) => err,
+    };
+    assert!(err.to_string().contains("invalid peer version format"));
     server_task.await??;
 
     Ok(())
