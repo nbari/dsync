@@ -13,6 +13,22 @@ const MAX_FRAME_SIZE: usize = 64 * 1024 * 1024;
 /// Idle timeout for network operations (5 minutes)
 const IDLE_TIMEOUT_SECS: u64 = 300;
 
+/// Feature flags for remote network synchronization.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RemoteFeatureOptions {
+    pub checksum: bool,
+    pub delete: bool,
+    pub fsync: bool,
+}
+
+/// Options shared by SSH sender/receiver flows.
+#[derive(Clone, Copy, Debug)]
+pub struct RemoteSyncOptions<'a> {
+    pub threshold: f32,
+    pub features: RemoteFeatureOptions,
+    pub ignores: &'a [String],
+}
+
 pub use codec::PxsCodec;
 pub use protocol::{
     Block, FileMetadata, Message, apply_file_metadata, deserialize_message, serialize_message,

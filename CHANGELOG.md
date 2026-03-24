@@ -2,6 +2,35 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.4.2] - 2026-03-24
+
+### Fixed
+
+- **Critical Security Fix**: Fixed a symlink traversal vulnerability in the network receiver where a malicious sender could cause the receiver to follow a symlink and truncate an out-of-scope file during metadata application.
+- Hardened destination path validation so local sync and the network receiver now reject symlinked destination roots and symlinked parent path components instead of writing through them.
+- Fixed a crash during synchronization when an existing broken symlink was present at the destination path.
+- Fixed a durability issue where the `--fsync` flag was ignored when pushing files over an SSH connection; the flag is now correctly forwarded to the remote receiver, and raw TCP push now propagates the same durability setting to the receiver.
+- Fixed SSH remote sync so `push --delete` and `pull --delete` now converge the destination tree by deleting extraneous entries after an explicit end-of-sync acknowledgment instead of leaving stale files behind.
+- Fixed receiver-side completion handling so raw TCP push reports non-file control-path failures and rejects premature `SyncComplete` messages while transfer state is still pending.
+- Fixed checksum-state handling so `VerifyChecksum` is only accepted for an active transfer, and checksum negotiation now falls back safely if the destination changes during `RequestHashes` to `BlockHashes`.
+- Updated `safe_mmap` documentation to accurately reflect that while `MAP_PRIVATE` protects against in-place data modifications, it does not prevent `SIGBUS` if the underlying file is externally truncated.
+
+### Changed
+
+- Optimized `--checksum` mode for network transfers: the receiver now avoids creating a temporary staging file and cloning data if the destination file already matches the source size and BLAKE3 hash.
+- Hardened replacement semantics for file, directory, and symlink transitions so conflicting destinations are installed with rollback-safe helpers instead of delete-then-create behavior.
+- Expanded `--fsync` durability coverage beyond file writes so committed directory installs, symlink installs, and final directory metadata application are durably synchronized before completion is acknowledged.
+- Hardened the public single-file sync API so direct library callers receive the same symlink-ancestor destination protection as the CLI.
+
+### Notes
+
+- SSH remote mirror mode now supports `--delete` for `push` and `pull`, with receiver-side cleanup completed before success is reported.
+- Raw TCP and public stdio flows still reject remote `--delete`.
+- Local `sync --delete` safely removes extra entries, including leaf symlinks, without following their targets. Its deletions are not yet crash-durable under `--fsync`; only committed create/replace paths, SSH remote delete finalization, and final metadata application currently receive durability syncing.
+- The bundled `sync.sh` PGDATA migration workflow now uses repeated SSH `push` passes plus `pg_backup_start()` / `pg_backup_stop()`, and it currently defaults to speed-first transfers without `--fsync`.
+- PostgreSQL tablespaces under `pg_tblspc` are preserved as symlinks; the destination host must already provide valid tablespace targets for that workflow.
+- `pxs` still does not provide full `rsync -aHAXx` parity for the bundled PGDATA script. Hard-link preservation remains the documented parity gap.
+
 ## [0.4.1] - 2026-03-20
 
 ### Added

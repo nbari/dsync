@@ -62,6 +62,8 @@ Windows is **not supported**.
 
 For network and `--stdio` transports, `pxs` uses normalized relative POSIX paths in the protocol. Incoming paths are rejected if they are absolute or contain `.` / `..` traversal components. Paths containing `\` are also rejected by the protocol, so filenames with backslashes are not supported for remote sync.
 
+`pxs` also rejects destination roots and destination parent components that are symlinks. This is intentional: the tool may replace or delete leaf symlink entries inside the destination tree, but it will not write through a symlinked destination root or a symlinked ancestor path component.
+
 ## How It Works
 
 ### Local Synchronization
@@ -179,6 +181,7 @@ Use this when the data starts on the local machine and you want to send it somew
 Typical use:
 - send local data to a remote receiver over raw TCP
 - push directly to a remote path over SSH
+- mirror a remote directory over SSH with `--delete`
 - benchmark sender-side transfer performance
 
 Examples:
@@ -195,6 +198,12 @@ pxs push ./backup.tar.zst db2@example.net:/srv/backups/backup.tar.zst
 
 # Push a directory tree over SSH
 pxs push /var/lib/postgresql/data db2@example.net:/srv/replica/data
+
+# Mirror a remote directory over SSH
+pxs push /var/lib/postgresql/data db2@example.net:/srv/replica/data --delete --fsync
+
+# Speed-first benchmark pass for PGDATA over SSH
+pxs push /var/lib/postgresql/data db2@example.net:/srv/replica/data --delete
 ```
 
 ### `pull`
@@ -204,6 +213,7 @@ Use this when the data should end up on the local machine.
 Typical use:
 - fetch data from a remote source into a local directory
 - pull a remote snapshot or `PGDATA` tree over SSH
+- mirror a local destination from an SSH source with `--delete`
 - run the receiving side locally while the remote side exposes data
 
 Examples:
@@ -217,9 +227,13 @@ pxs pull db1@example.net:/srv/export/base.tar.zst ./base.tar.zst
 
 # Pull a directory tree over SSH
 pxs pull db1@example.net:/var/lib/postgresql/data /srv/restore/data
+
+# Mirror a local directory from an SSH source
+pxs pull db1@example.net:/srv/export/pgdata /srv/restore/pgdata --delete --fsync
 ```
 
 For raw TCP endpoints, source-side options such as `--checksum`, `--threshold`, and `--ignore` belong on `serve`. For SSH endpoints, `pull` can pass those options through to the remote helper.
+Remote mirror deletion with `--delete` is currently supported for SSH `push` and `pull`. Raw TCP and manual stdio public flows reject `--delete`.
 
 ### `listen`
 Use this when this machine should receive incoming `push` operations.
@@ -238,6 +252,9 @@ pxs listen 0.0.0.0:8080 /srv/incoming
 # Receive into /new/data and fsync committed files
 pxs listen 0.0.0.0:8080 /new/data --fsync
 ```
+
+> [!IMPORTANT]
+> `listen` rejects destination roots that are symlinks, and it rejects incoming writes whose destination parent path would traverse a symlink under the configured root.
 
 ### `serve`
 Use this when this machine should expose a source tree for remote `pull` clients.
@@ -292,11 +309,37 @@ If you need custom SSH flags, you can still use the internal `--stdio` transport
 ssh user@remote-server "pxs --stdio --quiet --destination /path/to/new/data" < <(pxs push /path/to/old/data -)
 ```
 
+## PGDATA Migration Script
+
+This repository includes [`sync.sh`](./sync.sh), a PostgreSQL-focused migration helper built around repeated `pxs push` passes over SSH.
+
+- Run it from the source host where `PGDATA` lives.
+- It opens a local `psql` session, calls `pg_backup_start(...)`, performs repeated SSH push passes, calls `pg_backup_stop()`, and installs the resulting `backup_label` on the destination.
+- Local `PGDATA` files are not modified by the script, but the local PostgreSQL instance does temporarily enter and exit backup mode.
+- Filesystem mutations happen on the remote destination: directory creation, file replacement, mirror cleanup via `--delete`, and `backup_label` installation.
+- The bundled script is currently speed-first: it runs all `pxs push` passes with `--delete` and without `--fsync` so you can benchmark raw transfer speed first.
+- The script assumes the remote SSH session already runs as the intended PostgreSQL OS user or otherwise writes with the correct ownership for the destination cluster.
+
+> [!IMPORTANT]
+> PostgreSQL tablespaces appear as symlinks under `pg_tblspc`. `pxs` preserves those symlinks as symlinks; it does not provision or rewrite the referenced tablespace targets for you. The destination host must already provide valid tablespace target paths.
+
+## Safety Notes
+
+- Use SSH for untrusted networks. Raw TCP transports are intended for trusted networks and private links.
+- Destination roots and destination parent path components must be real directories, not symlinks.
+- Leaf symlink entries inside the destination tree are handled as entries: they can be replaced or removed without following their targets.
+- Replacement paths are staged to preserve an existing destination until the new object is ready to commit, including cross-type replacements such as file-to-directory and directory-to-symlink.
+- `--fsync` now covers committed file writes, directory installs, symlink installs, and final directory metadata application.
+- SSH `push --delete` and `pull --delete` now perform receiver-side mirror cleanup before completion is acknowledged.
+- Local `sync --delete` removes extra entries safely, including leaf symlinks, but its deletions are not yet crash-durable under `--fsync`.
+- PostgreSQL tablespaces under `pg_tblspc` are preserved as symlinks. The destination must already provide valid tablespace targets.
+
 ### Advanced Options
 
 *   **`--quiet` (-q)**: Suppress all progress bars and status messages.
 *   **`--checksum` (-c)**: Force a block-by-block hash comparison even if size/mtime match.
-*   **`--fsync` (-f)**: Force `fsync(2)` after file writes. Slower, but safer for durability-sensitive copies.
+*   **`--delete`**: Remove destination entries that are not present in the source tree. Supported for local `sync` and SSH `push`/`pull`. Raw TCP and public stdio flows currently reject it.
+*   **`--fsync` (-f)**: Force durable sync of committed file writes plus directory/symlink installs and final directory metadata. For SSH `push`/`pull --delete`, completion waits for delete finalization. Local `sync --delete` deletions are not yet crash-durable.
 *   **`--ignore` (-i)**: (Repeatable) Skip files/directories matching a glob pattern (e.g., `-i "*.log"`).
 *   **`--exclude-from` (-E)**: Read exclude patterns from a file (one pattern per line).
 *   **`--threshold` (-t)**: (Default: 0.5) If the destination file is less than X% the size of the source, perform a full copy instead of hashing.

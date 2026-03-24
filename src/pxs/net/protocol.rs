@@ -72,6 +72,10 @@ pub enum Message {
     Handshake {
         version: String,
     },
+    SessionOptions {
+        fsync: bool,
+        delete: bool,
+    },
     SyncStart {
         total_size: u64,
     },
@@ -132,6 +136,8 @@ pub enum Message {
     ChecksumMismatch {
         path: String,
     },
+    SyncComplete,
+    SyncCompleteAck,
     Error(String),
 }
 

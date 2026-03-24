@@ -19,7 +19,7 @@ fn build_remote_command(args: &[String]) -> String {
 
 /// Build the remote pxs command used for SSH push mode.
 #[must_use]
-pub(crate) fn build_ssh_push_command(dst_path: &str, ignores: &[String]) -> String {
+pub(crate) fn build_ssh_push_command(dst_path: &str, fsync: bool, ignores: &[String]) -> String {
     let mut args = vec![
         "pxs".to_string(),
         "--stdio".to_string(),
@@ -27,6 +27,9 @@ pub(crate) fn build_ssh_push_command(dst_path: &str, ignores: &[String]) -> Stri
         "--destination".to_string(),
         dst_path.to_string(),
     ];
+    if fsync {
+        args.push("--fsync".to_string());
+    }
     for pattern in ignores {
         args.push("--ignore".to_string());
         args.push(pattern.clone());
@@ -40,6 +43,7 @@ pub(crate) fn build_ssh_pull_command(
     src_path: &str,
     threshold: f32,
     checksum: bool,
+    delete: bool,
     ignores: &[String],
 ) -> String {
     let mut args = vec![
@@ -54,6 +58,9 @@ pub(crate) fn build_ssh_pull_command(
     ];
     if checksum {
         args.push("--checksum".to_string());
+    }
+    if delete {
+        args.push("--delete".to_string());
     }
     for pattern in ignores {
         args.push("--ignore".to_string());
@@ -163,6 +170,7 @@ mod tests {
     fn test_build_ssh_push_command_quotes_destination_and_ignores() {
         let command = build_ssh_push_command(
             "/tmp/dst path/it's here",
+            false,
             &[String::from("*.tmp"), String::from("quote'pattern")],
         );
         assert_eq!(
@@ -177,6 +185,7 @@ mod tests {
             "/tmp/src path/it's here",
             0.5,
             true,
+            false,
             &[String::from("space name")],
         );
         assert_eq!(
@@ -250,5 +259,23 @@ mod tests {
 
         assert!(err.to_string().contains("test process exited with error"));
         Ok(())
+    }
+
+    #[test]
+    fn test_build_ssh_push_command_includes_fsync() {
+        let command = build_ssh_push_command("/dst", true, &[]);
+        assert!(
+            command.contains("'--fsync'"),
+            "SSH PUSH REGRESSION: --fsync was not forwarded!"
+        );
+    }
+
+    #[test]
+    fn test_build_ssh_pull_command_includes_delete() {
+        let command = build_ssh_pull_command("/src", 0.5, false, true, &[]);
+        assert!(
+            command.contains("'--delete'"),
+            "SSH PULL REGRESSION: --delete was not forwarded!"
+        );
     }
 }

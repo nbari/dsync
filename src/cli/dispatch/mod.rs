@@ -107,6 +107,8 @@ fn handle_push(matches: &ArgMatches, quiet: bool) -> anyhow::Result<Action> {
         src: required_path(matches, "src")?,
         threshold: threshold(matches),
         checksum: matches.get_flag("checksum"),
+        delete: matches.get_flag("delete"),
+        fsync: matches.get_flag("fsync"),
         ignores: parse_ignores(matches),
         quiet,
     })
@@ -132,6 +134,7 @@ fn handle_pull(matches: &ArgMatches, quiet: bool) -> anyhow::Result<Action> {
         dst: required_path(matches, "dst")?,
         threshold,
         checksum,
+        delete: matches.get_flag("delete"),
         fsync: matches.get_flag("fsync"),
         ignores,
         quiet,
@@ -168,6 +171,7 @@ fn handle_internal_stdio(matches: &ArgMatches, quiet: bool) -> anyhow::Result<Ac
             src: required_path(matches, "source")?,
             threshold,
             checksum,
+            delete: matches.get_flag("delete"),
             ignores: parse_ignores(matches),
             quiet,
         });
@@ -176,6 +180,7 @@ fn handle_internal_stdio(matches: &ArgMatches, quiet: bool) -> anyhow::Result<Ac
     Ok(Action::InternalStdioReceive {
         dst: required_path(matches, "destination")?,
         fsync: matches.get_flag("fsync"),
+        ignores: parse_ignores(matches),
         quiet,
     })
 }
@@ -369,8 +374,10 @@ mod tests {
             &src_arg,
             "user@example:/srv/data",
             "--checksum",
+            "--delete",
             "--threshold",
             "0.75",
+            "--fsync",
         ])?;
 
         match action {
@@ -378,6 +385,8 @@ mod tests {
                 endpoint,
                 threshold,
                 checksum,
+                delete,
+                fsync,
                 ..
             } => {
                 assert_eq!(
@@ -389,6 +398,8 @@ mod tests {
                 );
                 assert_threshold(threshold, 0.75);
                 assert!(checksum);
+                assert!(delete);
+                assert!(fsync);
             }
             other => anyhow::bail!("expected Action::Push, got {other:?}"),
         }
@@ -451,6 +462,7 @@ mod tests {
             "0.8",
             "--ignore",
             "*.tmp",
+            "--delete",
             "--fsync",
         ])?;
 
@@ -459,6 +471,7 @@ mod tests {
                 endpoint,
                 threshold,
                 checksum,
+                delete,
                 fsync,
                 ignores,
                 ..
@@ -472,6 +485,7 @@ mod tests {
                 );
                 assert_threshold(threshold, 0.8);
                 assert!(checksum);
+                assert!(delete);
                 assert!(fsync);
                 assert_eq!(ignores, vec!["*.tmp"]);
             }
@@ -700,6 +714,7 @@ mod tests {
             "--threshold",
             "0.8",
             "--checksum",
+            "--delete",
             "--ignore",
             "*.tmp",
         ])?;
@@ -708,14 +723,41 @@ mod tests {
             Action::InternalStdioSend {
                 threshold,
                 checksum,
+                delete,
                 ignores,
                 ..
             } => {
                 assert_threshold(threshold, 0.8);
                 assert!(checksum);
+                assert!(delete);
                 assert_eq!(ignores, vec!["*.tmp"]);
             }
             other => anyhow::bail!("expected Action::InternalStdioSend, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_internal_stdio_receiver_parses_hidden_ignores() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let dst = dir.path().join("dst");
+        let dst_arg = dst.to_string_lossy().to_string();
+
+        let action = parse_action(&[
+            "pxs",
+            "--stdio",
+            "--destination",
+            &dst_arg,
+            "--ignore",
+            "*.tmp",
+        ])?;
+
+        match action {
+            Action::InternalStdioReceive { ignores, .. } => {
+                assert_eq!(ignores, vec!["*.tmp"]);
+            }
+            other => anyhow::bail!("expected Action::InternalStdioReceive, got {other:?}"),
         }
 
         Ok(())

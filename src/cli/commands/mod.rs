@@ -146,7 +146,7 @@ fn fsync_arg(hidden: bool) -> Arg {
     Arg::new("fsync")
         .short('f')
         .long("fsync")
-        .help("Force fsync after writing files")
+        .help("Force durable sync of committed files, directories, and symlinks")
         .long_help(FSYNC_LONG_HELP)
         .action(ArgAction::SetTrue)
         .hide(hidden)
@@ -217,7 +217,7 @@ fn addr_arg() -> Arg {
         .required(true)
 }
 
-fn internal_stdio_args() -> [Arg; 9] {
+fn internal_stdio_args() -> [Arg; 10] {
     [
         Arg::new("stdio")
             .long("stdio")
@@ -243,6 +243,7 @@ fn internal_stdio_args() -> [Arg; 9] {
             .value_name("DST"),
         threshold_arg(true),
         checksum_arg(true),
+        delete_arg(),
         fsync_arg(true),
         ignore_arg(true),
         exclude_from_arg(true),
@@ -273,6 +274,8 @@ fn push_command() -> Command {
             endpoint_arg(),
             threshold_arg(false),
             checksum_arg(false),
+            delete_arg(),
+            fsync_arg(false),
             ignore_arg(false),
             exclude_from_arg(false),
         ])
@@ -286,6 +289,7 @@ fn pull_command() -> Command {
             dst_arg(),
             threshold_arg(false),
             checksum_arg(false),
+            delete_arg(),
             fsync_arg(false),
             ignore_arg(false),
             exclude_from_arg(false),

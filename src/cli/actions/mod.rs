@@ -34,6 +34,8 @@ pub enum Action {
         src: PathBuf,
         threshold: f32,
         checksum: bool,
+        delete: bool,
+        fsync: bool,
         ignores: Vec<String>,
         quiet: bool,
     },
@@ -43,6 +45,7 @@ pub enum Action {
         dst: PathBuf,
         threshold: f32,
         checksum: bool,
+        delete: bool,
         fsync: bool,
         ignores: Vec<String>,
         quiet: bool,
@@ -67,6 +70,7 @@ pub enum Action {
     InternalStdioReceive {
         dst: PathBuf,
         fsync: bool,
+        ignores: Vec<String>,
         quiet: bool,
     },
     /// Internal stdio sender used by SSH tunneling.
@@ -74,6 +78,7 @@ pub enum Action {
         src: PathBuf,
         threshold: f32,
         checksum: bool,
+        delete: bool,
         ignores: Vec<String>,
         quiet: bool,
     },

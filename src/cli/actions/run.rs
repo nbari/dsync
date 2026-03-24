@@ -1,5 +1,8 @@
 use crate::cli::actions::{Action, RemoteEndpoint};
-use crate::pxs::{sync, tools};
+use crate::pxs::{
+    net::{RemoteFeatureOptions, RemoteSyncOptions},
+    sync, tools,
+};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 use tracing::{info, instrument};
@@ -43,22 +46,51 @@ async fn handle_push_action(
     src: &Path,
     threshold: f32,
     checksum: bool,
+    delete: bool,
+    fsync: bool,
     ignores: &[String],
 ) -> Result<()> {
     match endpoint {
         RemoteEndpoint::Ssh { host, path } => {
             eprintln!("Connecting via SSH to {host} to sync to {path}");
-            crate::pxs::net::run_ssh_sender(host, src, path, threshold, checksum, ignores).await?;
+            crate::pxs::net::run_ssh_sender(
+                host,
+                src,
+                path,
+                RemoteSyncOptions {
+                    threshold,
+                    features: RemoteFeatureOptions {
+                        checksum,
+                        delete,
+                        fsync,
+                    },
+                    ignores,
+                },
+            )
+            .await?;
         }
         RemoteEndpoint::Stdio => {
-            crate::pxs::net::run_stdio_sender(src, threshold, checksum, ignores, false).await?;
+            anyhow::ensure!(
+                !fsync,
+                "--fsync is not supported for `pxs push -`; use a receiver transport that can apply durability on the destination side"
+            );
+            anyhow::ensure!(
+                !delete,
+                "--delete is not supported for `pxs push -`; use SSH remote mirror mode instead"
+            );
+            crate::pxs::net::run_stdio_sender(src, threshold, checksum, false, ignores, false)
+                .await?;
         }
         RemoteEndpoint::Tcp(addr) => {
+            anyhow::ensure!(
+                !delete,
+                "--delete is not supported for raw TCP push; use SSH remote mirror mode instead"
+            );
             eprintln!(
                 "Connecting to {addr} to sync from {} (checksum: {checksum})",
                 src.display()
             );
-            crate::pxs::net::run_sender(addr, src, threshold, checksum, ignores).await?;
+            crate::pxs::net::run_sender(addr, src, threshold, checksum, fsync, ignores).await?;
         }
     }
 
@@ -70,25 +102,154 @@ async fn handle_pull_action(
     dst: &Path,
     threshold: f32,
     checksum: bool,
+    delete: bool,
     fsync: bool,
     ignores: &[String],
 ) -> Result<()> {
     match endpoint {
         RemoteEndpoint::Ssh { host, path } => {
             eprintln!("Pulling via SSH from {host}:{path} to {}", dst.display());
-            crate::pxs::net::run_ssh_receiver(host, dst, path, threshold, checksum, fsync, ignores)
-                .await?;
+            crate::pxs::net::run_ssh_receiver(
+                host,
+                dst,
+                path,
+                RemoteSyncOptions {
+                    threshold,
+                    features: RemoteFeatureOptions {
+                        checksum,
+                        delete,
+                        fsync,
+                    },
+                    ignores,
+                },
+            )
+            .await?;
         }
         RemoteEndpoint::Stdio => {
             anyhow::bail!("stdio is not supported for pull mode");
         }
         RemoteEndpoint::Tcp(addr) => {
+            anyhow::ensure!(
+                !delete,
+                "--delete is not supported for raw TCP pull; use SSH remote mirror mode instead"
+            );
             eprintln!("Connecting to {addr} to pull to {}", dst.display());
             crate::pxs::net::run_pull_client(addr, dst, fsync).await?;
         }
     }
 
     Ok(())
+}
+
+async fn handle_listen_action(addr: &str, dst: &Path, fsync: bool, quiet: bool) -> Result<()> {
+    if !quiet {
+        eprintln!("Listening on {addr} for incoming sync to {}", dst.display());
+    }
+    crate::pxs::net::run_receiver(addr, dst, fsync).await
+}
+
+async fn handle_serve_action(
+    addr: &str,
+    src: &Path,
+    threshold: f32,
+    checksum: bool,
+    ignores: &[String],
+    quiet: bool,
+) -> Result<()> {
+    if !quiet {
+        eprintln!("Serving {} on {addr} (checksum: {checksum})", src.display());
+    }
+    crate::pxs::net::run_sender_listener(addr, src, threshold, checksum, ignores).await
+}
+
+async fn handle_internal_stdio_receive_action(
+    dst: &Path,
+    fsync: bool,
+    ignores: &[String],
+    quiet: bool,
+) -> Result<()> {
+    crate::pxs::net::run_stdio_receiver(dst, fsync, ignores, quiet).await
+}
+
+async fn handle_internal_stdio_send_action(
+    src: &Path,
+    threshold: f32,
+    checksum: bool,
+    delete: bool,
+    ignores: &[String],
+    quiet: bool,
+) -> Result<()> {
+    crate::pxs::net::run_stdio_sender(src, threshold, checksum, delete, ignores, quiet).await
+}
+
+async fn handle_push_cli_action(
+    endpoint: &RemoteEndpoint,
+    src: &Path,
+    threshold: f32,
+    checksum: bool,
+    delete: bool,
+    fsync: bool,
+    ignores: &[String],
+) -> Result<HandleOutcome> {
+    handle_push_action(endpoint, src, threshold, checksum, delete, fsync, ignores).await?;
+    Ok(HandleOutcome::PrintCompletion)
+}
+
+async fn handle_pull_cli_action(
+    endpoint: &RemoteEndpoint,
+    dst: &Path,
+    threshold: f32,
+    checksum: bool,
+    delete: bool,
+    fsync: bool,
+    ignores: &[String],
+) -> Result<HandleOutcome> {
+    handle_pull_action(endpoint, dst, threshold, checksum, delete, fsync, ignores).await?;
+    Ok(HandleOutcome::PrintCompletion)
+}
+
+async fn handle_listen_cli_action(
+    addr: &str,
+    dst: &Path,
+    fsync: bool,
+    quiet: bool,
+) -> Result<HandleOutcome> {
+    handle_listen_action(addr, dst, fsync, quiet).await?;
+    Ok(HandleOutcome::PrintCompletion)
+}
+
+async fn handle_serve_cli_action(
+    addr: &str,
+    src: &Path,
+    threshold: f32,
+    checksum: bool,
+    ignores: &[String],
+    quiet: bool,
+) -> Result<HandleOutcome> {
+    handle_serve_action(addr, src, threshold, checksum, ignores, quiet).await?;
+    Ok(HandleOutcome::PrintCompletion)
+}
+
+async fn handle_internal_receive_cli_action(
+    dst: &Path,
+    fsync: bool,
+    ignores: &[String],
+    quiet: bool,
+) -> Result<HandleOutcome> {
+    handle_internal_stdio_receive_action(dst, fsync, ignores, quiet).await?;
+    Ok(HandleOutcome::PrintCompletion)
+}
+
+async fn handle_internal_send_cli_action(
+    src: &Path,
+    threshold: f32,
+    checksum: bool,
+    delete: bool,
+    ignores: &[String],
+    quiet: bool,
+) -> Result<HandleOutcome> {
+    handle_internal_stdio_send_action(src, threshold, checksum, delete, ignores, quiet).await?;
+    Ok(HandleOutcome::PrintCompletion)
 }
 
 async fn handle_local_sync(
@@ -139,6 +300,7 @@ async fn handle_local_sync(
     );
 
     let dst = resolve_local_file_destination(src, dst)?;
+    tools::ensure_no_symlink_ancestors(&dst)?;
 
     if tools::should_skip_file(src, &dst, options.checksum).await? {
         if !options.quiet {
@@ -207,25 +369,32 @@ pub async fn handle(action: Action) -> Result<()> {
             src,
             threshold,
             checksum,
+            delete,
+            fsync,
             ignores,
             quiet,
         } => {
             is_quiet = quiet;
-            handle_push_action(&endpoint, &src, threshold, checksum, &ignores).await?;
-            HandleOutcome::PrintCompletion
+            handle_push_cli_action(
+                &endpoint, &src, threshold, checksum, delete, fsync, &ignores,
+            )
+            .await?
         }
         Action::Pull {
             endpoint,
             dst,
             threshold,
             checksum,
+            delete,
             fsync,
             ignores,
             quiet,
         } => {
             is_quiet = quiet;
-            handle_pull_action(&endpoint, &dst, threshold, checksum, fsync, &ignores).await?;
-            HandleOutcome::PrintCompletion
+            handle_pull_cli_action(
+                &endpoint, &dst, threshold, checksum, delete, fsync, &ignores,
+            )
+            .await?
         }
         Action::Listen {
             addr,
@@ -234,11 +403,7 @@ pub async fn handle(action: Action) -> Result<()> {
             quiet,
         } => {
             is_quiet = quiet;
-            if !quiet {
-                eprintln!("Listening on {addr} for incoming sync to {}", dst.display());
-            }
-            crate::pxs::net::run_receiver(&addr, &dst, fsync).await?;
-            HandleOutcome::PrintCompletion
+            handle_listen_cli_action(&addr, &dst, fsync, quiet).await?
         }
         Action::Serve {
             addr,
@@ -249,28 +414,28 @@ pub async fn handle(action: Action) -> Result<()> {
             quiet,
         } => {
             is_quiet = quiet;
-            if !quiet {
-                eprintln!("Serving {} on {addr} (checksum: {checksum})", src.display());
-            }
-            crate::pxs::net::run_sender_listener(&addr, &src, threshold, checksum, &ignores)
-                .await?;
-            HandleOutcome::PrintCompletion
+            handle_serve_cli_action(&addr, &src, threshold, checksum, &ignores, quiet).await?
         }
-        Action::InternalStdioReceive { dst, fsync, quiet } => {
+        Action::InternalStdioReceive {
+            dst,
+            fsync,
+            ignores,
+            quiet,
+        } => {
             is_quiet = quiet;
-            crate::pxs::net::run_stdio_receiver(&dst, fsync, quiet).await?;
-            HandleOutcome::PrintCompletion
+            handle_internal_receive_cli_action(&dst, fsync, &ignores, quiet).await?
         }
         Action::InternalStdioSend {
             src,
             threshold,
             checksum,
+            delete,
             ignores,
             quiet,
         } => {
             is_quiet = quiet;
-            crate::pxs::net::run_stdio_sender(&src, threshold, checksum, &ignores, quiet).await?;
-            HandleOutcome::PrintCompletion
+            handle_internal_send_cli_action(&src, threshold, checksum, delete, &ignores, quiet)
+                .await?
         }
     };
 
@@ -389,6 +554,118 @@ mod tests {
                 .to_string()
                 .contains("--delete is only supported when syncing directories")
         );
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_stdio_rejects_fsync() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("source.txt");
+        fs::write(&src, "payload")?;
+
+        let error = match handle(Action::Push {
+            endpoint: crate::cli::actions::RemoteEndpoint::Stdio,
+            src,
+            threshold: 0.5,
+            checksum: false,
+            delete: false,
+            fsync: true,
+            ignores: Vec::new(),
+            quiet: false,
+        })
+        .await
+        {
+            Ok(()) => anyhow::bail!("stdio push should reject --fsync"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("--fsync is not supported"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_push_stdio_rejects_delete() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src_dir = dir.path().join("source");
+        fs::create_dir_all(&src_dir)?;
+
+        let error = match handle(Action::Push {
+            endpoint: crate::cli::actions::RemoteEndpoint::Stdio,
+            src: src_dir,
+            threshold: 0.5,
+            checksum: false,
+            delete: true,
+            fsync: false,
+            ignores: Vec::new(),
+            quiet: false,
+        })
+        .await
+        {
+            Ok(()) => anyhow::bail!("stdio push should reject --delete"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("--delete is not supported"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_tcp_pull_rejects_delete() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let dst = dir.path().join("dst");
+        fs::create_dir_all(&dst)?;
+
+        let error = match handle(Action::Pull {
+            endpoint: crate::cli::actions::RemoteEndpoint::Tcp(String::from("127.0.0.1:9999")),
+            dst,
+            threshold: 0.5,
+            checksum: false,
+            delete: true,
+            fsync: false,
+            ignores: Vec::new(),
+            quiet: false,
+        })
+        .await
+        {
+            Ok(()) => anyhow::bail!("raw TCP pull should reject --delete"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("--delete is not supported"));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_handle_local_sync_rejects_symlinked_parent_destination() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("source.txt");
+        let dst_root = dir.path().join("dest");
+        let external_dir = tempdir()?;
+        let protected_path = external_dir.path().join("payload.txt");
+        fs::write(&src, "new payload")?;
+        fs::create_dir_all(&dst_root)?;
+        fs::write(&protected_path, "protected")?;
+        std::os::unix::fs::symlink(external_dir.path(), dst_root.join("escape"))?;
+
+        let error = match handle(Action::Sync {
+            src,
+            dst: dst_root.join("escape/payload.txt"),
+            threshold: 0.5,
+            checksum: false,
+            dry_run: false,
+            delete: false,
+            fsync: false,
+            ignores: Vec::new(),
+            quiet: false,
+        })
+        .await
+        {
+            Ok(()) => anyhow::bail!("local sync should reject symlinked parent destinations"),
+            Err(error) => error,
+        };
+
+        assert!(error.to_string().contains("symlinked parent"));
+        assert_eq!(fs::read_to_string(&protected_path)?, "protected");
         Ok(())
     }
 }

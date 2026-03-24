@@ -105,6 +105,7 @@ pub async fn sync_changed_blocks(
     fsync: bool,
     quiet: bool,
 ) -> Result<SyncStats> {
+    tools::ensure_no_symlink_ancestors(dst_path)?;
     let pb: Arc<dyn tools::ProgressBarLike> = if quiet {
         Arc::new(ProgressBar::hidden())
     } else {

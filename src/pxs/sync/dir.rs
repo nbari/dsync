@@ -150,6 +150,8 @@ async fn ensure_directory_exists(
     context: &DirectorySyncContext<'_>,
     dst_path: &Path,
 ) -> Result<()> {
+    tools::ensure_no_symlink_ancestors_under_root(context.dst_dir, dst_path)?;
+
     let dst_meta = tokio::fs::symlink_metadata(dst_path).await;
     let exists = dst_meta.is_ok();
     let is_dir = matches!(&dst_meta, Ok(m) if m.is_dir());
@@ -161,14 +163,7 @@ async fn ensure_directory_exists(
                 dst_path.display()
             );
         } else {
-            let meta = dst_meta?;
-            if meta.is_dir() {
-                tokio::fs::remove_dir_all(dst_path).await?;
-            } else {
-                tokio::fs::remove_file(dst_path).await?;
-            }
-            tokio::fs::create_dir_all(dst_path)
-                .await
+            tools::ensure_directory_path(dst_path)
                 .with_context(|| format!("failed to create directory {}", dst_path.display()))?;
         }
     } else if !exists {
@@ -180,6 +175,9 @@ async fn ensure_directory_exists(
                 .with_context(|| format!("failed to create directory {}", dst_path.display()))?;
         }
     }
+    if context.options.fsync && !context.options.dry_run && dst_path.exists() {
+        tools::sync_directory_and_parent(dst_path)?;
+    }
 
     Ok(())
 }
@@ -189,6 +187,8 @@ async fn handle_symlink_entry(
     src_path: &Path,
     dst_path: &Path,
 ) -> Result<()> {
+    tools::ensure_no_symlink_ancestors_under_root(context.dst_dir, dst_path)?;
+
     let target = tokio::fs::read_link(src_path)
         .await
         .with_context(|| format!("failed to read symlink target: {}", src_path.display()))?;
@@ -201,27 +201,32 @@ async fn handle_symlink_entry(
         return Ok(());
     }
 
-    if let Ok(meta) = tokio::fs::symlink_metadata(dst_path).await {
-        if meta.is_dir() {
-            tokio::fs::remove_dir_all(dst_path)
-                .await
-                .with_context(|| format!("failed to remove directory: {}", dst_path.display()))?;
-        } else {
-            tokio::fs::remove_file(dst_path)
-                .await
-                .with_context(|| format!("failed to remove file: {}", dst_path.display()))?;
-        }
+    if let Some(parent) = dst_path.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .with_context(|| format!("failed to create directory {}", parent.display()))?;
     }
-    tokio::fs::symlink(&target, dst_path)
-        .await
-        .with_context(|| {
-            format!(
-                "failed to create symlink {} -> {}",
-                dst_path.display(),
-                target.display()
-            )
-        })?;
-    meta::apply_metadata(src_path, dst_path)?;
+    let prepared_path = tools::create_prepared_symlink(&target, dst_path).with_context(|| {
+        format!(
+            "failed to create staged symlink {} -> {}",
+            dst_path.display(),
+            target.display()
+        )
+    })?;
+    if let Err(error) = meta::apply_metadata(src_path, &prepared_path) {
+        let _ = std::fs::remove_file(&prepared_path);
+        return Err(error);
+    }
+    tools::install_prepared_path(&prepared_path, dst_path).with_context(|| {
+        format!(
+            "failed to install symlink {} -> {}",
+            dst_path.display(),
+            target.display()
+        )
+    })?;
+    if context.options.fsync {
+        tools::sync_parent_directory(dst_path)?;
+    }
     Ok(())
 }
 
@@ -334,6 +339,7 @@ async fn handle_walk_entry(
     }
 
     if file_type.is_file() {
+        tools::ensure_no_symlink_ancestors_under_root(context.dst_dir, &dst_path)?;
         if state.tasks.len() >= state.max_in_flight {
             wait_for_next_sync_task(&mut state.tasks).await?;
         }
@@ -390,8 +396,14 @@ fn apply_directory_metadata(
         let rel_path = src_path.strip_prefix(context.src_dir)?;
         let dst_path = context.dst_dir.join(rel_path);
         meta::apply_metadata(&src_path, &dst_path)?;
+        if context.options.fsync {
+            tools::sync_directory_and_parent(&dst_path)?;
+        }
     }
     meta::apply_metadata(context.src_dir, context.dst_dir)?;
+    if context.options.fsync {
+        tools::sync_directory_and_parent(context.dst_dir)?;
+    }
 
     Ok(())
 }

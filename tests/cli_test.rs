@@ -39,6 +39,17 @@ fn test_pull_tcp_source_flags_reports_actionable_error() -> anyhow::Result<()> {
 }
 
 #[test]
+fn test_pull_tcp_delete_reports_actionable_error() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let dst_arg = dir.path().join("dst").to_string_lossy().to_string();
+    let output = run_pxs(&["pull", "127.0.0.1:9999", &dst_arg, "--delete"])?;
+
+    assert!(!output.status.success());
+    assert!(stderr_text(&output).contains("--delete is not supported"));
+    Ok(())
+}
+
+#[test]
 fn test_push_reports_malformed_bracketed_endpoint() -> anyhow::Result<()> {
     let dir = tempdir()?;
     let src = dir.path().join("src.txt");
@@ -59,6 +70,19 @@ fn test_push_reports_missing_source_path() -> anyhow::Result<()> {
 
     assert!(!output.status.success());
     assert!(stderr_text(&output).contains("Path does not exist"));
+    Ok(())
+}
+
+#[test]
+fn test_push_stdio_delete_reports_actionable_error() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    std::fs::create_dir_all(&src_dir)?;
+    let src_arg = src_dir.to_string_lossy().to_string();
+    let output = run_pxs(&["push", &src_arg, "-", "--delete"])?;
+
+    assert!(!output.status.success());
+    assert!(stderr_text(&output).contains("--delete is not supported"));
     Ok(())
 }
 

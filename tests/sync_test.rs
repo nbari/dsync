@@ -83,6 +83,61 @@ async fn test_sync_dir_recursive() -> anyhow::Result<()> {
 }
 
 #[tokio::test]
+async fn test_sync_changed_blocks_rejects_symlinked_parent_destination() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_path = dir.path().join("source.txt");
+    let dst_root = dir.path().join("dst");
+    let external_dir = tempdir()?;
+    let protected_path = external_dir.path().join("payload.txt");
+    fs::write(&src_path, "payload")?;
+    fs::create_dir_all(&dst_root)?;
+    fs::write(&protected_path, "protected")?;
+    std::os::unix::fs::symlink(external_dir.path(), dst_root.join("escape"))?;
+
+    let Err(error) = sync::sync_changed_blocks(
+        &src_path,
+        &dst_root.join("escape/payload.txt"),
+        true,
+        false,
+        true,
+    )
+    .await
+    else {
+        anyhow::bail!("single-file sync should reject symlinked parent destinations");
+    };
+
+    assert!(error.to_string().contains("symlinked parent"));
+    assert_eq!(fs::read_to_string(&protected_path)?, "protected");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_sync_dir_rejects_symlinked_destination_root() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let external_dir = tempdir()?;
+    let dst_root = dir.path().join("dst-link");
+    let protected_path = external_dir.path().join("payload.txt");
+    fs::create_dir_all(&src_dir)?;
+    fs::write(src_dir.join("payload.txt"), "payload")?;
+    fs::write(&protected_path, "protected")?;
+    std::os::unix::fs::symlink(external_dir.path(), &dst_root)?;
+
+    let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, false);
+    let Err(error) = sync::sync_dir(&src_dir, &dst_root, &options).await else {
+        anyhow::bail!("directory sync should reject symlinked destination roots");
+    };
+
+    assert!(
+        error
+            .to_string()
+            .contains("destination root must not be a symlink")
+    );
+    assert_eq!(fs::read_to_string(&protected_path)?, "protected");
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_metadata_skip_logic() -> anyhow::Result<()> {
     let dir = tempdir()?;
     let src_path = dir.path().join("src.txt");

@@ -1,3 +1,4 @@
+use crate::pxs::tools;
 use std::path::{Path, PathBuf};
 
 pub(crate) fn validate_protocol_path(path: &str) -> anyhow::Result<()> {
@@ -32,6 +33,7 @@ pub(crate) fn resolve_protocol_path(root: &Path, path: &str) -> anyhow::Result<P
     for component in path.split('/') {
         full_path.push(component);
     }
+    tools::ensure_no_symlink_ancestors_under_root(root, &full_path)?;
     Ok(full_path)
 }
 

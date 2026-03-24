@@ -1,5 +1,5 @@
 use super::{
-    BLOCK_SIZE, BLOCK_SIZE_USIZE,
+    BLOCK_SIZE, BLOCK_SIZE_USIZE, RemoteSyncOptions,
     codec::PxsCodec,
     path::{ensure_expected_protocol_path, relative_protocol_path},
     protocol::{
@@ -23,6 +23,20 @@ use tokio::{
 use tokio_util::codec::Framed;
 
 const MIN_COMPRESSED_BATCH_BYTES: u64 = 64 * 1024;
+
+#[derive(Clone, Copy)]
+struct SessionOptionFlags {
+    fsync: bool,
+    delete: bool,
+}
+
+#[derive(Clone, Copy)]
+struct SenderLoopOptions {
+    threshold: f32,
+    checksum: bool,
+    session: SessionOptionFlags,
+    allow_lz4: bool,
+}
 
 /// Run the listener in sender mode (serves files to clients).
 ///
@@ -58,11 +72,17 @@ pub async fn run_sender_listener(
             if let Err(error) = sender_loop(
                 &mut framed,
                 &src_root,
-                threshold,
-                checksum,
+                SenderLoopOptions {
+                    threshold,
+                    checksum,
+                    session: SessionOptionFlags {
+                        fsync: false,
+                        delete: false,
+                    },
+                    allow_lz4: true,
+                },
                 &tasks,
                 pb,
-                true,
             )
             .await
             {
@@ -143,6 +163,7 @@ async fn run_sender_workers(
     src_root: &Path,
     threshold: f32,
     checksum: bool,
+    fsync: bool,
     progress: &Arc<ProgressBar>,
     batches: Vec<Vec<String>>,
 ) -> anyhow::Result<()> {
@@ -156,6 +177,7 @@ async fn run_sender_workers(
             let stream = connect_with_retry(&addr_owned).await?;
             let mut framed = Framed::new(stream, PxsCodec);
             let features = sender_handshake(&mut framed, true).await?;
+            send_push_session_options(&mut framed, fsync, false).await?;
 
             for rel_path in batch {
                 let src_path = source_path_for(&src_root_worker, &rel_path);
@@ -192,6 +214,7 @@ pub async fn run_sender(
     src_root: &Path,
     threshold: f32,
     checksum: bool,
+    fsync: bool,
     ignores: &[String],
 ) -> anyhow::Result<()> {
     let (tasks, total_size) = collect_sync_tasks(src_root, ignores).await?;
@@ -205,6 +228,7 @@ pub async fn run_sender(
         let stream = connect_with_retry(addr).await?;
         let mut framed = Framed::new(stream, PxsCodec);
         let _ = sender_handshake(&mut framed, true).await?;
+        send_push_session_options(&mut framed, fsync, false).await?;
         send_non_file_tasks(&mut framed, &tasks).await?;
         Some(framed)
     } else {
@@ -215,7 +239,7 @@ pub async fn run_sender(
 
     if file_paths.is_empty() {
         if let Some(mut framed) = main_framed {
-            let _ = framed.flush().await;
+            finish_control_connection(&mut framed).await?;
         }
         progress.finish_with_message("Done");
         return Ok(());
@@ -227,10 +251,12 @@ pub async fn run_sender(
         .min(64)
         .min(file_paths.len());
     let batches = build_worker_batches(file_paths, worker_count)?;
-    run_sender_workers(addr, src_root, threshold, checksum, &progress, batches).await?;
-
+    run_sender_workers(
+        addr, src_root, threshold, checksum, fsync, &progress, batches,
+    )
+    .await?;
     if let Some(mut framed) = main_framed {
-        let _ = framed.flush().await;
+        finish_control_connection(&mut framed).await?;
     }
 
     progress.finish_with_message("Done");
@@ -246,9 +272,14 @@ pub async fn run_stdio_sender(
     src_root: &Path,
     threshold: f32,
     checksum: bool,
+    delete: bool,
     ignores: &[String],
     quiet: bool,
 ) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !delete || src_root.is_dir(),
+        "--delete is only supported when syncing directories"
+    );
     let (tasks, total_size) = collect_sync_tasks(src_root, ignores).await?;
     let progress = Arc::new(if quiet {
         ProgressBar::hidden()
@@ -262,11 +293,17 @@ pub async fn run_stdio_sender(
     sender_loop(
         &mut framed,
         src_root,
-        threshold,
-        checksum,
+        SenderLoopOptions {
+            threshold,
+            checksum,
+            session: SessionOptionFlags {
+                fsync: false,
+                delete,
+            },
+            allow_lz4: false,
+        },
         &tasks,
         progress,
-        false,
     )
     .await
 }
@@ -280,22 +317,30 @@ pub async fn run_ssh_sender(
     addr: &str,
     src_root: &Path,
     dst_path: &str,
-    threshold: f32,
-    checksum: bool,
-    ignores: &[String],
+    options: RemoteSyncOptions<'_>,
 ) -> anyhow::Result<()> {
-    let (tasks, total_size) = collect_sync_tasks(src_root, ignores).await?;
+    anyhow::ensure!(
+        !options.features.delete || src_root.is_dir(),
+        "--delete is only supported when syncing directories"
+    );
+    let (tasks, total_size) = collect_sync_tasks(src_root, options.ignores).await?;
     let progress = Arc::new(tools::create_progress_bar(total_size));
-    let remote_cmd = build_ssh_push_command(dst_path, ignores);
+    let remote_cmd = build_ssh_push_command(dst_path, options.features.fsync, options.ignores);
     let mut session = ChildSession::spawn(build_ssh_command(addr, &remote_cmd))?;
     let result = sender_loop(
         session.framed_mut()?,
         src_root,
-        threshold,
-        checksum,
+        SenderLoopOptions {
+            threshold: options.threshold,
+            checksum: options.features.checksum,
+            session: SessionOptionFlags {
+                fsync: false,
+                delete: options.features.delete,
+            },
+            allow_lz4: false,
+        },
         &tasks,
         Arc::clone(&progress),
-        false,
     )
     .await;
     session.finish(result, "SSH process").await?;
@@ -324,19 +369,57 @@ where
     }
 }
 
-async fn sender_loop<T>(
+async fn send_push_session_options<T>(
     framed: &mut Framed<T, PxsCodec>,
-    src_root: &Path,
-    threshold: f32,
-    checksum: bool,
-    tasks: &[SyncTask],
-    progress: Arc<ProgressBar>,
-    allow_lz4: bool,
+    fsync: bool,
+    delete: bool,
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let features = sender_handshake(framed, allow_lz4).await?;
+    if !fsync && !delete {
+        return Ok(());
+    }
+
+    framed
+        .send(serialize_message(&Message::SessionOptions {
+            fsync,
+            delete,
+        })?)
+        .await?;
+    Ok(())
+}
+
+async fn finish_control_connection<T>(framed: &mut Framed<T, PxsCodec>) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    framed
+        .send(serialize_message(&Message::SyncComplete)?)
+        .await?;
+
+    let response = recv_with_timeout(framed).await?.ok_or_else(|| {
+        anyhow::anyhow!("connection closed before sync completion acknowledgment")
+    })?;
+    match deserialize_message(&response)? {
+        Message::SyncCompleteAck => Ok(()),
+        Message::Error(message) => anyhow::bail!("Remote error on control connection: {message}"),
+        other => anyhow::bail!("Unexpected control response: {other:?}"),
+    }
+}
+
+async fn sender_loop<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    src_root: &Path,
+    options: SenderLoopOptions,
+    tasks: &[SyncTask],
+    progress: Arc<ProgressBar>,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let features = sender_handshake(framed, options.allow_lz4).await?;
+    send_push_session_options(framed, options.session.fsync, options.session.delete).await?;
 
     framed
         .send(serialize_message(&Message::SyncStart {
@@ -373,8 +456,8 @@ where
                     framed,
                     src_root,
                     &src_path,
-                    threshold,
-                    checksum,
+                    options.threshold,
+                    options.checksum,
                     Arc::clone(&progress),
                     features,
                 )
@@ -383,7 +466,7 @@ where
         }
     }
 
-    Ok(())
+    finish_control_connection(framed).await
 }
 
 async fn send_sync_file_message<T>(
@@ -803,6 +886,7 @@ where
                 progress.inc(metadata.size);
                 send_apply_metadata(framed, &rel_path, metadata).await?;
             }
+            Message::Error(message) => anyhow::bail!("Remote error for {rel_path}: {message}"),
             _ => anyhow::bail!("Unexpected message: {msg:?}"),
         }
     }
