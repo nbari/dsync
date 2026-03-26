@@ -34,6 +34,8 @@ const THRESHOLD_LONG_HELP: &str = "Value between 0.1 and 1.0. If the destination
 const CHECKSUM_LONG_HELP: &str = "By default, pxs skips files if size and modification time match. Use this to force a block-by-block hash comparison. In network mode, pxs also performs end-to-end BLAKE3 verification after the transfer completes.";
 const FSYNC_LONG_HELP: &str =
     "Ensures that file data and metadata are flushed to disk before finishing. Slower but safer.";
+const LARGE_FILE_PARALLEL_THRESHOLD_LONG_HELP: &str = "Enable SSH push chunk-parallel transfer for files at or above this size. Accepts raw bytes or binary suffixes such as KiB, MiB, GiB, and TiB. Use 0 to disable.";
+const LARGE_FILE_PARALLEL_WORKERS_LONG_HELP: &str = "Number of parallel SSH worker sessions for eligible large files. If omitted, pxs chooses a conservative default from available CPU cores.";
 
 /// Create a path validator that requires the path to exist.
 pub fn validator_path_exists() -> ValueParser {
@@ -94,6 +96,48 @@ fn threshold_parser() -> ValueParser {
     })
 }
 
+fn parse_size_bytes(value: &str) -> std::result::Result<u64, String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(String::from("Size must not be empty"));
+    }
+
+    let split_index = trimmed
+        .find(|ch: char| !ch.is_ascii_digit())
+        .unwrap_or(trimmed.len());
+    let (digits, suffix) = trimmed.split_at(split_index);
+    let base = digits
+        .parse::<u64>()
+        .map_err(|_| format!("Invalid size value: '{value}'"))?;
+    let multiplier = match suffix.trim().to_ascii_lowercase().as_str() {
+        "" | "b" => 1_u64,
+        "k" | "kb" | "kib" => 1024_u64,
+        "m" | "mb" | "mib" => 1024_u64.pow(2),
+        "g" | "gb" | "gib" => 1024_u64.pow(3),
+        "t" | "tb" | "tib" => 1024_u64.pow(4),
+        _ => return Err(format!("Unsupported size suffix in '{value}'")),
+    };
+    base.checked_mul(multiplier)
+        .ok_or_else(|| format!("Size is too large: '{value}'"))
+}
+
+fn size_bytes_parser() -> ValueParser {
+    ValueParser::from(|s: &str| parse_size_bytes(s))
+}
+
+fn positive_usize_parser() -> ValueParser {
+    ValueParser::from(|s: &str| {
+        let value = s
+            .parse::<usize>()
+            .map_err(|_| String::from("Invalid positive integer"))?;
+        if value == 0 {
+            Err(String::from("Value must be greater than 0"))
+        } else {
+            Ok(value)
+        }
+    })
+}
+
 fn long_version() -> &'static str {
     if let Some(git_hash) = built_info::GIT_COMMIT_HASH {
         Box::leak(format!("{} - {}", env!("CARGO_PKG_VERSION"), git_hash).into_boxed_str())
@@ -150,6 +194,25 @@ fn fsync_arg(hidden: bool) -> Arg {
         .long_help(FSYNC_LONG_HELP)
         .action(ArgAction::SetTrue)
         .hide(hidden)
+}
+
+fn large_file_parallel_threshold_arg() -> Arg {
+    Arg::new("large_file_parallel_threshold")
+        .long("large-file-parallel-threshold")
+        .help("Enable SSH push chunk-parallel transfer at or above SIZE")
+        .long_help(LARGE_FILE_PARALLEL_THRESHOLD_LONG_HELP)
+        .value_name("SIZE")
+        .value_parser(size_bytes_parser())
+        .default_value("1GiB")
+}
+
+fn large_file_parallel_workers_arg() -> Arg {
+    Arg::new("large_file_parallel_workers")
+        .long("large-file-parallel-workers")
+        .help("Set the number of SSH worker sessions for large-file push")
+        .long_help(LARGE_FILE_PARALLEL_WORKERS_LONG_HELP)
+        .value_name("N")
+        .value_parser(positive_usize_parser())
 }
 
 fn dry_run_arg() -> Arg {
@@ -217,7 +280,7 @@ fn addr_arg() -> Arg {
         .required(true)
 }
 
-fn internal_stdio_args() -> [Arg; 10] {
+fn internal_stdio_args() -> [Arg; 13] {
     [
         Arg::new("stdio")
             .long("stdio")
@@ -241,6 +304,21 @@ fn internal_stdio_args() -> [Arg; 10] {
             .hide(true)
             .value_parser(validator_parent_exist())
             .value_name("DST"),
+        Arg::new("chunk_writer")
+            .long("chunk-writer")
+            .help("Run in chunk-writer mode (internal use for SSH large files)")
+            .hide(true)
+            .action(ArgAction::SetTrue),
+        Arg::new("transfer_id")
+            .long("transfer-id")
+            .help("Receiver-issued transfer id for chunk-writer mode")
+            .hide(true)
+            .value_name("ID"),
+        Arg::new("chunk_path")
+            .long("chunk-path")
+            .help("Protocol path for the chunk-writer file")
+            .hide(true)
+            .value_name("PATH"),
         threshold_arg(true),
         checksum_arg(true),
         delete_arg(),
@@ -276,6 +354,8 @@ fn push_command() -> Command {
             checksum_arg(false),
             delete_arg(),
             fsync_arg(false),
+            large_file_parallel_threshold_arg(),
+            large_file_parallel_workers_arg(),
             ignore_arg(false),
             exclude_from_arg(false),
         ])

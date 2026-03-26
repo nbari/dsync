@@ -21,11 +21,19 @@ pub struct RemoteFeatureOptions {
     pub fsync: bool,
 }
 
+/// Options controlling large-file parallel transfer over SSH.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LargeFileParallelOptions {
+    pub threshold_bytes: u64,
+    pub worker_count: usize,
+}
+
 /// Options shared by SSH sender/receiver flows.
 #[derive(Clone, Copy, Debug)]
 pub struct RemoteSyncOptions<'a> {
     pub threshold: f32,
     pub features: RemoteFeatureOptions,
+    pub large_file_parallel: Option<LargeFileParallelOptions>,
     pub ignores: &'a [String],
 }
 
@@ -34,7 +42,8 @@ pub use protocol::{
     Block, FileMetadata, Message, apply_file_metadata, deserialize_message, serialize_message,
 };
 pub use receiver::{
-    handle_client, run_pull_client, run_receiver, run_ssh_receiver, run_stdio_receiver,
+    handle_client, run_pull_client, run_receiver, run_ssh_receiver, run_stdio_chunk_writer,
+    run_stdio_receiver,
 };
 pub use sender::{
     run_sender, run_sender_listener, run_ssh_sender, run_stdio_sender, sync_remote_file,

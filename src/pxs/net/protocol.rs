@@ -76,6 +76,10 @@ pub enum Message {
         fsync: bool,
         delete: bool,
     },
+    ParallelTransferConfig {
+        threshold_bytes: u64,
+        worker_count: u16,
+    },
     SyncStart {
         total_size: u64,
     },
@@ -96,6 +100,10 @@ pub enum Message {
     },
     RequestFullCopy {
         path: String,
+    },
+    RequestParallelFullCopy {
+        path: String,
+        transfer_id: String,
     },
     RequestHashes {
         path: String,
@@ -124,6 +132,11 @@ pub enum Message {
     },
     RequestBlocks {
         path: String,
+        indices: Vec<u32>,
+    },
+    RequestParallelBlocks {
+        path: String,
+        transfer_id: String,
         indices: Vec<u32>,
     },
     VerifyChecksum {

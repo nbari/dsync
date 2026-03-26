@@ -13,10 +13,12 @@ const PROTOCOL_MAJOR: &str = env!("CARGO_PKG_VERSION_MAJOR");
 const PROTOCOL_MINOR: &str = env!("CARGO_PKG_VERSION_MINOR");
 const CAPABILITIES_PREFIX: &str = "caps=";
 const LZ4_BLOCKS_CAPABILITY: &str = "lz4-blocks";
+const LARGE_FILE_PARALLEL_CAPABILITY: &str = "large-file-parallel";
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) struct TransportFeatures {
     pub(crate) lz4_block_messages: bool,
+    pub(crate) large_file_parallel: bool,
 }
 
 pub(crate) async fn connect_with_retry(addr: &str) -> anyhow::Result<TcpStream> {
@@ -84,17 +86,30 @@ fn parse_peer_capabilities(version: &str) -> TransportFeatures {
     for capability in raw_capabilities.split(',') {
         if capability == LZ4_BLOCKS_CAPABILITY {
             features.lz4_block_messages = true;
+        } else if capability == LARGE_FILE_PARALLEL_CAPABILITY {
+            features.large_file_parallel = true;
         }
     }
 
     features
 }
 
-pub(crate) fn local_handshake_version(advertise_lz4: bool) -> String {
+pub(crate) fn local_handshake_version(
+    advertise_lz4: bool,
+    advertise_large_file_parallel: bool,
+) -> String {
+    let mut capabilities = Vec::new();
     if advertise_lz4 {
+        capabilities.push(LZ4_BLOCKS_CAPABILITY);
+    }
+    if advertise_large_file_parallel {
+        capabilities.push(LARGE_FILE_PARALLEL_CAPABILITY);
+    }
+    if !capabilities.is_empty() {
         return format!(
-            "{}+{CAPABILITIES_PREFIX}{LZ4_BLOCKS_CAPABILITY}",
-            env!("CARGO_PKG_VERSION")
+            "{}+{CAPABILITIES_PREFIX}{}",
+            env!("CARGO_PKG_VERSION"),
+            capabilities.join(",")
         );
     }
 
@@ -104,11 +119,13 @@ pub(crate) fn local_handshake_version(advertise_lz4: bool) -> String {
 pub(crate) fn negotiate_transport_features(
     peer_version: &str,
     allow_lz4: bool,
+    allow_large_file_parallel: bool,
 ) -> anyhow::Result<TransportFeatures> {
     validate_peer_version(peer_version)?;
     let peer_features = parse_peer_capabilities(peer_version);
     Ok(TransportFeatures {
         lz4_block_messages: allow_lz4 && peer_features.lz4_block_messages,
+        large_file_parallel: allow_large_file_parallel && peer_features.large_file_parallel,
     })
 }
 
@@ -186,7 +203,7 @@ mod tests {
 
     #[test]
     fn test_local_handshake_version_advertises_lz4_capability() {
-        let version = local_handshake_version(true);
+        let version = local_handshake_version(true, false);
         assert!(version.contains("+caps=lz4-blocks"));
     }
 
@@ -196,11 +213,13 @@ mod tests {
         let features = negotiate_transport_features(
             &format!("{}+caps=lz4-blocks", env!("CARGO_PKG_VERSION")),
             true,
+            false,
         )?;
         assert_eq!(
             features,
             TransportFeatures {
                 lz4_block_messages: true,
+                large_file_parallel: false,
             }
         );
         Ok(())
@@ -208,8 +227,26 @@ mod tests {
 
     #[test]
     fn test_negotiate_transport_features_disables_lz4_without_peer_support() -> anyhow::Result<()> {
-        let features = negotiate_transport_features(env!("CARGO_PKG_VERSION"), true)?;
+        let features = negotiate_transport_features(env!("CARGO_PKG_VERSION"), true, false)?;
         assert_eq!(features, TransportFeatures::default());
+        Ok(())
+    }
+
+    #[test]
+    fn test_negotiate_transport_features_enables_large_file_parallel_when_both_peers_support_it()
+    -> anyhow::Result<()> {
+        let features = negotiate_transport_features(
+            &format!("{}+caps=large-file-parallel", env!("CARGO_PKG_VERSION")),
+            false,
+            true,
+        )?;
+        assert_eq!(
+            features,
+            TransportFeatures {
+                lz4_block_messages: false,
+                large_file_parallel: true,
+            }
+        );
         Ok(())
     }
 }

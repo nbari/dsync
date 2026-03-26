@@ -1,5 +1,5 @@
 use super::{
-    BLOCK_SIZE, BLOCK_SIZE_USIZE, RemoteSyncOptions,
+    BLOCK_SIZE, BLOCK_SIZE_USIZE, LargeFileParallelOptions, RemoteSyncOptions,
     codec::PxsCodec,
     path::{ensure_expected_protocol_path, relative_protocol_path},
     protocol::{
@@ -9,7 +9,9 @@ use super::{
         TransportFeatures, block_bytes, connect_with_retry, local_handshake_version,
         negotiate_transport_features, recv_with_timeout, skipped_bytes,
     },
-    ssh::{ChildSession, build_ssh_command, build_ssh_push_command},
+    ssh::{
+        ChildSession, build_ssh_chunk_writer_command, build_ssh_command, build_ssh_push_command,
+    },
     tasks::{SyncTask, collect_sync_tasks, source_path_for},
 };
 use crate::pxs::tools;
@@ -30,12 +32,21 @@ struct SessionOptionFlags {
     delete: bool,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone)]
 struct SenderLoopOptions {
     threshold: f32,
     checksum: bool,
     session: SessionOptionFlags,
     allow_lz4: bool,
+    large_file_parallel: Option<ParallelSenderOptions>,
+}
+
+#[derive(Clone)]
+struct ParallelSenderOptions {
+    threshold_bytes: u64,
+    worker_count: usize,
+    ssh_addr: String,
+    ssh_dst_path: String,
 }
 
 /// Run the listener in sender mode (serves files to clients).
@@ -80,6 +91,7 @@ pub async fn run_sender_listener(
                         delete: false,
                     },
                     allow_lz4: true,
+                    large_file_parallel: None,
                 },
                 &tasks,
                 pb,
@@ -176,7 +188,7 @@ async fn run_sender_workers(
         workers.push(tokio::spawn(async move {
             let stream = connect_with_retry(&addr_owned).await?;
             let mut framed = Framed::new(stream, PxsCodec);
-            let features = sender_handshake(&mut framed, true).await?;
+            let features = sender_handshake(&mut framed, true, false).await?;
             send_push_session_options(&mut framed, fsync, false).await?;
 
             for rel_path in batch {
@@ -185,10 +197,13 @@ async fn run_sender_workers(
                     &mut framed,
                     &src_root_worker,
                     &src_path,
-                    threshold,
-                    checksum,
-                    Arc::clone(&progress_worker),
-                    features,
+                    RemoteFileSyncOptions {
+                        threshold,
+                        checksum,
+                        progress: Arc::clone(&progress_worker),
+                        features,
+                        parallel: None,
+                    },
                 )
                 .await?;
             }
@@ -227,7 +242,7 @@ pub async fn run_sender(
     let main_framed = if has_non_file_tasks {
         let stream = connect_with_retry(addr).await?;
         let mut framed = Framed::new(stream, PxsCodec);
-        let _ = sender_handshake(&mut framed, true).await?;
+        let _ = sender_handshake(&mut framed, true, false).await?;
         send_push_session_options(&mut framed, fsync, false).await?;
         send_non_file_tasks(&mut framed, &tasks).await?;
         Some(framed)
@@ -301,6 +316,7 @@ pub async fn run_stdio_sender(
                 delete,
             },
             allow_lz4: false,
+            large_file_parallel: None,
         },
         &tasks,
         progress,
@@ -338,6 +354,17 @@ pub async fn run_ssh_sender(
                 delete: options.features.delete,
             },
             allow_lz4: false,
+            large_file_parallel: options.large_file_parallel.map(
+                |LargeFileParallelOptions {
+                     threshold_bytes,
+                     worker_count,
+                 }| ParallelSenderOptions {
+                    threshold_bytes,
+                    worker_count,
+                    ssh_addr: addr.to_string(),
+                    ssh_dst_path: dst_path.to_string(),
+                },
+            ),
         },
         &tasks,
         Arc::clone(&progress),
@@ -351,19 +378,22 @@ pub async fn run_ssh_sender(
 async fn sender_handshake<T>(
     framed: &mut Framed<T, PxsCodec>,
     allow_lz4: bool,
+    allow_large_file_parallel: bool,
 ) -> anyhow::Result<TransportFeatures>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let handshake = Message::Handshake {
-        version: local_handshake_version(allow_lz4),
+        version: local_handshake_version(allow_lz4, allow_large_file_parallel),
     };
     framed.send(serialize_message(&handshake)?).await?;
     let resp_bytes = recv_with_timeout(framed)
         .await?
         .ok_or_else(|| anyhow::anyhow!("Connection closed during handshake"))?;
     match deserialize_message(&resp_bytes)? {
-        Message::Handshake { version } => negotiate_transport_features(&version, allow_lz4),
+        Message::Handshake { version } => {
+            negotiate_transport_features(&version, allow_lz4, allow_large_file_parallel)
+        }
         Message::Error(message) => anyhow::bail!("Handshake rejected: {message}"),
         other => anyhow::bail!("Unexpected handshake response: {other:?}"),
     }
@@ -385,6 +415,30 @@ where
         .send(serialize_message(&Message::SessionOptions {
             fsync,
             delete,
+        })?)
+        .await?;
+    Ok(())
+}
+
+async fn send_parallel_transfer_config<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    config: Option<ParallelSenderOptions>,
+    features: TransportFeatures,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let Some(config) = config else {
+        return Ok(());
+    };
+    if !features.large_file_parallel || config.worker_count <= 1 || config.threshold_bytes == 0 {
+        return Ok(());
+    }
+
+    framed
+        .send(serialize_message(&Message::ParallelTransferConfig {
+            threshold_bytes: config.threshold_bytes,
+            worker_count: u16::try_from(config.worker_count).map_err(|e| anyhow::anyhow!(e))?,
         })?)
         .await?;
     Ok(())
@@ -418,8 +472,14 @@ async fn sender_loop<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let features = sender_handshake(framed, options.allow_lz4).await?;
+    let features = sender_handshake(
+        framed,
+        options.allow_lz4,
+        options.large_file_parallel.is_some(),
+    )
+    .await?;
     send_push_session_options(framed, options.session.fsync, options.session.delete).await?;
+    send_parallel_transfer_config(framed, options.large_file_parallel.clone(), features).await?;
 
     framed
         .send(serialize_message(&Message::SyncStart {
@@ -456,10 +516,13 @@ where
                     framed,
                     src_root,
                     &src_path,
-                    options.threshold,
-                    options.checksum,
-                    Arc::clone(&progress),
-                    features,
+                    RemoteFileSyncOptions {
+                        threshold: options.threshold,
+                        checksum: options.checksum,
+                        progress: Arc::clone(&progress),
+                        features,
+                        parallel: options.large_file_parallel.clone(),
+                    },
                 )
                 .await?;
             }
@@ -655,6 +718,227 @@ where
     Ok(())
 }
 
+fn build_parallel_block_ranges(total_blocks: u64, worker_count: usize) -> Vec<(u64, u64)> {
+    if total_blocks == 0 || worker_count == 0 {
+        return Vec::new();
+    }
+
+    let effective_workers = worker_count.min(usize::try_from(total_blocks).unwrap_or(worker_count));
+    let base = total_blocks / u64::try_from(effective_workers).unwrap_or(1);
+    let remainder = total_blocks % u64::try_from(effective_workers).unwrap_or(1);
+    let mut start = 0_u64;
+    let mut ranges = Vec::with_capacity(effective_workers);
+
+    for worker_index in 0..effective_workers {
+        let extra = u64::from(u64::try_from(worker_index).unwrap_or(u64::MAX) < remainder);
+        let end = start + base + extra;
+        if start < end {
+            ranges.push((start, end));
+        }
+        start = end;
+    }
+
+    ranges
+}
+
+fn build_parallel_index_batches(indices: Vec<u32>, worker_count: usize) -> Vec<Vec<u32>> {
+    if indices.is_empty() || worker_count == 0 {
+        return Vec::new();
+    }
+
+    let effective_workers = worker_count.min(indices.len());
+    let mut batches = vec![Vec::new(); effective_workers];
+    for (index, block_index) in indices.into_iter().enumerate() {
+        let batch_index = index % effective_workers;
+        if let Some(batch) = batches.get_mut(batch_index) {
+            batch.push(block_index);
+        }
+    }
+    batches
+        .into_iter()
+        .filter(|batch| !batch.is_empty())
+        .collect()
+}
+
+async fn finish_worker_connection<T>(framed: &mut Framed<T, PxsCodec>) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    framed
+        .send(serialize_message(&Message::SyncComplete)?)
+        .await?;
+    let response = recv_with_timeout(framed)
+        .await?
+        .ok_or_else(|| anyhow::anyhow!("chunk writer closed before completion acknowledgment"))?;
+    match deserialize_message(&response)? {
+        Message::SyncCompleteAck => Ok(()),
+        Message::Error(message) => anyhow::bail!("chunk writer remote error: {message}"),
+        other => anyhow::bail!("unexpected chunk writer response: {other:?}"),
+    }
+}
+
+async fn send_full_copy_range<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    rel_path: &str,
+    source_reader: Arc<SourceReadContext>,
+    start_block: u64,
+    end_block: u64,
+    progress: &Arc<ProgressBar>,
+    features: TransportFeatures,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let batch_size = 128_u64;
+    let mut start = start_block;
+    let mut pending_blocks: Option<Vec<Block>> = None;
+
+    while start < end_block || pending_blocks.is_some() {
+        let read_future = if start < end_block {
+            let next_end = std::cmp::min(start + batch_size, end_block);
+            let next_start = next_end;
+            Some((
+                read_block_range(Arc::clone(&source_reader), start, next_end),
+                next_start,
+            ))
+        } else {
+            None
+        };
+
+        if let Some(blocks) = pending_blocks.take() {
+            if let Some((read_fut, next_start)) = read_future {
+                let (send_result, read_result) = tokio::join!(
+                    send_block_batch(framed, rel_path, blocks, progress, features),
+                    read_fut
+                );
+                send_result?;
+                pending_blocks = Some(read_result?);
+                start = next_start;
+            } else {
+                send_block_batch(framed, rel_path, blocks, progress, features).await?;
+            }
+        } else if let Some((read_fut, next_start)) = read_future {
+            pending_blocks = Some(read_fut.await?);
+            start = next_start;
+        }
+    }
+
+    Ok(())
+}
+
+async fn send_requested_block_batches<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    rel_path: &str,
+    source_reader: Arc<SourceReadContext>,
+    indices: Vec<u32>,
+    progress: &Arc<ProgressBar>,
+    features: TransportFeatures,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    for chunk_indices in indices.chunks(128) {
+        let blocks =
+            read_requested_blocks(Arc::clone(&source_reader), chunk_indices.to_vec()).await?;
+        send_block_batch(framed, rel_path, blocks, progress, features).await?;
+    }
+    Ok(())
+}
+
+async fn run_ssh_parallel_full_copy_workers(
+    options: &ParallelSenderOptions,
+    rel_path: &str,
+    transfer_id: &str,
+    metadata: FileMetadata,
+    progress: &Arc<ProgressBar>,
+    source_reader: Arc<SourceReadContext>,
+) -> anyhow::Result<()> {
+    let total_blocks = metadata.size.div_ceil(BLOCK_SIZE);
+    let ranges = build_parallel_block_ranges(total_blocks, options.worker_count);
+    let mut workers = Vec::with_capacity(ranges.len());
+
+    for (start_block, end_block) in ranges {
+        let addr = options.ssh_addr.clone();
+        let dst_path = options.ssh_dst_path.clone();
+        let transfer_id = transfer_id.to_string();
+        let rel_path = rel_path.to_string();
+        let progress = Arc::clone(progress);
+        let source_reader = Arc::clone(&source_reader);
+
+        workers.push(tokio::spawn(async move {
+            let remote_cmd = build_ssh_chunk_writer_command(&dst_path, &transfer_id, &rel_path);
+            let mut session = ChildSession::spawn(build_ssh_command(&addr, &remote_cmd))?;
+            let result = async {
+                let features = sender_handshake(session.framed_mut()?, false, false).await?;
+                send_full_copy_range(
+                    session.framed_mut()?,
+                    &rel_path,
+                    source_reader,
+                    start_block,
+                    end_block,
+                    &progress,
+                    features,
+                )
+                .await?;
+                finish_worker_connection(session.framed_mut()?).await
+            }
+            .await;
+            session.finish(result, "SSH chunk writer").await
+        }));
+    }
+
+    for worker in workers {
+        worker.await??;
+    }
+    Ok(())
+}
+
+async fn run_ssh_parallel_block_workers(
+    options: &ParallelSenderOptions,
+    rel_path: &str,
+    transfer_id: &str,
+    indices: Vec<u32>,
+    progress: &Arc<ProgressBar>,
+    source_reader: Arc<SourceReadContext>,
+) -> anyhow::Result<()> {
+    let batches = build_parallel_index_batches(indices, options.worker_count);
+    let mut workers = Vec::with_capacity(batches.len());
+
+    for batch in batches {
+        let addr = options.ssh_addr.clone();
+        let dst_path = options.ssh_dst_path.clone();
+        let transfer_id = transfer_id.to_string();
+        let rel_path = rel_path.to_string();
+        let progress = Arc::clone(progress);
+        let source_reader = Arc::clone(&source_reader);
+
+        workers.push(tokio::spawn(async move {
+            let remote_cmd = build_ssh_chunk_writer_command(&dst_path, &transfer_id, &rel_path);
+            let mut session = ChildSession::spawn(build_ssh_command(&addr, &remote_cmd))?;
+            let result = async {
+                let features = sender_handshake(session.framed_mut()?, false, false).await?;
+                send_requested_block_batches(
+                    session.framed_mut()?,
+                    &rel_path,
+                    source_reader,
+                    batch,
+                    &progress,
+                    features,
+                )
+                .await?;
+                finish_worker_connection(session.framed_mut()?).await
+            }
+            .await;
+            session.finish(result, "SSH chunk writer").await
+        }));
+    }
+
+    for worker in workers {
+        worker.await??;
+    }
+    Ok(())
+}
+
 async fn handle_request_full_copy_message<T>(
     framed: &mut Framed<T, PxsCodec>,
     rel_path: &str,
@@ -761,6 +1045,320 @@ where
     send_apply_metadata(framed, rel_path, metadata).await
 }
 
+#[derive(Clone)]
+struct RemoteFileSyncOptions {
+    threshold: f32,
+    checksum: bool,
+    progress: Arc<ProgressBar>,
+    features: TransportFeatures,
+    parallel: Option<ParallelSenderOptions>,
+}
+
+struct RemoteFileContext<'a> {
+    rel_path: String,
+    path: &'a Path,
+    metadata: FileMetadata,
+}
+
+impl RemoteFileContext<'_> {
+    fn ensure_expected_path(&self, received_path: &str) -> anyhow::Result<()> {
+        ensure_expected_protocol_path(&self.rel_path, received_path)
+    }
+}
+
+fn ensure_parallel_options(
+    parallel_options: Option<ParallelSenderOptions>,
+    transfer_kind: &str,
+) -> anyhow::Result<ParallelSenderOptions> {
+    parallel_options.ok_or_else(|| {
+        anyhow::anyhow!(
+            "remote requested parallel {transfer_kind} transfer but SSH large-file parallelism is not configured"
+        )
+    })
+}
+
+async fn handle_parallel_full_copy_request<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    context: &RemoteFileContext<'_>,
+    source_reader: &mut Option<Arc<SourceReadContext>>,
+    progress: &Arc<ProgressBar>,
+    parallel_options: Option<ParallelSenderOptions>,
+    transfer_id: String,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let source_reader = ensure_source_read_context(source_reader, context.path).await?;
+    let parallel_options = ensure_parallel_options(parallel_options, "full-copy")?;
+    run_ssh_parallel_full_copy_workers(
+        &parallel_options,
+        &context.rel_path,
+        &transfer_id,
+        context.metadata,
+        progress,
+        source_reader,
+    )
+    .await?;
+    send_apply_metadata(framed, &context.rel_path, context.metadata).await
+}
+
+async fn handle_parallel_block_request<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    context: &RemoteFileContext<'_>,
+    source_reader: &mut Option<Arc<SourceReadContext>>,
+    progress: &Arc<ProgressBar>,
+    parallel_options: Option<ParallelSenderOptions>,
+    transfer_id: String,
+    indices: Vec<u32>,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let source_reader = ensure_source_read_context(source_reader, context.path).await?;
+    let parallel_options = ensure_parallel_options(parallel_options, "block")?;
+    run_ssh_parallel_block_workers(
+        &parallel_options,
+        &context.rel_path,
+        &transfer_id,
+        indices,
+        progress,
+        source_reader,
+    )
+    .await?;
+    send_apply_metadata(framed, &context.rel_path, context.metadata).await
+}
+
+async fn handle_request_full_copy_with_context<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    context: &RemoteFileContext<'_>,
+    source_reader: &mut Option<Arc<SourceReadContext>>,
+    progress: &Arc<ProgressBar>,
+    features: TransportFeatures,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let source_reader = ensure_source_read_context(source_reader, context.path).await?;
+    handle_request_full_copy_message(
+        framed,
+        &context.rel_path,
+        source_reader,
+        context.metadata,
+        progress,
+        features,
+    )
+    .await
+}
+
+async fn handle_request_hashes_with_context<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    context: &RemoteFileContext<'_>,
+    source_reader: &mut Option<Arc<SourceReadContext>>,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let source_reader = ensure_source_read_context(source_reader, context.path).await?;
+    handle_request_hashes_message(framed, &context.rel_path, source_reader).await
+}
+
+async fn handle_request_blocks_with_context<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    context: &RemoteFileContext<'_>,
+    source_reader: &mut Option<Arc<SourceReadContext>>,
+    indices: Vec<u32>,
+    progress: &Arc<ProgressBar>,
+    features: TransportFeatures,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let source_reader = ensure_source_read_context(source_reader, context.path).await?;
+    handle_request_blocks_message(
+        framed,
+        &context.rel_path,
+        source_reader,
+        context.metadata,
+        indices,
+        progress,
+        features,
+    )
+    .await
+}
+
+async fn handle_metadata_applied_with_context<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    context: &RemoteFileContext<'_>,
+    checksum: bool,
+) -> anyhow::Result<bool>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    if !checksum {
+        return Ok(true);
+    }
+
+    let hash = tools::blake3_file_hash(context.path).await?;
+    framed
+        .send(serialize_message(&Message::VerifyChecksum {
+            path: context.rel_path.clone(),
+            hash,
+        })?)
+        .await?;
+    Ok(false)
+}
+
+async fn handle_end_of_file_with_context<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    context: &RemoteFileContext<'_>,
+    progress: &Arc<ProgressBar>,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    progress.inc(context.metadata.size);
+    send_apply_metadata(framed, &context.rel_path, context.metadata).await
+}
+
+enum RemoteFileMessageOutcome {
+    Continue,
+    Complete,
+}
+
+async fn handle_remote_file_request_message<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    context: &RemoteFileContext<'_>,
+    source_reader: &mut Option<Arc<SourceReadContext>>,
+    message: &Message,
+    options: &RemoteFileSyncOptions,
+) -> anyhow::Result<Option<RemoteFileMessageOutcome>>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    match message {
+        Message::RequestFullCopy {
+            path: received_path,
+        } => {
+            context.ensure_expected_path(received_path)?;
+            handle_request_full_copy_with_context(
+                framed,
+                context,
+                source_reader,
+                &options.progress,
+                options.features,
+            )
+            .await?;
+        }
+        Message::RequestHashes {
+            path: received_path,
+        } => {
+            context.ensure_expected_path(received_path)?;
+            handle_request_hashes_with_context(framed, context, source_reader).await?;
+        }
+        Message::RequestParallelFullCopy {
+            path: received_path,
+            transfer_id,
+        } => {
+            context.ensure_expected_path(received_path)?;
+            handle_parallel_full_copy_request(
+                framed,
+                context,
+                source_reader,
+                &options.progress,
+                options.parallel.clone(),
+                transfer_id.clone(),
+            )
+            .await?;
+        }
+        Message::RequestBlocks {
+            path: received_path,
+            indices,
+        } => {
+            context.ensure_expected_path(received_path)?;
+            handle_request_blocks_with_context(
+                framed,
+                context,
+                source_reader,
+                indices.clone(),
+                &options.progress,
+                options.features,
+            )
+            .await?;
+        }
+        Message::RequestParallelBlocks {
+            path: received_path,
+            transfer_id,
+            indices,
+        } => {
+            context.ensure_expected_path(received_path)?;
+            handle_parallel_block_request(
+                framed,
+                context,
+                source_reader,
+                &options.progress,
+                options.parallel.clone(),
+                transfer_id.clone(),
+                indices.clone(),
+            )
+            .await?;
+        }
+        _ => return Ok(None),
+    }
+
+    Ok(Some(RemoteFileMessageOutcome::Continue))
+}
+
+async fn handle_remote_file_status_message<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    context: &RemoteFileContext<'_>,
+    message: &Message,
+    options: &RemoteFileSyncOptions,
+) -> anyhow::Result<Option<RemoteFileMessageOutcome>>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    match message {
+        Message::MetadataApplied {
+            path: received_path,
+        } => {
+            context.ensure_expected_path(received_path)?;
+            let done =
+                handle_metadata_applied_with_context(framed, context, options.checksum).await?;
+            Ok(Some(if done {
+                RemoteFileMessageOutcome::Complete
+            } else {
+                RemoteFileMessageOutcome::Continue
+            }))
+        }
+        Message::ChecksumVerified {
+            path: received_path,
+        } => {
+            context.ensure_expected_path(received_path)?;
+            Ok(Some(RemoteFileMessageOutcome::Complete))
+        }
+        Message::ChecksumMismatch {
+            path: received_path,
+        } => {
+            context.ensure_expected_path(received_path)?;
+            anyhow::bail!(
+                "Checksum mismatch for {}: destination file differs from source after transfer",
+                context.rel_path
+            );
+        }
+        Message::EndOfFile {
+            path: received_path,
+        } => {
+            context.ensure_expected_path(received_path)?;
+            handle_end_of_file_with_context(framed, context, &options.progress).await?;
+            Ok(Some(RemoteFileMessageOutcome::Continue))
+        }
+        Message::Error(error_message) => {
+            anyhow::bail!("Remote error for {}: {error_message}", context.rel_path);
+        }
+        _ => Ok(None),
+    }
+}
+
 /// Sync a remote file.
 ///
 /// # Errors
@@ -781,10 +1379,13 @@ where
         framed,
         src_root,
         path,
-        threshold,
-        checksum,
-        progress,
-        TransportFeatures::default(),
+        RemoteFileSyncOptions {
+            threshold,
+            checksum,
+            progress,
+            features: TransportFeatures::default(),
+            parallel: None,
+        },
     )
     .await
 }
@@ -793,101 +1394,43 @@ async fn sync_remote_file_with_features<T>(
     framed: &mut Framed<T, PxsCodec>,
     src_root: &Path,
     path: &Path,
-    threshold: f32,
-    checksum: bool,
-    progress: Arc<ProgressBar>,
-    features: TransportFeatures,
+    options: RemoteFileSyncOptions,
 ) -> anyhow::Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let rel_path = relative_protocol_path(src_root, path)?;
-    let metadata = FileMetadata::from(tokio::fs::metadata(path).await?);
+    let context = RemoteFileContext {
+        rel_path: relative_protocol_path(src_root, path)?,
+        path,
+        metadata: FileMetadata::from(tokio::fs::metadata(path).await?),
+    };
     let mut source_reader: Option<Arc<SourceReadContext>> = None;
-    progress.set_message(rel_path.clone());
-    send_sync_file_message(framed, &rel_path, metadata, threshold, checksum).await?;
+    options.progress.set_message(context.rel_path.clone());
+    send_sync_file_message(
+        framed,
+        &context.rel_path,
+        context.metadata,
+        options.threshold,
+        options.checksum,
+    )
+    .await?;
 
     while let Some(msg_bytes) = recv_with_timeout(framed).await? {
         let msg = deserialize_message(&msg_bytes)?;
-        match msg {
-            Message::RequestFullCopy {
-                path: received_path,
-            } => {
-                ensure_expected_protocol_path(&rel_path, &received_path)?;
-                let source_reader = ensure_source_read_context(&mut source_reader, path).await?;
-                handle_request_full_copy_message(
-                    framed,
-                    &rel_path,
-                    source_reader,
-                    metadata,
-                    &progress,
-                    features,
-                )
-                .await?;
-            }
-            Message::RequestHashes {
-                path: received_path,
-            } => {
-                ensure_expected_protocol_path(&rel_path, &received_path)?;
-                let source_reader = ensure_source_read_context(&mut source_reader, path).await?;
-                handle_request_hashes_message(framed, &rel_path, source_reader).await?;
-            }
-            Message::RequestBlocks {
-                path: received_path,
-                indices,
-            } => {
-                ensure_expected_protocol_path(&rel_path, &received_path)?;
-                let source_reader = ensure_source_read_context(&mut source_reader, path).await?;
-                handle_request_blocks_message(
-                    framed,
-                    &rel_path,
-                    source_reader,
-                    metadata,
-                    indices,
-                    &progress,
-                    features,
-                )
-                .await?;
-            }
-            Message::MetadataApplied {
-                path: received_path,
-            } => {
-                ensure_expected_protocol_path(&rel_path, &received_path)?;
-                if checksum {
-                    let hash = tools::blake3_file_hash(path).await?;
-                    framed
-                        .send(serialize_message(&Message::VerifyChecksum {
-                            path: rel_path.clone(),
-                            hash,
-                        })?)
-                        .await?;
-                } else {
-                    return Ok(());
-                }
-            }
-            Message::ChecksumVerified {
-                path: received_path,
-            } => {
-                ensure_expected_protocol_path(&rel_path, &received_path)?;
+        if let Some(outcome) =
+            handle_remote_file_request_message(framed, &context, &mut source_reader, &msg, &options)
+                .await?
+        {
+            if matches!(outcome, RemoteFileMessageOutcome::Complete) {
                 return Ok(());
             }
-            Message::ChecksumMismatch {
-                path: received_path,
-            } => {
-                ensure_expected_protocol_path(&rel_path, &received_path)?;
-                anyhow::bail!(
-                    "Checksum mismatch for {rel_path}: destination file differs from source after transfer"
-                );
-            }
-            Message::EndOfFile {
-                path: received_path,
-            } => {
-                ensure_expected_protocol_path(&rel_path, &received_path)?;
-                progress.inc(metadata.size);
-                send_apply_metadata(framed, &rel_path, metadata).await?;
-            }
-            Message::Error(message) => anyhow::bail!("Remote error for {rel_path}: {message}"),
-            _ => anyhow::bail!("Unexpected message: {msg:?}"),
+            continue;
+        }
+
+        match handle_remote_file_status_message(framed, &context, &msg, &options).await? {
+            Some(RemoteFileMessageOutcome::Complete) => return Ok(()),
+            Some(RemoteFileMessageOutcome::Continue) => {}
+            None => anyhow::bail!("Unexpected message: {msg:?}"),
         }
     }
 
@@ -912,7 +1455,7 @@ mod tests {
         let mut peer_framed = Framed::new(server, PxsCodec);
 
         let sender_task =
-            tokio::spawn(async move { sender_handshake(&mut sender_framed, true).await });
+            tokio::spawn(async move { sender_handshake(&mut sender_framed, true, false).await });
 
         let handshake = peer_framed
             .next()
@@ -956,6 +1499,7 @@ mod tests {
             &progress,
             TransportFeatures {
                 lz4_block_messages: true,
+                large_file_parallel: false,
             },
         )
         .await?;

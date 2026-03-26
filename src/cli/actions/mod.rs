@@ -36,6 +36,8 @@ pub enum Action {
         checksum: bool,
         delete: bool,
         fsync: bool,
+        large_file_parallel_threshold: u64,
+        large_file_parallel_workers: usize,
         ignores: Vec<String>,
         quiet: bool,
     },
@@ -80,6 +82,13 @@ pub enum Action {
         checksum: bool,
         delete: bool,
         ignores: Vec<String>,
+        quiet: bool,
+    },
+    /// Internal stdio worker used by SSH large-file chunk transfer.
+    InternalChunkWrite {
+        dst: PathBuf,
+        transfer_id: String,
+        path: String,
         quiet: bool,
     },
 }

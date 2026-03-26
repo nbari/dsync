@@ -109,6 +109,12 @@ fn handle_push(matches: &ArgMatches, quiet: bool) -> anyhow::Result<Action> {
         checksum: matches.get_flag("checksum"),
         delete: matches.get_flag("delete"),
         fsync: matches.get_flag("fsync"),
+        large_file_parallel_threshold: *matches
+            .get_one::<u64>("large_file_parallel_threshold")
+            .unwrap_or(&0),
+        large_file_parallel_workers: *matches
+            .get_one::<usize>("large_file_parallel_workers")
+            .unwrap_or(&0),
         ignores: parse_ignores(matches),
         quiet,
     })
@@ -165,6 +171,15 @@ fn handle_internal_stdio(matches: &ArgMatches, quiet: bool) -> anyhow::Result<Ac
     let threshold = threshold(matches);
     let checksum = matches.get_flag("checksum");
     let quiet = quiet || matches.get_flag("quiet");
+
+    if matches.get_flag("chunk_writer") {
+        return Ok(Action::InternalChunkWrite {
+            dst: required_path(matches, "destination")?,
+            transfer_id: required_string(matches, "transfer_id")?,
+            path: required_string(matches, "chunk_path")?,
+            quiet,
+        });
+    }
 
     if matches.get_flag("sender") {
         return Ok(Action::InternalStdioSend {
@@ -400,6 +415,39 @@ mod tests {
                 assert!(checksum);
                 assert!(delete);
                 assert!(fsync);
+            }
+            other => anyhow::bail!("expected Action::Push, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
+    fn test_push_ssh_endpoint_parses_large_file_parallel_flags() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, "content")?;
+        let src_arg = src.to_string_lossy().to_string();
+
+        let action = parse_action(&[
+            "pxs",
+            "push",
+            &src_arg,
+            "user@example:/srv/data",
+            "--large-file-parallel-threshold",
+            "2GiB",
+            "--large-file-parallel-workers",
+            "4",
+        ])?;
+
+        match action {
+            Action::Push {
+                large_file_parallel_threshold,
+                large_file_parallel_workers,
+                ..
+            } => {
+                assert_eq!(large_file_parallel_threshold, 2 * 1024_u64.pow(3));
+                assert_eq!(large_file_parallel_workers, 4);
             }
             other => anyhow::bail!("expected Action::Push, got {other:?}"),
         }

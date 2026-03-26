@@ -2,6 +2,26 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.0] - 2026-03-26
+
+### Added
+
+- Added SSH push chunk-parallel large-file transfer with automatic activation above `--large-file-parallel-threshold` and conservative worker defaults from available CPU cores.
+- Added new `push` flags `--large-file-parallel-threshold <SIZE>` and `--large-file-parallel-workers <N>` for tuning large-file SSH worker fan-out.
+- Added regression coverage for the new parallel receiver path, including transfer-id negotiation, parallel block/full-copy requests, chunk-writer path validation, and non-UTF8 staged-path handling.
+
+### Changed
+
+- Reworked the internal SSH large-file worker flow to use receiver-issued transfer ids instead of exposing staged filesystem paths back to the sender.
+- Hardened hidden `--chunk-writer` execution so worker sessions resolve receiver-owned transfer records under the destination root before writing any block data.
+- Kept raw TCP behavior unchanged; the new large-file parallelism remains scoped to SSH push.
+
+### Fixed
+
+- Fixed a write-scope escape in the new SSH chunk-writer path where a caller-supplied staged path could previously target arbitrary writable files.
+- Fixed lossy staged-path transport in the SSH large-file worker flow so non-UTF8 staged temp paths no longer break chunk-writer transfers.
+- Fixed parallel-transfer cleanup so abandoned or failed receiver-side staged files remove their transfer records before the session exits.
+
 ## [0.4.2] - 2026-03-24
 
 ### Fixed

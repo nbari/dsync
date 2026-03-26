@@ -1,6 +1,0 @@
-flowchart LR
-    SRC[Source path] --> WALK[Parallel file walker]
-    WALK --> HASH[Parallel block hasher]
-    HASH --> COMPARE[Block comparator]
-    COMPARE -->|Changed blocks only| WRITE[Parallel block writer]
-    WRITE --> DST[Destination path]

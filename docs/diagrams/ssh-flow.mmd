@@ -1,5 +1,0 @@
-flowchart LR
-    CLI[Local pxs CLI] -->|starts| SSH[SSH process]
-    CLI <-->|pxs protocol over stdio| SSH
-    SSH <-->|encrypted transport| REMOTE[Remote pxs --stdio]
-    REMOTE --> DST[Destination path]

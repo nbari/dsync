@@ -77,9 +77,6 @@ flowchart LR
     WRITE --> DST[Destination path]
 ```
 
-Mermaid source: [`docs/diagrams/local-sync.mmd`](docs/diagrams/local-sync.mmd)
-Fallback image: [`docs/diagrams/local-sync.svg`](docs/diagrams/local-sync.svg)
-
 ### Network Synchronization (Direct TCP)
 
 ```mermaid
@@ -106,21 +103,18 @@ sequenceDiagram
     end
 ```
 
-Mermaid source: [`docs/diagrams/direct-tcp.mmd`](docs/diagrams/direct-tcp.mmd)
-Fallback image: [`docs/diagrams/direct-tcp.svg`](docs/diagrams/direct-tcp.svg)
-
 ### SSH Synchronization (Auto-Tunnel)
 
 ```mermaid
 flowchart LR
-    CLI[Local pxs CLI] -->|starts| SSH[SSH process]
-    CLI <-->|pxs protocol over stdio| SSH
-    SSH <-->|encrypted transport| REMOTE[Remote pxs --stdio]
+    CLI[Local pxs CLI] --> CTRL[SSH control session]
+    CTRL <-->|pxs protocol over stdio| REMOTE[Remote pxs --stdio receiver]
     REMOTE --> DST[Destination path]
+    CTRL -. large SSH push files .-> WORKERS[SSH chunk-writer sessions]
+    WORKERS -->|transfer-id bound block writes| REMOTE
 ```
 
-Mermaid source: [`docs/diagrams/ssh-flow.mmd`](docs/diagrams/ssh-flow.mmd)
-Fallback image: [`docs/diagrams/ssh-flow.svg`](docs/diagrams/ssh-flow.svg)
+For normal SSH transfers, `pxs` uses a single control session. For eligible large-file SSH `push` operations, that control session can spawn additional chunk-writer SSH workers while final metadata, checksum, delete finalization, and completion acknowledgment stay on the control path.
 
 ### Delta Sync Algorithm
 
@@ -143,9 +137,6 @@ flowchart TD
     SKIP --> DONE([Done])
     META --> DONE
 ```
-
-Mermaid source: [`docs/diagrams/delta-sync.mmd`](docs/diagrams/delta-sync.mmd)
-Fallback image: [`docs/diagrams/delta-sync.svg`](docs/diagrams/delta-sync.svg)
 
 ## Usage
 
@@ -294,6 +285,9 @@ pxs pull 192.168.1.10:8080 ./snapshot.bin
 ### SSH Command Pairs
 Use these when you want `pxs` to manage the SSH tunnel automatically:
 
+> [!IMPORTANT]
+> The built-in SSH transport is designed for non-interactive authentication. In practice, that means SSH keys, `ssh-agent`, or an already-established multiplexed SSH session. Interactive password prompts are not a supported workflow for `pxs push` / `pxs pull` over SSH.
+
 ```bash
 # Push local data to a remote path over SSH
 pxs push my_file.bin user@remote-server:/path/to/dest/my_file.bin
@@ -308,6 +302,8 @@ If you need custom SSH flags, you can still use the internal `--stdio` transport
 ```bash
 ssh user@remote-server "pxs --stdio --quiet --destination /path/to/new/data" < <(pxs push /path/to/old/data -)
 ```
+
+If you cannot use SSH keys, authenticate with plain `ssh` first or use SSH multiplexing outside `pxs`, then run the transfer over that existing SSH setup.
 
 ## PGDATA Migration Script
 
@@ -345,6 +341,8 @@ This repository includes [`sync.sh`](./sync.sh), a PostgreSQL-focused migration 
 *   **`--threshold` (-t)**: (Default: 0.5) If the destination file is less than X% the size of the source, perform a full copy instead of hashing.
 *   **`--dry-run` (-n)**: Show what would have been transferred without making any changes.
 *   **`--verbose` (-v)**: Increase logging verbosity (use `-vv` for debug).
+*   **`--large-file-parallel-threshold`**: (Default: 1GiB) Enable SSH push chunk-parallel transfer for files at or above this size. Use 0 to disable.
+*   **`--large-file-parallel-workers`**: Set the number of SSH worker sessions for large-file push. If omitted, `pxs` chooses a conservative default from available CPU cores.
 
 ## Progress Output & Quiet Mode
 

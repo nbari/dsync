@@ -3,6 +3,8 @@ use futures_util::{SinkExt, StreamExt};
 use indicatif::ProgressBar;
 use pxs::pxs::net::{self, Block, FileMetadata, Message};
 use pxs::pxs::tools;
+use std::ffi::OsString;
+use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
 use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
 use tempfile::tempdir;
@@ -74,6 +76,48 @@ fn spawn_stdio_sender(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     sender.spawn().map_err(Into::into)
+}
+
+fn create_parallel_transfer_record(
+    dst_root: &std::path::Path,
+    transfer_id: &str,
+    chunk_path: &str,
+    staged_path: &std::path::Path,
+) -> anyhow::Result<()> {
+    let record_dir = dst_root.join(".pxs-transfers").join(transfer_id);
+    std::fs::create_dir_all(&record_dir)?;
+    std::fs::write(record_dir.join("path"), chunk_path.as_bytes())?;
+    std::os::unix::fs::symlink(staged_path, record_dir.join("staged"))?;
+    Ok(())
+}
+
+fn child_framed(
+    child: &mut tokio::process::Child,
+) -> anyhow::Result<
+    Framed<tokio::io::Join<tokio::process::ChildStdout, tokio::process::ChildStdin>, net::PxsCodec>,
+> {
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing child stdout"))?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing child stdin"))?;
+    Ok(Framed::new(tokio::io::join(stdout, stdin), net::PxsCodec))
+}
+
+async fn wait_for_child(
+    mut child: tokio::process::Child,
+) -> anyhow::Result<(std::process::ExitStatus, String)> {
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("missing child stderr"))?;
+    let stderr_task = tokio::spawn(collect_stdio_stderr(stderr));
+    let status = child.wait().await?;
+    let stderr_output = String::from_utf8_lossy(&stderr_task.await??).into_owned();
+    Ok((status, stderr_output))
 }
 
 async fn collect_stdio_stderr(
@@ -466,6 +510,297 @@ async fn test_stdio_transport_delete_preserves_ignored_destination_entries() -> 
         "preserve me"
     );
     assert!(!dst_dir.join("stale.txt").exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_stdio_receiver_requests_parallel_full_copy_and_cleans_transfer_record()
+-> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let dst_root = dir.path().join("dst");
+    std::fs::create_dir_all(&dst_root)?;
+
+    let bin = env!("CARGO_BIN_EXE_pxs");
+    let mut receiver = spawn_stdio_receiver(bin, &dst_root, &[])?;
+    let mut framed = child_framed(&mut receiver)?;
+
+    framed
+        .send(net::serialize_message(&Message::Handshake {
+            version: format!("{}+caps=large-file-parallel", env!("CARGO_PKG_VERSION")),
+        })?)
+        .await?;
+
+    let handshake = framed
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("missing receiver handshake"))??;
+    match net::deserialize_message(&handshake)? {
+        Message::Handshake { version } => assert!(version.contains("large-file-parallel")),
+        other => anyhow::bail!("expected handshake, got {other:?}"),
+    }
+
+    framed
+        .send(net::serialize_message(&Message::ParallelTransferConfig {
+            threshold_bytes: 1,
+            worker_count: 2,
+        })?)
+        .await?;
+    framed
+        .send(net::serialize_message(&Message::SyncFile {
+            path: String::from("large.bin"),
+            metadata: FileMetadata {
+                size: 512 * 1024,
+                mtime: 1_000_000_000,
+                mtime_nsec: 0,
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+            },
+            threshold: 0.5,
+            checksum: false,
+        })?)
+        .await?;
+
+    let request = framed
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("missing parallel full-copy request"))??;
+    let transfer_id = match net::deserialize_message(&request)? {
+        Message::RequestParallelFullCopy { path, transfer_id } => {
+            assert_eq!(path, "large.bin");
+            transfer_id
+        }
+        other => anyhow::bail!("expected RequestParallelFullCopy, got {other:?}"),
+    };
+
+    let transfer_dir = dst_root.join(".pxs-transfers").join(&transfer_id);
+    assert!(transfer_dir.exists());
+
+    drop(framed);
+    let (status, stderr) = wait_for_child(receiver).await?;
+    assert!(!status.success());
+    assert!(!transfer_dir.exists());
+    assert!(
+        stderr.contains("incomplete transfer state")
+            || stderr.contains("pending staged file")
+            || stderr.contains("Connection closed"),
+        "{stderr}"
+    );
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_stdio_receiver_requests_parallel_blocks_with_transfer_id() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let dst_root = dir.path().join("dst");
+    std::fs::create_dir_all(&dst_root)?;
+    std::fs::write(dst_root.join("delta.bin"), b"old payload")?;
+
+    let src_file = dir.path().join("src.bin");
+    std::fs::write(&src_file, b"new payload")?;
+    let hashes = tools::calculate_file_hashes(&src_file, 128 * 1024).await?;
+
+    let bin = env!("CARGO_BIN_EXE_pxs");
+    let mut receiver = spawn_stdio_receiver(bin, &dst_root, &[])?;
+    let mut framed = child_framed(&mut receiver)?;
+
+    framed
+        .send(net::serialize_message(&Message::Handshake {
+            version: format!("{}+caps=large-file-parallel", env!("CARGO_PKG_VERSION")),
+        })?)
+        .await?;
+    let _ = framed
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("missing receiver handshake"))??;
+
+    framed
+        .send(net::serialize_message(&Message::ParallelTransferConfig {
+            threshold_bytes: 1,
+            worker_count: 2,
+        })?)
+        .await?;
+    framed
+        .send(net::serialize_message(&Message::SyncFile {
+            path: String::from("delta.bin"),
+            metadata: FileMetadata {
+                size: 11,
+                mtime: 1_000_000_000,
+                mtime_nsec: 0,
+                mode: 0o644,
+                uid: 1000,
+                gid: 1000,
+            },
+            threshold: 0.0,
+            checksum: true,
+        })?)
+        .await?;
+
+    let request_hashes = framed
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("missing hash request"))??;
+    match net::deserialize_message(&request_hashes)? {
+        Message::RequestHashes { path } => assert_eq!(path, "delta.bin"),
+        other => anyhow::bail!("expected RequestHashes, got {other:?}"),
+    }
+
+    framed
+        .send(net::serialize_message(&Message::BlockHashes {
+            path: String::from("delta.bin"),
+            hashes,
+        })?)
+        .await?;
+
+    let request = framed
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("missing parallel block request"))??;
+    let transfer_id = match net::deserialize_message(&request)? {
+        Message::RequestParallelBlocks {
+            path,
+            transfer_id,
+            indices,
+        } => {
+            assert_eq!(path, "delta.bin");
+            assert!(!indices.is_empty());
+            transfer_id
+        }
+        other => anyhow::bail!("expected RequestParallelBlocks, got {other:?}"),
+    };
+
+    let transfer_dir = dst_root.join(".pxs-transfers").join(&transfer_id);
+    assert!(transfer_dir.exists());
+
+    drop(framed);
+    let (status, _stderr) = wait_for_child(receiver).await?;
+    assert!(!status.success());
+    assert!(!transfer_dir.exists());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_chunk_writer_rejects_unknown_transfer_id() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let dst_root = dir.path().join("dst");
+    std::fs::create_dir_all(&dst_root)?;
+
+    let bin = env!("CARGO_BIN_EXE_pxs");
+    let receiver = spawn_stdio_receiver(
+        bin,
+        &dst_root,
+        &[
+            "--chunk-writer",
+            "--transfer-id",
+            "deadbeef",
+            "--chunk-path",
+            "file.bin",
+        ],
+    )?;
+
+    let (status, stderr) = wait_for_child(receiver).await?;
+    assert!(!status.success());
+    assert!(stderr.contains("unknown transfer id"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_chunk_writer_rejects_transfer_path_mismatch() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let dst_root = dir.path().join("dst");
+    std::fs::create_dir_all(&dst_root)?;
+    let staged_path = dst_root.join("file.tmp");
+    std::fs::write(&staged_path, [])?;
+    create_parallel_transfer_record(&dst_root, "feedface", "file.bin", &staged_path)?;
+
+    let bin = env!("CARGO_BIN_EXE_pxs");
+    let receiver = spawn_stdio_receiver(
+        bin,
+        &dst_root,
+        &[
+            "--chunk-writer",
+            "--transfer-id",
+            "feedface",
+            "--chunk-path",
+            "other.bin",
+        ],
+    )?;
+
+    let (status, stderr) = wait_for_child(receiver).await?;
+    assert!(!status.success());
+    assert!(stderr.contains("protocol path mismatch"));
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_chunk_writer_supports_non_utf8_staged_path() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let dst_root = dir.path().join("dst");
+    std::fs::create_dir_all(&dst_root)?;
+
+    let staged_name = OsString::from_vec(b"file-\xff.tmp".to_vec());
+    let staged_path = dst_root.join(staged_name);
+    std::fs::write(&staged_path, [])?;
+    create_parallel_transfer_record(&dst_root, "cafebabe", "file.bin", &staged_path)?;
+
+    let bin = env!("CARGO_BIN_EXE_pxs");
+    let mut receiver = spawn_stdio_receiver(
+        bin,
+        &dst_root,
+        &[
+            "--chunk-writer",
+            "--transfer-id",
+            "cafebabe",
+            "--chunk-path",
+            "file.bin",
+        ],
+    )?;
+    let mut framed = child_framed(&mut receiver)?;
+
+    framed
+        .send(net::serialize_message(&Message::Handshake {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })?)
+        .await?;
+
+    let handshake = if let Some(result) = framed.next().await {
+        result?
+    } else {
+        drop(framed);
+        let (_status, stderr) = wait_for_child(receiver).await?;
+        anyhow::bail!("missing chunk writer handshake: {stderr}");
+    };
+    match net::deserialize_message(&handshake)? {
+        Message::Handshake { .. } => {}
+        other => anyhow::bail!("expected handshake, got {other:?}"),
+    }
+
+    framed
+        .send(net::serialize_message(&Message::ApplyBlocks {
+            path: String::from("file.bin"),
+            blocks: vec![Block {
+                offset: 0,
+                data: b"hello".to_vec(),
+            }],
+        })?)
+        .await?;
+    framed
+        .send(net::serialize_message(&Message::SyncComplete)?)
+        .await?;
+
+    let response = framed
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("missing chunk writer completion response"))??;
+    match net::deserialize_message(&response)? {
+        Message::SyncCompleteAck => {}
+        other => anyhow::bail!("expected SyncCompleteAck, got {other:?}"),
+    }
+
+    drop(framed);
+    let (status, stderr) = wait_for_child(receiver).await?;
+    assert!(status.success(), "{stderr}");
+    assert_eq!(std::fs::read(&staged_path)?, b"hello");
     Ok(())
 }
 

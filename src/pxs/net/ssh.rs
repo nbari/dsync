@@ -37,6 +37,28 @@ pub(crate) fn build_ssh_push_command(dst_path: &str, fsync: bool, ignores: &[Str
     build_remote_command(&args)
 }
 
+/// Build the remote pxs command used for SSH chunk-writer worker mode.
+#[must_use]
+pub(crate) fn build_ssh_chunk_writer_command(
+    dst_path: &str,
+    transfer_id: &str,
+    rel_path: &str,
+) -> String {
+    let args = vec![
+        "pxs".to_string(),
+        "--stdio".to_string(),
+        "--quiet".to_string(),
+        "--destination".to_string(),
+        dst_path.to_string(),
+        "--chunk-writer".to_string(),
+        "--transfer-id".to_string(),
+        transfer_id.to_string(),
+        "--chunk-path".to_string(),
+        rel_path.to_string(),
+    ];
+    build_remote_command(&args)
+}
+
 /// Build the remote pxs command used for SSH pull mode.
 #[must_use]
 pub(crate) fn build_ssh_pull_command(
@@ -155,8 +177,8 @@ impl ChildSession {
 #[cfg(test)]
 mod tests {
     use super::{
-        ChildSession, build_ssh_command, build_ssh_pull_command, build_ssh_push_command,
-        shell_quote,
+        ChildSession, build_ssh_chunk_writer_command, build_ssh_command, build_ssh_pull_command,
+        build_ssh_push_command, shell_quote,
     };
     use std::time::{Duration, Instant};
     use tokio::process::Command;
@@ -191,6 +213,16 @@ mod tests {
         assert_eq!(
             command,
             "'pxs' '--stdio' '--quiet' '--sender' '--source' '/tmp/src path/it'\"'\"'s here' '--threshold' '0.5' '--checksum' '--ignore' 'space name'"
+        );
+    }
+
+    #[test]
+    fn test_build_ssh_chunk_writer_command_quotes_paths() {
+        let command =
+            build_ssh_chunk_writer_command("/tmp/dst path", "deadbeef-42", "nested/it's-here");
+        assert_eq!(
+            command,
+            "'pxs' '--stdio' '--quiet' '--destination' '/tmp/dst path' '--chunk-writer' '--transfer-id' 'deadbeef-42' '--chunk-path' 'nested/it'\"'\"'s-here'"
         );
     }
 

@@ -1,7 +1,7 @@
 use super::{
     BLOCK_SIZE, RemoteSyncOptions,
     codec::PxsCodec,
-    path::{resolve_protocol_path, validate_protocol_path},
+    path::{ensure_expected_protocol_path, resolve_protocol_path, validate_protocol_path},
     protocol::{
         Block, FileMetadata, Message, apply_file_metadata, deserialize_block_batch,
         deserialize_message, serialize_message,
@@ -19,7 +19,11 @@ use std::{
     collections::{HashMap, HashSet},
     os::unix::fs::{FileExt, MetadataExt},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::{SystemTime, UNIX_EPOCH},
 };
 use tokio::{
     io::{AsyncRead, AsyncWrite},
@@ -31,6 +35,19 @@ struct PendingFile {
     staged_file: tools::StagedFile,
     file: Option<std::fs::File>,
     checksum: bool,
+    parallel_transfer: Option<ParallelTransferRecord>,
+}
+
+#[derive(Debug)]
+struct ParallelTransferRecord {
+    id: String,
+    dir: PathBuf,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ParallelTransferConfig {
+    threshold_bytes: u64,
+    worker_count: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -73,6 +90,7 @@ struct ClientHandlingOptions {
     remote_fsync_override: RemoteFsyncOverride,
     remote_delete_override: RemoteDeleteOverride,
     lz4: Lz4Allowance,
+    large_file_parallel: bool,
     ignores: Arc<[String]>,
 }
 
@@ -87,6 +105,7 @@ struct ClientState {
     session_fsync_override: Option<bool>,
     delete_mode: DeleteMode,
     source_paths: HashSet<String>,
+    parallel_config: Option<ParallelTransferConfig>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -103,6 +122,11 @@ enum DeleteMode {
     Enabled,
 }
 
+const TRANSFER_STATE_DIR_NAME: &str = ".pxs-transfers";
+const TRANSFER_PATH_FILENAME: &str = "path";
+const TRANSFER_STAGED_LINK_NAME: &str = "staged";
+static PARALLEL_TRANSFER_COUNTER: AtomicU64 = AtomicU64::new(1);
+
 impl ClientState {
     fn new(dst_root: &Path) -> Self {
         Self {
@@ -116,6 +140,7 @@ impl ClientState {
             session_fsync_override: None,
             delete_mode: DeleteMode::Disabled,
             source_paths: HashSet::new(),
+            parallel_config: None,
         }
     }
 
@@ -133,7 +158,7 @@ impl ClientState {
         checksum: bool,
     ) -> anyhow::Result<()> {
         if let Some(existing) = self.pending_files.remove(path) {
-            let _ = existing.staged_file.cleanup();
+            let _ = cleanup_pending_file(existing);
         }
 
         let staged_file = tools::StagedFile::new(final_path)?;
@@ -148,6 +173,7 @@ impl ClientState {
                 staged_file,
                 file: Some(file),
                 checksum,
+                parallel_transfer: None,
             },
         );
         Ok(())
@@ -156,8 +182,7 @@ impl ClientState {
     /// Clean up partial files on transfer failure.
     fn cleanup_partial_files(&mut self) {
         for (path, pending_file) in self.pending_files.drain() {
-            drop(pending_file.file);
-            if let Err(e) = pending_file.staged_file.cleanup()
+            if let Err(e) = cleanup_pending_file(pending_file)
                 && let Ok(full_path) = resolve_protocol_path(&self.dst_root, &path)
             {
                 eprintln!(
@@ -212,6 +237,143 @@ impl ClientState {
     fn clear_transfer_state(&mut self, path: &str) {
         self.file_transfers.remove(path);
     }
+
+    fn parallel_config(&self) -> Option<ParallelTransferConfig> {
+        self.parallel_config
+    }
+
+    fn ensure_parallel_transfer_record(&mut self, path: &str) -> anyhow::Result<String> {
+        let pending_file = self
+            .pending_files
+            .get_mut(path)
+            .ok_or_else(|| anyhow::anyhow!("missing pending file for path: {path}"))?;
+        if let Some(record) = &pending_file.parallel_transfer {
+            return Ok(record.id.clone());
+        }
+
+        let record =
+            create_parallel_transfer_record(&self.dst_root, path, pending_file.staged_file.path())?;
+        let transfer_id = record.id.clone();
+        pending_file.parallel_transfer = Some(record);
+        Ok(transfer_id)
+    }
+}
+
+fn validate_transfer_id(transfer_id: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !transfer_id.is_empty()
+            && transfer_id
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit() || byte == b'-'),
+        "invalid transfer id"
+    );
+    Ok(())
+}
+
+fn transfer_state_root(dst_root: &Path) -> PathBuf {
+    dst_root.join(TRANSFER_STATE_DIR_NAME)
+}
+
+fn transfer_record_dir(dst_root: &Path, transfer_id: &str) -> anyhow::Result<PathBuf> {
+    validate_transfer_id(transfer_id)?;
+    Ok(transfer_state_root(dst_root).join(transfer_id))
+}
+
+fn next_parallel_transfer_id() -> String {
+    let counter = PARALLEL_TRANSFER_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0_u128, |duration| duration.as_nanos());
+    format!("{:x}-{:x}-{:x}", std::process::id(), counter, nanos)
+}
+
+fn remove_parallel_transfer_record(record_dir: &Path) -> anyhow::Result<()> {
+    match std::fs::remove_dir_all(record_dir) {
+        Ok(()) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error.into()),
+    }
+}
+
+fn cleanup_pending_file(mut pending_file: PendingFile) -> anyhow::Result<()> {
+    drop(pending_file.file.take());
+    let staged_cleanup = pending_file.staged_file.cleanup();
+    let transfer_cleanup = pending_file
+        .parallel_transfer
+        .take()
+        .map_or(Ok(()), |record| {
+            remove_parallel_transfer_record(&record.dir)
+        });
+    staged_cleanup?;
+    transfer_cleanup?;
+    Ok(())
+}
+
+fn create_parallel_transfer_record(
+    dst_root: &Path,
+    expected_path: &str,
+    staged_path: &Path,
+) -> anyhow::Result<ParallelTransferRecord> {
+    let transfer_root = transfer_state_root(dst_root);
+    tools::ensure_no_symlink_ancestors_under_root(dst_root, &transfer_root)?;
+    std::fs::create_dir_all(&transfer_root)?;
+
+    loop {
+        let transfer_id = next_parallel_transfer_id();
+        let record_dir = transfer_record_dir(dst_root, &transfer_id)?;
+        match std::fs::create_dir(&record_dir) {
+            Ok(()) => {
+                let staged_target = if staged_path.is_absolute() {
+                    staged_path.to_path_buf()
+                } else {
+                    std::env::current_dir()?.join(staged_path)
+                };
+                let path_file = record_dir.join(TRANSFER_PATH_FILENAME);
+                let staged_link = record_dir.join(TRANSFER_STAGED_LINK_NAME);
+                if let Err(error) = std::fs::write(&path_file, expected_path.as_bytes()) {
+                    let _ = remove_parallel_transfer_record(&record_dir);
+                    return Err(error.into());
+                }
+                if let Err(error) = std::os::unix::fs::symlink(&staged_target, &staged_link) {
+                    let _ = remove_parallel_transfer_record(&record_dir);
+                    return Err(error.into());
+                }
+                return Ok(ParallelTransferRecord {
+                    id: transfer_id,
+                    dir: record_dir,
+                });
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+}
+
+fn resolve_parallel_transfer_record(
+    dst_root: &Path,
+    transfer_id: &str,
+    expected_path: &str,
+) -> anyhow::Result<PathBuf> {
+    let record_dir = transfer_record_dir(dst_root, transfer_id)?;
+    tools::ensure_no_symlink_ancestors_under_root(dst_root, &record_dir)?;
+    let recorded_path =
+        std::fs::read_to_string(record_dir.join(TRANSFER_PATH_FILENAME)).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!("unknown transfer id: {transfer_id}")
+            } else {
+                anyhow::Error::from(error)
+            }
+        })?;
+    ensure_expected_protocol_path(recorded_path.trim_end_matches('\n'), expected_path)?;
+    let staged_path =
+        std::fs::read_link(record_dir.join(TRANSFER_STAGED_LINK_NAME)).map_err(|error| {
+            if error.kind() == std::io::ErrorKind::NotFound {
+                anyhow::anyhow!("unknown transfer id: {transfer_id}")
+            } else {
+                anyhow::Error::from(error)
+            }
+        })?;
+    Ok(staged_path)
 }
 
 /// Run the client in pull mode (connects to a server to receive files).
@@ -231,6 +393,7 @@ pub async fn run_pull_client(addr: &str, dst_root: &Path, fsync: bool) -> anyhow
             remote_fsync_override: RemoteFsyncOverride::Deny,
             remote_delete_override: RemoteDeleteOverride::Deny,
             lz4: Lz4Allowance::Allow,
+            large_file_parallel: false,
             ignores: Arc::from(Vec::<String>::new()),
         },
     )
@@ -259,6 +422,7 @@ pub async fn run_receiver(addr: &str, dst_root: &Path, fsync: bool) -> anyhow::R
                     remote_fsync_override: RemoteFsyncOverride::Allow,
                     remote_delete_override: RemoteDeleteOverride::Deny,
                     lz4: Lz4Allowance::Allow,
+                    large_file_parallel: false,
                     ignores: Arc::from(Vec::<String>::new()),
                 },
             )
@@ -296,10 +460,74 @@ pub async fn run_stdio_receiver(
             remote_fsync_override: RemoteFsyncOverride::Deny,
             remote_delete_override: RemoteDeleteOverride::Allow,
             lz4: Lz4Allowance::Deny,
+            large_file_parallel: true,
             ignores: Arc::<[String]>::from(ignores.to_vec()),
         },
     )
     .await
+}
+
+/// Run the receiver in SSH chunk-writer mode using stdin/stdout.
+///
+/// # Errors
+///
+/// Returns an error if the staged file cannot be updated or protocol handling fails.
+pub async fn run_stdio_chunk_writer(
+    dst_root: &Path,
+    transfer_id: &str,
+    expected_path: &str,
+    _quiet: bool,
+) -> anyhow::Result<()> {
+    tools::ensure_no_symlink_ancestors_under_root(dst_root, dst_root)?;
+    validate_protocol_path(expected_path)?;
+    let staged_path = resolve_parallel_transfer_record(dst_root, transfer_id, expected_path)?;
+
+    let stdin = tokio::io::stdin();
+    let stdout = tokio::io::stdout();
+    let combined = tokio::io::join(stdin, stdout);
+    let mut framed = Framed::new(combined, PxsCodec);
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(staged_path)?;
+
+    let mut saw_handshake = false;
+    while let Some(bytes) = recv_with_timeout(&mut framed).await? {
+        let msg = deserialize_message(&bytes)?;
+        match msg {
+            Message::Handshake { version } => {
+                anyhow::ensure!(!saw_handshake, "duplicate handshake message");
+                let _features = negotiate_transport_features(&version, false, false)?;
+                saw_handshake = true;
+                framed
+                    .send(serialize_message(&Message::Handshake {
+                        version: local_handshake_version(false, false),
+                    })?)
+                    .await?;
+            }
+            Message::ApplyBlocks { path, blocks } => {
+                anyhow::ensure!(saw_handshake, "expected handshake before chunk data");
+                ensure_expected_protocol_path(expected_path, &path)?;
+                for block in blocks {
+                    file.write_all_at(&block.data, block.offset)?;
+                }
+            }
+            Message::SyncComplete => {
+                anyhow::ensure!(saw_handshake, "expected handshake before sync completion");
+                framed
+                    .send(serialize_message(&Message::SyncCompleteAck)?)
+                    .await?;
+                return Ok(());
+            }
+            Message::Error(message) => anyhow::bail!("chunk writer sender error: {message}"),
+            Message::ApplyBlocksCompressed { .. } => {
+                anyhow::bail!("chunk writer does not support compressed block batches")
+            }
+            other => anyhow::bail!("unexpected chunk writer protocol message: {other:?}"),
+        }
+    }
+
+    anyhow::bail!("chunk writer connection closed unexpectedly")
 }
 
 /// Run the receiver over an SSH tunnel (for pull mode).
@@ -330,6 +558,7 @@ pub async fn run_ssh_receiver(
             remote_fsync_override: RemoteFsyncOverride::Deny,
             remote_delete_override: RemoteDeleteOverride::Allow,
             lz4: Lz4Allowance::Deny,
+            large_file_parallel: false,
             ignores: Arc::<[String]>::from(options.ignores.to_vec()),
         },
     )
@@ -342,21 +571,23 @@ async fn handle_handshake<T>(
     framed: &mut Framed<T, PxsCodec>,
     version: String,
     allow_lz4: bool,
+    allow_large_file_parallel: bool,
 ) -> anyhow::Result<TransportFeatures>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let features = match negotiate_transport_features(&version, allow_lz4) {
-        Ok(features) => features,
-        Err(error) => {
-            framed
-                .send(serialize_message(&Message::Error(error.to_string()))?)
-                .await?;
-            return Err(error);
-        }
-    };
+    let features =
+        match negotiate_transport_features(&version, allow_lz4, allow_large_file_parallel) {
+            Ok(features) => features,
+            Err(error) => {
+                framed
+                    .send(serialize_message(&Message::Error(error.to_string()))?)
+                    .await?;
+                return Err(error);
+            }
+        };
     let response = Message::Handshake {
-        version: local_handshake_version(allow_lz4),
+        version: local_handshake_version(allow_lz4, allow_large_file_parallel),
     };
     framed.send(serialize_message(&response)?).await?;
     Ok(features)
@@ -385,6 +616,24 @@ async fn handle_sync_symlink(
         tools::sync_parent_directory(&full_path)?;
     }
     Ok(())
+}
+
+fn parallel_transfer_config_for(
+    state: &ClientState,
+    metadata: FileMetadata,
+) -> Option<ParallelTransferConfig> {
+    let config = state.parallel_config()?;
+    if !state.transport.large_file_parallel || config.worker_count <= 1 {
+        return None;
+    }
+    if metadata.size < config.threshold_bytes {
+        return None;
+    }
+    Some(config)
+}
+
+fn pending_transfer_id(state: &mut ClientState, path: &str) -> anyhow::Result<String> {
+    state.ensure_parallel_transfer_record(path)
 }
 
 async fn handle_sync_file<T>(
@@ -432,9 +681,19 @@ where
                 if let Some(progress) = &progress {
                     progress.set_message(format!("Full copy: {path}"));
                 }
-                framed
-                    .send(serialize_message(&Message::RequestFullCopy { path })?)
-                    .await?;
+                if parallel_transfer_config_for(state, metadata).is_some() {
+                    let transfer_id = pending_transfer_id(state, &path)?;
+                    framed
+                        .send(serialize_message(&Message::RequestParallelFullCopy {
+                            path,
+                            transfer_id,
+                        })?)
+                        .await?;
+                } else {
+                    framed
+                        .send(serialize_message(&Message::RequestFullCopy { path })?)
+                        .await?;
+                }
                 return Ok(());
             }
 
@@ -453,9 +712,19 @@ where
         if let Some(progress) = &progress {
             progress.set_message(format!("Full copy: {path}"));
         }
-        framed
-            .send(serialize_message(&Message::RequestFullCopy { path })?)
-            .await?;
+        if parallel_transfer_config_for(state, metadata).is_some() {
+            let transfer_id = pending_transfer_id(state, &path)?;
+            framed
+                .send(serialize_message(&Message::RequestParallelFullCopy {
+                    path,
+                    transfer_id,
+                })?)
+                .await?;
+        } else {
+            framed
+                .send(serialize_message(&Message::RequestFullCopy { path })?)
+                .await?;
+        }
         return Ok(());
     }
 
@@ -464,9 +733,19 @@ where
     if let Some(progress) = &progress {
         progress.set_message(format!("Full copy: {path}"));
     }
-    framed
-        .send(serialize_message(&Message::RequestFullCopy { path })?)
-        .await?;
+    if parallel_transfer_config_for(state, metadata).is_some() {
+        let transfer_id = pending_transfer_id(state, &path)?;
+        framed
+            .send(serialize_message(&Message::RequestParallelFullCopy {
+                path,
+                transfer_id,
+            })?)
+            .await?;
+    } else {
+        framed
+            .send(serialize_message(&Message::RequestFullCopy { path })?)
+            .await?;
+    }
     Ok(())
 }
 
@@ -506,6 +785,66 @@ where
     handle_sync_file(framed, state, path, metadata, threshold, checksum, dst_root).await
 }
 
+async fn request_full_copy_for_path<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    state: &mut ClientState,
+    path: String,
+    full_path: &Path,
+    metadata: FileMetadata,
+    checksum: bool,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    state.prepare_pending_file(&path, full_path, metadata.size, false, checksum)?;
+    state.update_transfer_phase(&path, TransferPhase::Content)?;
+    framed
+        .send(serialize_message(&Message::RequestFullCopy { path })?)
+        .await?;
+    Ok(())
+}
+
+async fn request_missing_blocks_for_path<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    state: &mut ClientState,
+    path: String,
+    transfer: FileTransferState,
+    full_path: &Path,
+    requested: Vec<u32>,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    if !state.pending_files.contains_key(&path) {
+        state.prepare_pending_file(
+            &path,
+            full_path,
+            transfer.metadata.size,
+            true,
+            transfer.checksum,
+        )?;
+    }
+    state.update_transfer_phase(&path, TransferPhase::Content)?;
+    if parallel_transfer_config_for(state, transfer.metadata).is_some() {
+        let transfer_id = pending_transfer_id(state, &path)?;
+        framed
+            .send(serialize_message(&Message::RequestParallelBlocks {
+                path,
+                transfer_id,
+                indices: requested,
+            })?)
+            .await?;
+    } else {
+        framed
+            .send(serialize_message(&Message::RequestBlocks {
+                path,
+                indices: requested,
+            })?)
+            .await?;
+    }
+    Ok(())
+}
+
 async fn handle_block_hashes_message<T>(
     framed: &mut Framed<T, PxsCodec>,
     state: &mut ClientState,
@@ -531,48 +870,42 @@ where
                 match tools::compute_requested_blocks(&full_path, &hashes, BLOCK_SIZE) {
                     Ok(requested) => requested,
                     Err(error) if is_not_found_error(&error) => {
-                        state.prepare_pending_file(
-                            &path,
+                        request_full_copy_for_path(
+                            framed,
+                            state,
+                            path,
                             &full_path,
-                            transfer.metadata.size,
-                            false,
+                            transfer.metadata,
                             transfer.checksum,
-                        )?;
-                        state.update_transfer_phase(&path, TransferPhase::Content)?;
-                        framed
-                            .send(serialize_message(&Message::RequestFullCopy { path })?)
-                            .await?;
+                        )
+                        .await?;
                         return Ok(());
                     }
                     Err(error) => return Err(error),
                 }
             }
             Ok(_) => {
-                state.prepare_pending_file(
-                    &path,
+                request_full_copy_for_path(
+                    framed,
+                    state,
+                    path,
                     &full_path,
-                    transfer.metadata.size,
-                    false,
+                    transfer.metadata,
                     transfer.checksum,
-                )?;
-                state.update_transfer_phase(&path, TransferPhase::Content)?;
-                framed
-                    .send(serialize_message(&Message::RequestFullCopy { path })?)
-                    .await?;
+                )
+                .await?;
                 return Ok(());
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                state.prepare_pending_file(
-                    &path,
+                request_full_copy_for_path(
+                    framed,
+                    state,
+                    path,
                     &full_path,
-                    transfer.metadata.size,
-                    false,
+                    transfer.metadata,
                     transfer.checksum,
-                )?;
-                state.update_transfer_phase(&path, TransferPhase::Content)?;
-                framed
-                    .send(serialize_message(&Message::RequestFullCopy { path })?)
-                    .await?;
+                )
+                .await?;
                 return Ok(());
             }
             Err(error) => return Err(error.into()),
@@ -589,21 +922,7 @@ where
             .send(serialize_message(&Message::EndOfFile { path })?)
             .await?;
     } else {
-        if !state.pending_files.contains_key(&path) {
-            state.prepare_pending_file(
-                &path,
-                &full_path,
-                transfer.metadata.size,
-                true,
-                transfer.checksum,
-            )?;
-        }
-        state.update_transfer_phase(&path, TransferPhase::Content)?;
-        framed
-            .send(serialize_message(&Message::RequestBlocks {
-                path,
-                indices: requested,
-            })?)
+        request_missing_blocks_for_path(framed, state, path, transfer, &full_path, requested)
             .await?;
     }
 
@@ -624,9 +943,8 @@ fn handle_apply_blocks_message(
 
 fn handle_end_of_file_message(state: &mut ClientState, path: &str) -> anyhow::Result<()> {
     validate_protocol_path(path)?;
-    if let Some(mut pending_file) = state.pending_files.remove(path) {
-        drop(pending_file.file.take());
-        pending_file.staged_file.cleanup()?;
+    if let Some(pending_file) = state.pending_files.remove(path) {
+        cleanup_pending_file(pending_file)?;
     }
     state.clear_transfer_state(path);
     Ok(())
@@ -663,6 +981,27 @@ fn handle_session_options(
     } else {
         DeleteMode::Disabled
     };
+    Ok(())
+}
+
+fn handle_parallel_transfer_config(
+    state: &mut ClientState,
+    worker_count: u16,
+    threshold_bytes: u64,
+) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        matches!(state.protocol_state, ProtocolState::AwaitingTransfer),
+        "parallel transfer config must be sent before transfer messages"
+    );
+    let worker_count = usize::from(worker_count);
+    anyhow::ensure!(
+        worker_count > 0,
+        "parallel transfer worker count must be greater than zero"
+    );
+    state.parallel_config = Some(ParallelTransferConfig {
+        threshold_bytes,
+        worker_count,
+    });
     Ok(())
 }
 
@@ -710,6 +1049,7 @@ where
                     framed,
                     version.clone(),
                     matches!(options.lz4, Lz4Allowance::Allow),
+                    options.large_file_parallel,
                 )
                 .await?;
                 state.protocol_state = ProtocolState::AwaitingTransfer;
@@ -729,6 +1069,19 @@ where
             *fsync,
             *delete,
         )?;
+        return Ok(Some(true));
+    }
+
+    if let Message::ParallelTransferConfig {
+        threshold_bytes,
+        worker_count,
+    } = msg
+    {
+        anyhow::ensure!(
+            state.transport.large_file_parallel,
+            "parallel transfer config is not supported by this receiver"
+        );
+        handle_parallel_transfer_config(state, *worker_count, *threshold_bytes)?;
         return Ok(Some(true));
     }
 
@@ -824,12 +1177,15 @@ where
             .await;
         }
         Message::RequestFullCopy { .. }
+        | Message::RequestParallelFullCopy { .. }
         | Message::RequestHashes { .. }
         | Message::RequestBlocks { .. }
+        | Message::RequestParallelBlocks { .. }
         | Message::MetadataApplied { .. }
         | Message::ChecksumVerified { .. }
         | Message::ChecksumMismatch { .. }
         | Message::SessionOptions { .. }
+        | Message::ParallelTransferConfig { .. }
         | Message::SyncCompleteAck
         | Message::Error(_) => {
             anyhow::bail!("unexpected receiver-side protocol message: {msg:?}");
@@ -995,6 +1351,7 @@ where
             remote_fsync_override: RemoteFsyncOverride::Deny,
             remote_delete_override: RemoteDeleteOverride::Deny,
             lz4: Lz4Allowance::Deny,
+            large_file_parallel: false,
             ignores: Arc::from(Vec::<String>::new()),
         },
     )
@@ -1139,11 +1496,14 @@ where
             .remove(&path)
             .ok_or_else(|| anyhow::anyhow!("missing pending file for path: {path}"))?;
         if let Err(error) = pending_file.staged_file.commit() {
-            let _ = pending_file.staged_file.cleanup();
+            let _ = cleanup_pending_file(pending_file);
             return Err(error);
         }
         if fsync {
             tools::sync_parent_directory(&full_path)?;
+        }
+        if let Some(record) = pending_file.parallel_transfer.take() {
+            remove_parallel_transfer_record(&record.dir)?;
         }
         state.clear_transfer_state(&path);
         framed
@@ -1202,21 +1562,24 @@ where
         let hash = match tools::blake3_file_hash(pending_file.staged_file.path()).await {
             Ok(h) => h,
             Err(error) => {
-                let _ = pending_file.staged_file.cleanup();
+                let _ = cleanup_pending_file(pending_file);
                 return Err(error);
             }
         };
 
         if &hash == expected_hash {
             if let Err(error) = pending_file.staged_file.commit() {
-                let _ = pending_file.staged_file.cleanup();
+                let _ = cleanup_pending_file(pending_file);
                 return Err(error);
             }
             if fsync {
                 tools::sync_parent_directory(&full_path)?;
             }
+            if let Some(record) = pending_file.parallel_transfer.take() {
+                remove_parallel_transfer_record(&record.dir)?;
+            }
         } else {
-            pending_file.staged_file.cleanup()?;
+            cleanup_pending_file(pending_file)?;
             state.clear_transfer_state(path);
             framed
                 .send(serialize_message(&Message::ChecksumMismatch {

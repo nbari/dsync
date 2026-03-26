@@ -334,6 +334,21 @@ pub fn clamped_parallelism() -> usize {
         .min(MAX_PARALLELISM)
 }
 
+/// Return a conservative default worker count for parallel SSH large-file transfer.
+///
+/// The SSH transport adds per-worker encryption and process overhead, so the
+/// default is intentionally bucketed rather than matching the CPU count
+/// directly.
+#[must_use]
+pub fn default_large_file_parallel_workers() -> usize {
+    match clamped_parallelism() {
+        0 | 1 => 1,
+        2 | 3 => 2,
+        4..=7 => 4,
+        _ => 8,
+    }
+}
+
 fn metadata_mtime_nanos(meta: &std::fs::Metadata) -> Option<u32> {
     u32::try_from(meta.mtime_nsec()).ok()
 }
@@ -1307,7 +1322,8 @@ pub async fn blake3_file_hash(path: &Path) -> anyhow::Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::{
-        REPLACEMENT_FAILURE_HOOK, ensure_directory_path, install_prepared_path,
+        REPLACEMENT_FAILURE_HOOK, default_large_file_parallel_workers, ensure_directory_path,
+        install_prepared_path,
         test_support::{DurabilityProbe, OptimizationProbe},
     };
     use crate::pxs::{
@@ -1578,5 +1594,14 @@ mod tests {
         assert!(path.is_file());
         assert_eq!(std::fs::read_to_string(&path)?, "original file");
         Ok(())
+    }
+
+    #[test]
+    fn test_default_large_file_parallel_workers_is_conservative() {
+        let workers = default_large_file_parallel_workers();
+        assert!(
+            (1..=8).contains(&workers),
+            "expected conservative SSH worker default between 1 and 8, got {workers}"
+        );
     }
 }
