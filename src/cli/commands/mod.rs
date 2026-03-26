@@ -34,8 +34,8 @@ const THRESHOLD_LONG_HELP: &str = "Value between 0.1 and 1.0. If the destination
 const CHECKSUM_LONG_HELP: &str = "By default, pxs skips files if size and modification time match. Use this to force a block-by-block hash comparison. In network mode, pxs also performs end-to-end BLAKE3 verification after the transfer completes.";
 const FSYNC_LONG_HELP: &str =
     "Ensures that file data and metadata are flushed to disk before finishing. Slower but safer.";
-const LARGE_FILE_PARALLEL_THRESHOLD_LONG_HELP: &str = "Enable SSH push chunk-parallel transfer for files at or above this size. Accepts raw bytes or binary suffixes such as KiB, MiB, GiB, and TiB. Use 0 to disable.";
-const LARGE_FILE_PARALLEL_WORKERS_LONG_HELP: &str = "Number of parallel SSH worker sessions for eligible large files. If omitted, pxs chooses a conservative default from available CPU cores.";
+const LARGE_FILE_PARALLEL_THRESHOLD_LONG_HELP: &str = "Enable remote push chunk-parallel transfer for files at or above this size when the transport supports it. Accepts raw bytes or binary suffixes such as KiB, MiB, GiB, and TiB. Use 0 to disable.";
+const LARGE_FILE_PARALLEL_WORKERS_LONG_HELP: &str = "Number of parallel worker connections or sessions for eligible remote large files. If omitted, pxs chooses a conservative default from available CPU cores.";
 
 /// Create a path validator that requires the path to exist.
 pub fn validator_path_exists() -> ValueParser {
@@ -199,7 +199,7 @@ fn fsync_arg(hidden: bool) -> Arg {
 fn large_file_parallel_threshold_arg() -> Arg {
     Arg::new("large_file_parallel_threshold")
         .long("large-file-parallel-threshold")
-        .help("Enable SSH push chunk-parallel transfer at or above SIZE")
+        .help("Enable remote push chunk-parallel transfer at or above SIZE")
         .long_help(LARGE_FILE_PARALLEL_THRESHOLD_LONG_HELP)
         .value_name("SIZE")
         .value_parser(size_bytes_parser())
@@ -209,7 +209,7 @@ fn large_file_parallel_threshold_arg() -> Arg {
 fn large_file_parallel_workers_arg() -> Arg {
     Arg::new("large_file_parallel_workers")
         .long("large-file-parallel-workers")
-        .help("Set the number of SSH worker sessions for large-file push")
+        .help("Set the number of worker sessions/connections for large-file push")
         .long_help(LARGE_FILE_PARALLEL_WORKERS_LONG_HELP)
         .value_name("N")
         .value_parser(positive_usize_parser())

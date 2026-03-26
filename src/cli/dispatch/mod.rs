@@ -476,6 +476,41 @@ mod tests {
     }
 
     #[test]
+    fn test_push_tcp_endpoint_parses_large_file_parallel_flags() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let src = dir.path().join("src.txt");
+        std::fs::write(&src, "content")?;
+        let src_arg = src.to_string_lossy().to_string();
+
+        let action = parse_action(&[
+            "pxs",
+            "push",
+            &src_arg,
+            "127.0.0.1:7878",
+            "--large-file-parallel-threshold",
+            "64MiB",
+            "--large-file-parallel-workers",
+            "3",
+        ])?;
+
+        match action {
+            Action::Push {
+                endpoint: RemoteEndpoint::Tcp(addr),
+                large_file_parallel_threshold,
+                large_file_parallel_workers,
+                ..
+            } => {
+                assert_eq!(addr, "127.0.0.1:7878");
+                assert_eq!(large_file_parallel_threshold, 64 * 1024_u64.pow(2));
+                assert_eq!(large_file_parallel_workers, 3);
+            }
+            other => anyhow::bail!("expected TCP push action, got {other:?}"),
+        }
+
+        Ok(())
+    }
+
+    #[test]
     fn test_push_stdio_endpoint_is_preserved_for_manual_piping() -> anyhow::Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("src.txt");

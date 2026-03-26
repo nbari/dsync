@@ -22,6 +22,23 @@ struct PushCommandOptions {
     large_file_parallel_workers: usize,
 }
 
+fn remote_large_file_parallel_options(
+    options: PushCommandOptions,
+) -> Option<LargeFileParallelOptions> {
+    if options.large_file_parallel_threshold == 0 {
+        return None;
+    }
+
+    Some(LargeFileParallelOptions {
+        threshold_bytes: options.large_file_parallel_threshold,
+        worker_count: if options.large_file_parallel_workers == 0 {
+            tools::default_large_file_parallel_workers()
+        } else {
+            options.large_file_parallel_workers
+        },
+    })
+}
+
 fn format_updated_block_percentage(stats: sync::SyncStats) -> String {
     if stats.total_blocks == 0 {
         return String::from("0.00");
@@ -60,18 +77,7 @@ async fn handle_push_action(
     match endpoint {
         RemoteEndpoint::Ssh { host, path } => {
             eprintln!("Connecting via SSH to {host} to sync to {path}");
-            let large_file_parallel = if options.large_file_parallel_threshold == 0 {
-                None
-            } else {
-                Some(LargeFileParallelOptions {
-                    threshold_bytes: options.large_file_parallel_threshold,
-                    worker_count: if options.large_file_parallel_workers == 0 {
-                        tools::default_large_file_parallel_workers()
-                    } else {
-                        options.large_file_parallel_workers
-                    },
-                })
-            };
+            let large_file_parallel = remote_large_file_parallel_options(options);
             crate::pxs::net::run_ssh_sender(
                 host,
                 src,
@@ -118,13 +124,14 @@ async fn handle_push_action(
                 src.display(),
                 options.checksum
             );
-            crate::pxs::net::run_sender(
+            crate::pxs::net::run_sender_with_options(
                 addr,
                 src,
                 options.threshold,
                 options.checksum,
                 options.fsync,
                 ignores,
+                remote_large_file_parallel_options(options),
             )
             .await?;
         }

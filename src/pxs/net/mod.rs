@@ -46,5 +46,6 @@ pub use receiver::{
     run_stdio_receiver,
 };
 pub use sender::{
-    run_sender, run_sender_listener, run_ssh_sender, run_stdio_sender, sync_remote_file,
+    run_sender, run_sender_listener, run_sender_with_options, run_ssh_sender, run_stdio_sender,
+    sync_remote_file,
 };

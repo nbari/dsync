@@ -422,7 +422,7 @@ pub async fn run_receiver(addr: &str, dst_root: &Path, fsync: bool) -> anyhow::R
                     remote_fsync_override: RemoteFsyncOverride::Allow,
                     remote_delete_override: RemoteDeleteOverride::Deny,
                     lz4: Lz4Allowance::Allow,
-                    large_file_parallel: false,
+                    large_file_parallel: true,
                     ignores: Arc::from(Vec::<String>::new()),
                 },
             )
@@ -478,21 +478,62 @@ pub async fn run_stdio_chunk_writer(
     expected_path: &str,
     _quiet: bool,
 ) -> anyhow::Result<()> {
-    tools::ensure_no_symlink_ancestors_under_root(dst_root, dst_root)?;
-    validate_protocol_path(expected_path)?;
-    let staged_path = resolve_parallel_transfer_record(dst_root, transfer_id, expected_path)?;
-
     let stdin = tokio::io::stdin();
     let stdout = tokio::io::stdout();
     let combined = tokio::io::join(stdin, stdout);
     let mut framed = Framed::new(combined, PxsCodec);
+    handle_chunk_writer_connection(&mut framed, dst_root, transfer_id, expected_path).await
+}
+
+async fn handle_chunk_writer_connection<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    dst_root: &Path,
+    transfer_id: &str,
+    expected_path: &str,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    tools::ensure_no_symlink_ancestors_under_root(dst_root, dst_root)?;
+    validate_protocol_path(expected_path)?;
+    let staged_path = resolve_parallel_transfer_record(dst_root, transfer_id, expected_path)?;
     let file = std::fs::OpenOptions::new()
         .read(true)
         .write(true)
         .open(staged_path)?;
+    handle_chunk_writer_session(framed, &file, expected_path, false).await
+}
 
-    let mut saw_handshake = false;
-    while let Some(bytes) = recv_with_timeout(&mut framed).await? {
+async fn handle_attached_chunk_writer_start<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    dst_root: &Path,
+    transfer_id: &str,
+    expected_path: &str,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    tools::ensure_no_symlink_ancestors_under_root(dst_root, dst_root)?;
+    validate_protocol_path(expected_path)?;
+    let staged_path = resolve_parallel_transfer_record(dst_root, transfer_id, expected_path)?;
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(staged_path)?;
+    handle_chunk_writer_session(framed, &file, expected_path, true).await
+}
+
+async fn handle_chunk_writer_session<T>(
+    framed: &mut Framed<T, PxsCodec>,
+    file: &std::fs::File,
+    expected_path: &str,
+    handshake_complete: bool,
+) -> anyhow::Result<()>
+where
+    T: AsyncRead + AsyncWrite + Unpin,
+{
+    let mut saw_handshake = handshake_complete;
+    while let Some(bytes) = recv_with_timeout(framed).await? {
         let msg = deserialize_message(&bytes)?;
         match msg {
             Message::Handshake { version } => {
@@ -508,9 +549,7 @@ pub async fn run_stdio_chunk_writer(
             Message::ApplyBlocks { path, blocks } => {
                 anyhow::ensure!(saw_handshake, "expected handshake before chunk data");
                 ensure_expected_protocol_path(expected_path, &path)?;
-                for block in blocks {
-                    file.write_all_at(&block.data, block.offset)?;
-                }
+                write_blocks_to_file(file, blocks)?;
             }
             Message::SyncComplete => {
                 anyhow::ensure!(saw_handshake, "expected handshake before sync completion");
@@ -1181,6 +1220,7 @@ where
         | Message::RequestHashes { .. }
         | Message::RequestBlocks { .. }
         | Message::RequestParallelBlocks { .. }
+        | Message::ChunkWriterStart { .. }
         | Message::MetadataApplied { .. }
         | Message::ChecksumVerified { .. }
         | Message::ChecksumMismatch { .. }
@@ -1351,7 +1391,7 @@ where
             remote_fsync_override: RemoteFsyncOverride::Deny,
             remote_delete_override: RemoteDeleteOverride::Deny,
             lz4: Lz4Allowance::Deny,
-            large_file_parallel: false,
+            large_file_parallel: true,
             ignores: Arc::from(Vec::<String>::new()),
         },
     )
@@ -1392,6 +1432,12 @@ where
 {
     while let Some(bytes) = recv_with_timeout(framed).await? {
         let msg = deserialize_message(&bytes)?;
+        if state.protocol_state == ProtocolState::AwaitingTransfer
+            && let Message::ChunkWriterStart { transfer_id, path } = &msg
+        {
+            handle_attached_chunk_writer_start(framed, dst_root, transfer_id, path).await?;
+            return Ok(());
+        }
         let should_continue =
             process_client_message(framed, state, dst_root, &options, msg).await?;
         if !should_continue {
@@ -1426,6 +1472,18 @@ where
     Ok(())
 }
 
+fn write_blocks_to_file(file: &std::fs::File, blocks: Vec<Block>) -> anyhow::Result<()> {
+    for block in blocks {
+        if let Err(e) = file.write_all_at(&block.data, block.offset) {
+            if e.raw_os_error() == Some(nix::libc::ENOSPC) {
+                anyhow::bail!("Disk full: not enough space to write to destination");
+            }
+            return Err(e.into());
+        }
+    }
+    Ok(())
+}
+
 fn handle_apply_blocks(
     pending_files: &mut HashMap<String, PendingFile>,
     path: &str,
@@ -1438,15 +1496,7 @@ fn handle_apply_blocks(
         .file
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("pending file already finalized for path: {path}"))?;
-    for block in blocks {
-        if let Err(e) = file.write_all_at(&block.data, block.offset) {
-            if e.raw_os_error() == Some(nix::libc::ENOSPC) {
-                anyhow::bail!("Disk full: not enough space to write to destination");
-            }
-            return Err(e.into());
-        }
-    }
-    Ok(())
+    write_blocks_to_file(file, blocks)
 }
 
 async fn handle_apply_metadata<T>(

@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented in this file.
 
+## [0.5.1] - 2026-03-26
+
+### Added
+
+- Added raw TCP push chunk-parallel large-file transfer using receiver-issued transfer ids and attached worker connections, bringing single-large-file raw TCP behavior closer to SSH push and local sync.
+- Added regression coverage for zero-byte remote file synchronization, raw TCP chunk-writer attachment errors, raw TCP large-file multi-connection transfer, and TCP parsing of the large-file parallel CLI flags.
+
+### Changed
+
+- Extended `--large-file-parallel-threshold` and `--large-file-parallel-workers` so they apply to raw TCP push as well as SSH push.
+- Generalized the receiver chunk-writer path so SSH stdio workers and raw TCP attached workers share the same staged-file validation and write flow.
+
+### Fixed
+
+- Fixed a panic in `compute_requested_blocks()` when a remote sender reported an empty block-hash list for a zero-byte file.
+- Fixed raw TCP and SSH push handling of zero-byte files so an existing non-empty destination is truncated cleanly instead of crashing during hash comparison.
+
 ## [0.5.0] - 2026-03-26
 
 ### Added

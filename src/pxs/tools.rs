@@ -1122,6 +1122,10 @@ pub fn compute_requested_blocks(
     hashes: &[u64],
     block_size: u64,
 ) -> anyhow::Result<Vec<u32>> {
+    if hashes.is_empty() {
+        return Ok(Vec::new());
+    }
+
     if !full_path.exists() {
         return (0..hashes.len()).map(block_index).collect();
     }
@@ -1322,8 +1326,8 @@ pub async fn blake3_file_hash(path: &Path) -> anyhow::Result<[u8; 32]> {
 #[cfg(test)]
 mod tests {
     use super::{
-        REPLACEMENT_FAILURE_HOOK, default_large_file_parallel_workers, ensure_directory_path,
-        install_prepared_path,
+        REPLACEMENT_FAILURE_HOOK, compute_requested_blocks, default_large_file_parallel_workers,
+        ensure_directory_path, install_prepared_path,
         test_support::{DurabilityProbe, OptimizationProbe},
     };
     use crate::pxs::{
@@ -1603,5 +1607,16 @@ mod tests {
             (1..=8).contains(&workers),
             "expected conservative SSH worker default between 1 and 8, got {workers}"
         );
+    }
+
+    #[test]
+    fn test_compute_requested_blocks_handles_empty_hash_list() -> anyhow::Result<()> {
+        let dir = tempdir()?;
+        let file_path = dir.path().join("existing.bin");
+        std::fs::write(&file_path, b"existing payload")?;
+
+        let requested = compute_requested_blocks(&file_path, &[], 128 * 1024)?;
+        assert!(requested.is_empty());
+        Ok(())
     }
 }

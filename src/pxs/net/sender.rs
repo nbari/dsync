@@ -42,11 +42,24 @@ struct SenderLoopOptions {
 }
 
 #[derive(Clone)]
+enum ParallelWorkerTransport {
+    Tcp { addr: String },
+    Ssh { addr: String, dst_path: String },
+}
+
+#[derive(Clone)]
 struct ParallelSenderOptions {
     threshold_bytes: u64,
     worker_count: usize,
-    ssh_addr: String,
-    ssh_dst_path: String,
+    transport: ParallelWorkerTransport,
+}
+
+#[derive(Clone)]
+struct RawSenderWorkerOptions {
+    threshold: f32,
+    checksum: bool,
+    fsync: bool,
+    parallel: Option<ParallelSenderOptions>,
 }
 
 /// Run the listener in sender mode (serves files to clients).
@@ -173,9 +186,7 @@ fn build_worker_batches(
 async fn run_sender_workers(
     addr: &str,
     src_root: &Path,
-    threshold: f32,
-    checksum: bool,
-    fsync: bool,
+    options: RawSenderWorkerOptions,
     progress: &Arc<ProgressBar>,
     batches: Vec<Vec<String>>,
 ) -> anyhow::Result<()> {
@@ -184,12 +195,16 @@ async fn run_sender_workers(
         let addr_owned = addr.to_string();
         let src_root_worker = src_root.to_path_buf();
         let progress_worker = Arc::clone(progress);
+        let worker_options = options.clone();
 
         workers.push(tokio::spawn(async move {
             let stream = connect_with_retry(&addr_owned).await?;
             let mut framed = Framed::new(stream, PxsCodec);
-            let features = sender_handshake(&mut framed, true, false).await?;
-            send_push_session_options(&mut framed, fsync, false).await?;
+            let features =
+                sender_handshake(&mut framed, true, worker_options.parallel.is_some()).await?;
+            send_push_session_options(&mut framed, worker_options.fsync, false).await?;
+            send_parallel_transfer_config(&mut framed, worker_options.parallel.clone(), features)
+                .await?;
 
             for rel_path in batch {
                 let src_path = source_path_for(&src_root_worker, &rel_path);
@@ -198,11 +213,11 @@ async fn run_sender_workers(
                     &src_root_worker,
                     &src_path,
                     RemoteFileSyncOptions {
-                        threshold,
-                        checksum,
+                        threshold: worker_options.threshold,
+                        checksum: worker_options.checksum,
                         progress: Arc::clone(&progress_worker),
                         features,
-                        parallel: None,
+                        parallel: worker_options.parallel.clone(),
                     },
                 )
                 .await?;
@@ -232,6 +247,23 @@ pub async fn run_sender(
     fsync: bool,
     ignores: &[String],
 ) -> anyhow::Result<()> {
+    run_sender_with_options(addr, src_root, threshold, checksum, fsync, ignores, None).await
+}
+
+/// Run the sender to coordinate the client-side sync with optional large-file parallelism.
+///
+/// # Errors
+///
+/// Returns an error if the connection fails or synchronization fails.
+pub async fn run_sender_with_options(
+    addr: &str,
+    src_root: &Path,
+    threshold: f32,
+    checksum: bool,
+    fsync: bool,
+    ignores: &[String],
+    large_file_parallel: Option<LargeFileParallelOptions>,
+) -> anyhow::Result<()> {
     let (tasks, total_size) = collect_sync_tasks(src_root, ignores).await?;
     let progress = Arc::new(tools::create_progress_bar(total_size));
 
@@ -251,6 +283,18 @@ pub async fn run_sender(
     };
 
     let file_paths = collect_file_paths(&tasks);
+    let large_file_parallel = large_file_parallel.map(
+        |LargeFileParallelOptions {
+             threshold_bytes,
+             worker_count,
+         }| ParallelSenderOptions {
+            threshold_bytes,
+            worker_count,
+            transport: ParallelWorkerTransport::Tcp {
+                addr: addr.to_string(),
+            },
+        },
+    );
 
     if file_paths.is_empty() {
         if let Some(mut framed) = main_framed {
@@ -267,7 +311,16 @@ pub async fn run_sender(
         .min(file_paths.len());
     let batches = build_worker_batches(file_paths, worker_count)?;
     run_sender_workers(
-        addr, src_root, threshold, checksum, fsync, &progress, batches,
+        addr,
+        src_root,
+        RawSenderWorkerOptions {
+            threshold,
+            checksum,
+            fsync,
+            parallel: large_file_parallel,
+        },
+        &progress,
+        batches,
     )
     .await?;
     if let Some(mut framed) = main_framed {
@@ -361,8 +414,10 @@ pub async fn run_ssh_sender(
                  }| ParallelSenderOptions {
                     threshold_bytes,
                     worker_count,
-                    ssh_addr: addr.to_string(),
-                    ssh_dst_path: dst_path.to_string(),
+                    transport: ParallelWorkerTransport::Ssh {
+                        addr: addr.to_string(),
+                        dst_path: dst_path.to_string(),
+                    },
                 },
             ),
         },
@@ -845,6 +900,107 @@ where
     Ok(())
 }
 
+async fn open_tcp_chunk_writer_connection(
+    addr: &str,
+    transfer_id: &str,
+    rel_path: &str,
+) -> anyhow::Result<Framed<TcpStream, PxsCodec>> {
+    let stream = connect_with_retry(addr).await?;
+    let mut framed = Framed::new(stream, PxsCodec);
+    let _features = sender_handshake(&mut framed, false, false).await?;
+    framed
+        .send(serialize_message(&Message::ChunkWriterStart {
+            transfer_id: transfer_id.to_string(),
+            path: rel_path.to_string(),
+        })?)
+        .await?;
+    Ok(framed)
+}
+
+async fn run_tcp_parallel_full_copy_workers(
+    addr: &str,
+    rel_path: &str,
+    transfer_id: &str,
+    metadata: FileMetadata,
+    progress: &Arc<ProgressBar>,
+    source_reader: Arc<SourceReadContext>,
+    worker_count: usize,
+) -> anyhow::Result<()> {
+    let total_blocks = metadata.size.div_ceil(BLOCK_SIZE);
+    let ranges = build_parallel_block_ranges(total_blocks, worker_count);
+    let mut workers = Vec::with_capacity(ranges.len());
+
+    for (start_block, end_block) in ranges {
+        let addr = addr.to_string();
+        let transfer_id = transfer_id.to_string();
+        let rel_path = rel_path.to_string();
+        let progress = Arc::clone(progress);
+        let source_reader = Arc::clone(&source_reader);
+
+        workers.push(tokio::spawn(async move {
+            let mut framed =
+                open_tcp_chunk_writer_connection(&addr, &transfer_id, &rel_path).await?;
+            send_full_copy_range(
+                &mut framed,
+                &rel_path,
+                source_reader,
+                start_block,
+                end_block,
+                &progress,
+                TransportFeatures::default(),
+            )
+            .await?;
+            finish_worker_connection(&mut framed).await
+        }));
+    }
+
+    for worker in workers {
+        worker.await??;
+    }
+    Ok(())
+}
+
+async fn run_tcp_parallel_block_workers(
+    addr: &str,
+    rel_path: &str,
+    transfer_id: &str,
+    indices: Vec<u32>,
+    progress: &Arc<ProgressBar>,
+    source_reader: Arc<SourceReadContext>,
+    worker_count: usize,
+) -> anyhow::Result<()> {
+    let batches = build_parallel_index_batches(indices, worker_count);
+    let mut workers = Vec::with_capacity(batches.len());
+
+    for batch in batches {
+        let addr = addr.to_string();
+        let transfer_id = transfer_id.to_string();
+        let rel_path = rel_path.to_string();
+        let progress = Arc::clone(progress);
+        let source_reader = Arc::clone(&source_reader);
+
+        workers.push(tokio::spawn(async move {
+            let mut framed =
+                open_tcp_chunk_writer_connection(&addr, &transfer_id, &rel_path).await?;
+            send_requested_block_batches(
+                &mut framed,
+                &rel_path,
+                source_reader,
+                batch,
+                &progress,
+                TransportFeatures::default(),
+            )
+            .await?;
+            finish_worker_connection(&mut framed).await
+        }));
+    }
+
+    for worker in workers {
+        worker.await??;
+    }
+    Ok(())
+}
+
 async fn run_ssh_parallel_full_copy_workers(
     options: &ParallelSenderOptions,
     rel_path: &str,
@@ -854,12 +1010,15 @@ async fn run_ssh_parallel_full_copy_workers(
     source_reader: Arc<SourceReadContext>,
 ) -> anyhow::Result<()> {
     let total_blocks = metadata.size.div_ceil(BLOCK_SIZE);
+    let ParallelWorkerTransport::Ssh { addr, dst_path } = &options.transport else {
+        anyhow::bail!("parallel SSH worker requested for non-SSH transport");
+    };
     let ranges = build_parallel_block_ranges(total_blocks, options.worker_count);
     let mut workers = Vec::with_capacity(ranges.len());
 
     for (start_block, end_block) in ranges {
-        let addr = options.ssh_addr.clone();
-        let dst_path = options.ssh_dst_path.clone();
+        let addr = addr.clone();
+        let dst_path = dst_path.clone();
         let transfer_id = transfer_id.to_string();
         let rel_path = rel_path.to_string();
         let progress = Arc::clone(progress);
@@ -901,12 +1060,15 @@ async fn run_ssh_parallel_block_workers(
     progress: &Arc<ProgressBar>,
     source_reader: Arc<SourceReadContext>,
 ) -> anyhow::Result<()> {
+    let ParallelWorkerTransport::Ssh { addr, dst_path } = &options.transport else {
+        anyhow::bail!("parallel SSH worker requested for non-SSH transport");
+    };
     let batches = build_parallel_index_batches(indices, options.worker_count);
     let mut workers = Vec::with_capacity(batches.len());
 
     for batch in batches {
-        let addr = options.ssh_addr.clone();
-        let dst_path = options.ssh_dst_path.clone();
+        let addr = addr.clone();
+        let dst_path = dst_path.clone();
         let transfer_id = transfer_id.to_string();
         let rel_path = rel_path.to_string();
         let progress = Arc::clone(progress);
@@ -1072,7 +1234,7 @@ fn ensure_parallel_options(
 ) -> anyhow::Result<ParallelSenderOptions> {
     parallel_options.ok_or_else(|| {
         anyhow::anyhow!(
-            "remote requested parallel {transfer_kind} transfer but SSH large-file parallelism is not configured"
+            "remote requested parallel {transfer_kind} transfer but large-file parallelism is not configured"
         )
     })
 }
@@ -1090,15 +1252,31 @@ where
 {
     let source_reader = ensure_source_read_context(source_reader, context.path).await?;
     let parallel_options = ensure_parallel_options(parallel_options, "full-copy")?;
-    run_ssh_parallel_full_copy_workers(
-        &parallel_options,
-        &context.rel_path,
-        &transfer_id,
-        context.metadata,
-        progress,
-        source_reader,
-    )
-    .await?;
+    match &parallel_options.transport {
+        ParallelWorkerTransport::Tcp { addr } => {
+            run_tcp_parallel_full_copy_workers(
+                addr,
+                &context.rel_path,
+                &transfer_id,
+                context.metadata,
+                progress,
+                source_reader,
+                parallel_options.worker_count,
+            )
+            .await?;
+        }
+        ParallelWorkerTransport::Ssh { .. } => {
+            run_ssh_parallel_full_copy_workers(
+                &parallel_options,
+                &context.rel_path,
+                &transfer_id,
+                context.metadata,
+                progress,
+                source_reader,
+            )
+            .await?;
+        }
+    }
     send_apply_metadata(framed, &context.rel_path, context.metadata).await
 }
 
@@ -1116,15 +1294,31 @@ where
 {
     let source_reader = ensure_source_read_context(source_reader, context.path).await?;
     let parallel_options = ensure_parallel_options(parallel_options, "block")?;
-    run_ssh_parallel_block_workers(
-        &parallel_options,
-        &context.rel_path,
-        &transfer_id,
-        indices,
-        progress,
-        source_reader,
-    )
-    .await?;
+    match &parallel_options.transport {
+        ParallelWorkerTransport::Tcp { addr } => {
+            run_tcp_parallel_block_workers(
+                addr,
+                &context.rel_path,
+                &transfer_id,
+                indices,
+                progress,
+                source_reader,
+                parallel_options.worker_count,
+            )
+            .await?;
+        }
+        ParallelWorkerTransport::Ssh { .. } => {
+            run_ssh_parallel_block_workers(
+                &parallel_options,
+                &context.rel_path,
+                &transfer_id,
+                indices,
+                progress,
+                source_reader,
+            )
+            .await?;
+        }
+    }
     send_apply_metadata(framed, &context.rel_path, context.metadata).await
 }
 

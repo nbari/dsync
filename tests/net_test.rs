@@ -1,12 +1,20 @@
 use bytes::BytesMut;
 use futures_util::{SinkExt, StreamExt};
 use indicatif::ProgressBar;
-use pxs::pxs::net::{self, Block, FileMetadata, Message};
+use pxs::pxs::net::{self, Block, FileMetadata, LargeFileParallelOptions, Message};
 use pxs::pxs::tools;
 use std::ffi::OsString;
 use std::os::unix::ffi::OsStringExt;
 use std::os::unix::fs::PermissionsExt;
-use std::{path::PathBuf, process::Stdio, sync::Arc, time::Duration};
+use std::{
+    path::PathBuf,
+    process::Stdio,
+    sync::{
+        Arc,
+        atomic::{AtomicUsize, Ordering},
+    },
+    time::Duration,
+};
 use tempfile::tempdir;
 use tokio::net::TcpListener;
 use tokio::process::Command;
@@ -39,6 +47,32 @@ async fn spawn_receiver(
 async fn stop_receiver(receiver_handle: JoinHandle<()>) {
     tokio::time::sleep(Duration::from_millis(100)).await;
     receiver_handle.abort();
+}
+
+async fn spawn_counting_receiver(
+    dst_root: PathBuf,
+) -> anyhow::Result<(std::net::SocketAddr, JoinHandle<()>, Arc<AtomicUsize>)> {
+    let listener = TcpListener::bind("127.0.0.1:0").await?;
+    let addr = listener.local_addr()?;
+    let accepted = Arc::new(AtomicUsize::new(0));
+    let accepted_listener = Arc::clone(&accepted);
+
+    let receiver_handle = tokio::spawn(async move {
+        while let Ok((stream, _)) = listener.accept().await {
+            accepted_listener.fetch_add(1, Ordering::Relaxed);
+            let dst_root_clone = dst_root.clone();
+            tokio::spawn(async move {
+                let mut framed = Framed::new(stream, net::PxsCodec);
+                if let Err(error) =
+                    net::handle_client(&mut framed, &dst_root_clone, false, false).await
+                {
+                    eprintln!("Receiver error: {error}");
+                }
+            });
+        }
+    });
+
+    Ok((addr, receiver_handle, accepted))
 }
 
 fn spawn_stdio_receiver(
@@ -801,6 +835,108 @@ async fn test_chunk_writer_supports_non_utf8_staged_path() -> anyhow::Result<()>
     let (status, stderr) = wait_for_child(receiver).await?;
     assert!(status.success(), "{stderr}");
     assert_eq!(std::fs::read(&staged_path)?, b"hello");
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_raw_tcp_chunk_writer_rejects_unknown_transfer_id() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let dst_root = dir.path().join("dst");
+    std::fs::create_dir_all(&dst_root)?;
+
+    let (client, server) = tokio::io::duplex(4096);
+    let dst_root_clone = dst_root.clone();
+    let receiver_task = tokio::spawn(async move {
+        let mut framed = Framed::new(server, net::PxsCodec);
+        net::handle_client(&mut framed, &dst_root_clone, false, false).await
+    });
+
+    let mut sender = Framed::new(client, net::PxsCodec);
+    sender
+        .send(net::serialize_message(&Message::Handshake {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+        })?)
+        .await?;
+
+    let _handshake = sender
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("missing receiver handshake"))??;
+
+    sender
+        .send(net::serialize_message(&Message::ChunkWriterStart {
+            transfer_id: String::from("deadbeef"),
+            path: String::from("file.bin"),
+        })?)
+        .await?;
+
+    let response = sender
+        .next()
+        .await
+        .ok_or_else(|| anyhow::anyhow!("missing chunk writer error"))??;
+    match net::deserialize_message(&response)? {
+        Message::Error(message) => assert!(message.contains("unknown transfer id")),
+        other => anyhow::bail!("expected Error, got {other:?}"),
+    }
+
+    let result = receiver_task.await?;
+    assert!(result.is_err());
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_raw_tcp_push_truncates_existing_destination_for_empty_source() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+    std::fs::create_dir_all(&src_dir)?;
+    std::fs::create_dir_all(&dst_dir)?;
+
+    let src_file = src_dir.join("empty.bin");
+    let dst_file = dst_dir.join("empty.bin");
+    std::fs::write(&src_file, [])?;
+    std::fs::write(&dst_file, b"non-empty destination payload")?;
+
+    let (addr, receiver_handle) = spawn_receiver(dst_dir.clone()).await?;
+    net::run_sender(&addr.to_string(), &src_dir, 0.5, false, false, &[]).await?;
+    stop_receiver(receiver_handle).await;
+
+    assert!(dst_file.exists());
+    assert_eq!(std::fs::metadata(&dst_file)?.len(), 0);
+    Ok(())
+}
+
+#[tokio::test]
+async fn test_raw_tcp_large_file_parallel_uses_multiple_connections() -> anyhow::Result<()> {
+    let dir = tempdir()?;
+    let src_file = dir.path().join("large.bin");
+    let dst_dir = dir.path().join("dst");
+    std::fs::create_dir_all(&dst_dir)?;
+
+    let content = make_patterned_bytes(8 * 128 * 1024 + 31, 19, 7)?;
+    std::fs::write(&src_file, &content)?;
+
+    let (addr, receiver_handle, accepted) = spawn_counting_receiver(dst_dir.clone()).await?;
+    net::run_sender_with_options(
+        &addr.to_string(),
+        &src_file,
+        0.5,
+        false,
+        false,
+        &[],
+        Some(LargeFileParallelOptions {
+            threshold_bytes: 1,
+            worker_count: 3,
+        }),
+    )
+    .await?;
+    stop_receiver(receiver_handle).await;
+
+    assert_eq!(std::fs::read(dst_dir.join("large.bin"))?, content);
+    assert!(
+        accepted.load(Ordering::Relaxed) >= 3,
+        "expected multiple raw TCP connections for chunk-parallel large-file transfer"
+    );
     Ok(())
 }
 

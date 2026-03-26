@@ -139,6 +139,10 @@ pub enum Message {
         transfer_id: String,
         indices: Vec<u32>,
     },
+    ChunkWriterStart {
+        transfer_id: String,
+        path: String,
+    },
     VerifyChecksum {
         path: String,
         hash: [u8; 32],
