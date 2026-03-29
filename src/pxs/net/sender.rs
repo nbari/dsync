@@ -9,9 +9,8 @@ use super::{
         Block, FileMetadata, Message, deserialize_message, serialize_block_batch, serialize_message,
     },
     shared::{
-        BlockCompression, TransportFeatures, block_bytes, compress_block_batch_payload,
-        connect_with_retry, local_handshake_version, negotiate_transport_features,
-        recv_with_timeout, skipped_bytes,
+        BlockCompression, BlockCompressor, TransportFeatures, block_bytes, connect_with_retry,
+        local_handshake_version, negotiate_transport_features, recv_with_timeout, skipped_bytes,
     },
     ssh::{
         ChildSession, build_ssh_chunk_writer_command, build_ssh_command, build_ssh_push_command,
@@ -693,6 +692,7 @@ where
             framed,
             &active_file.context,
             &mut active_file.source_reader,
+            &mut active_file.compressor,
             &msg,
             file_options,
         )
@@ -921,6 +921,7 @@ async fn send_block_batch<T>(
     blocks: Vec<Block>,
     progress: &Arc<ProgressBar>,
     features: TransportFeatures,
+    compression_state: &mut Option<BlockCompressor>,
 ) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
@@ -930,9 +931,19 @@ where
         && bytes_sent >= MIN_COMPRESSED_BATCH_BYTES
     {
         let serialized = serialize_block_batch(&blocks)?;
-        if let Some(compressed) =
-            compress_block_batch_payload(serialized.as_slice(), features.block_compression)?
-        {
+        let compressed = match features.block_compression {
+            BlockCompression::None => None,
+            BlockCompression::Zstd => {
+                if compression_state.is_none() {
+                    *compression_state = Some(BlockCompressor::new()?);
+                }
+                compression_state
+                    .as_mut()
+                    .ok_or_else(|| anyhow::anyhow!("missing zstd compressor state"))?
+                    .compress_block_batch_payload(serialized.as_slice())?
+            }
+        };
+        if let Some(compressed) = compressed {
             framed
                 .send(serialize_message(&Message::ApplyBlocksCompressed {
                     path: rel_path.to_vec(),
@@ -1045,6 +1056,7 @@ where
     let batch_size = 128_u64;
     let mut start = start_block;
     let mut pending_blocks: Option<Vec<Block>> = None;
+    let mut compression_state = None;
 
     while start < end_block || pending_blocks.is_some() {
         let read_future = if start < end_block {
@@ -1061,14 +1073,29 @@ where
         if let Some(blocks) = pending_blocks.take() {
             if let Some((read_fut, next_start)) = read_future {
                 let (send_result, read_result) = tokio::join!(
-                    send_block_batch(framed, rel_path, blocks, progress, features),
+                    send_block_batch(
+                        framed,
+                        rel_path,
+                        blocks,
+                        progress,
+                        features,
+                        &mut compression_state
+                    ),
                     read_fut
                 );
                 send_result?;
                 pending_blocks = Some(read_result?);
                 start = next_start;
             } else {
-                send_block_batch(framed, rel_path, blocks, progress, features).await?;
+                send_block_batch(
+                    framed,
+                    rel_path,
+                    blocks,
+                    progress,
+                    features,
+                    &mut compression_state,
+                )
+                .await?;
             }
         } else if let Some((read_fut, next_start)) = read_future {
             pending_blocks = Some(read_fut.await?);
@@ -1090,10 +1117,19 @@ async fn send_requested_block_batches<T>(
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
+    let mut compression_state = None;
     for chunk_indices in indices.chunks(128) {
         let blocks =
             read_requested_blocks(Arc::clone(&source_reader), chunk_indices.to_vec()).await?;
-        send_block_batch(framed, rel_path, blocks, progress, features).await?;
+        send_block_batch(
+            framed,
+            rel_path,
+            blocks,
+            progress,
+            features,
+            &mut compression_state,
+        )
+        .await?;
     }
     Ok(())
 }
@@ -1301,16 +1337,16 @@ async fn run_ssh_parallel_block_workers(
 
 async fn handle_request_full_copy_message<T>(
     framed: &mut Framed<T, PxsCodec>,
-    rel_path: &[u8],
+    context: &RemoteFileContext,
     source_reader: Arc<SourceReadContext>,
-    metadata: FileMetadata,
     progress: &Arc<ProgressBar>,
     features: TransportFeatures,
+    compression_state: &mut Option<BlockCompressor>,
 ) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
-    let num_blocks = metadata.size.div_ceil(BLOCK_SIZE);
+    let num_blocks = context.metadata.size.div_ceil(BLOCK_SIZE);
     let batch_size = 128_u64;
     let mut start_block = 0_u64;
 
@@ -1333,7 +1369,14 @@ where
             if let Some((read_fut, next_start)) = read_future {
                 // Pipeline: send current batch while reading next
                 let (send_result, read_result) = tokio::join!(
-                    send_block_batch(framed, rel_path, blocks, progress, features),
+                    send_block_batch(
+                        framed,
+                        &context.rel_path,
+                        blocks,
+                        progress,
+                        features,
+                        compression_state
+                    ),
                     read_fut
                 );
                 send_result?;
@@ -1341,7 +1384,15 @@ where
                 start_block = next_start;
             } else {
                 // Last batch, just send
-                send_block_batch(framed, rel_path, blocks, progress, features).await?;
+                send_block_batch(
+                    framed,
+                    &context.rel_path,
+                    blocks,
+                    progress,
+                    features,
+                    compression_state,
+                )
+                .await?;
             }
         } else if let Some((read_fut, next_start)) = read_future {
             // First iteration, just read
@@ -1350,7 +1401,7 @@ where
         }
     }
 
-    send_apply_metadata(framed, rel_path, metadata).await
+    send_apply_metadata(framed, &context.rel_path, context.metadata).await
 }
 
 async fn handle_request_hashes_message<T>(
@@ -1380,29 +1431,37 @@ where
 
 async fn handle_request_blocks_message<T>(
     framed: &mut Framed<T, PxsCodec>,
-    rel_path: &[u8],
+    context: &RemoteFileContext,
     source_reader: Arc<SourceReadContext>,
-    metadata: FileMetadata,
     indices: Vec<u32>,
     progress: &Arc<ProgressBar>,
     features: TransportFeatures,
+    compression_state: &mut Option<BlockCompressor>,
 ) -> Result<()>
 where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let requested_count = u64::try_from(indices.len()).map_err(|e| anyhow::anyhow!(e))?;
-    let total_blocks = metadata.size.div_ceil(BLOCK_SIZE);
+    let total_blocks = context.metadata.size.div_ceil(BLOCK_SIZE);
     if total_blocks > requested_count {
-        progress.inc(skipped_bytes(metadata, &indices));
+        progress.inc(skipped_bytes(context.metadata, &indices));
     }
 
     for chunk_indices in indices.chunks(128) {
         let blocks =
             read_requested_blocks(Arc::clone(&source_reader), chunk_indices.to_vec()).await?;
-        send_block_batch(framed, rel_path, blocks, progress, features).await?;
+        send_block_batch(
+            framed,
+            &context.rel_path,
+            blocks,
+            progress,
+            features,
+            compression_state,
+        )
+        .await?;
     }
 
-    send_apply_metadata(framed, rel_path, metadata).await
+    send_apply_metadata(framed, &context.rel_path, context.metadata).await
 }
 
 #[derive(Clone)]
@@ -1429,6 +1488,7 @@ impl RemoteFileContext {
 struct ActiveRemoteFile {
     context: RemoteFileContext,
     source_reader: Option<Arc<SourceReadContext>>,
+    compressor: Option<BlockCompressor>,
 }
 
 impl ActiveRemoteFile {
@@ -1436,6 +1496,7 @@ impl ActiveRemoteFile {
         Self {
             context,
             source_reader: None,
+            compressor: None,
         }
     }
 }
@@ -1555,6 +1616,7 @@ async fn handle_request_full_copy_with_context<T>(
     framed: &mut Framed<T, PxsCodec>,
     context: &RemoteFileContext,
     source_reader: &mut Option<Arc<SourceReadContext>>,
+    compression_state: &mut Option<BlockCompressor>,
     progress: &Arc<ProgressBar>,
     features: TransportFeatures,
 ) -> Result<()>
@@ -1564,11 +1626,11 @@ where
     let source_reader = ensure_source_read_context(source_reader, &context.path).await?;
     handle_request_full_copy_message(
         framed,
-        &context.rel_path,
+        context,
         source_reader,
-        context.metadata,
         progress,
         features,
+        compression_state,
     )
     .await
 }
@@ -1589,6 +1651,7 @@ async fn handle_request_blocks_with_context<T>(
     framed: &mut Framed<T, PxsCodec>,
     context: &RemoteFileContext,
     source_reader: &mut Option<Arc<SourceReadContext>>,
+    compression_state: &mut Option<BlockCompressor>,
     indices: Vec<u32>,
     progress: &Arc<ProgressBar>,
     features: TransportFeatures,
@@ -1599,12 +1662,12 @@ where
     let source_reader = ensure_source_read_context(source_reader, &context.path).await?;
     handle_request_blocks_message(
         framed,
-        &context.rel_path,
+        context,
         source_reader,
-        context.metadata,
         indices,
         progress,
         features,
+        compression_state,
     )
     .await
 }
@@ -1652,6 +1715,7 @@ async fn handle_remote_file_request_message<T>(
     framed: &mut Framed<T, PxsCodec>,
     context: &RemoteFileContext,
     source_reader: &mut Option<Arc<SourceReadContext>>,
+    compression_state: &mut Option<BlockCompressor>,
     message: &Message,
     options: &RemoteFileSyncOptions,
 ) -> Result<Option<RemoteFileMessageOutcome>>
@@ -1667,6 +1731,7 @@ where
                 framed,
                 context,
                 source_reader,
+                compression_state,
                 &options.progress,
                 options.features,
             )
@@ -1702,6 +1767,7 @@ where
                 framed,
                 context,
                 source_reader,
+                compression_state,
                 indices.clone(),
                 &options.progress,
                 options.features,
@@ -1838,6 +1904,7 @@ where
     T: AsyncRead + AsyncWrite + Unpin,
 {
     let mut source_reader: Option<Arc<SourceReadContext>> = None;
+    let mut compression_state = None;
     options
         .progress
         .set_message(display_protocol_path(&context.rel_path));
@@ -1852,9 +1919,15 @@ where
 
     while let Some(msg_bytes) = recv_with_timeout(framed).await? {
         let msg = deserialize_message(&msg_bytes)?;
-        if let Some(outcome) =
-            handle_remote_file_request_message(framed, &context, &mut source_reader, &msg, &options)
-                .await?
+        if let Some(outcome) = handle_remote_file_request_message(
+            framed,
+            &context,
+            &mut source_reader,
+            &mut compression_state,
+            &msg,
+            &options,
+        )
+        .await?
         {
             if matches!(outcome, RemoteFileMessageOutcome::Complete) {
                 return Ok(());
@@ -1901,7 +1974,6 @@ mod tests {
             .ok_or_else(|| anyhow::anyhow!("missing sender handshake"))??;
         match deserialize_message(&handshake)? {
             Message::Handshake { version } => {
-                assert!(version.contains("lz4-blocks"));
                 assert!(version.contains("zstd-blocks"));
             }
             other => anyhow::bail!("expected handshake, got {other:?}"),
@@ -1909,7 +1981,7 @@ mod tests {
 
         peer_framed
             .send(serialize_message(&Message::Handshake {
-                version: format!("{}+caps=zstd-blocks,lz4-blocks", env!("CARGO_PKG_VERSION")),
+                version: format!("{}+caps=zstd-blocks", env!("CARGO_PKG_VERSION")),
             })?)
             .await?;
 
@@ -1924,6 +1996,7 @@ mod tests {
         let mut sender_framed = Framed::new(client, PxsCodec);
         let mut receiver_framed = Framed::new(server, PxsCodec);
         let progress = Arc::new(ProgressBar::hidden());
+        let mut compression_state = None;
         let blocks = vec![Block {
             offset: 0,
             data: vec![
@@ -1942,6 +2015,7 @@ mod tests {
                 block_compression: BlockCompression::Zstd,
                 large_file_parallel: false,
             },
+            &mut compression_state,
         )
         .await?;
 
@@ -1975,6 +2049,7 @@ mod tests {
         let mut sender_framed = Framed::new(client, PxsCodec);
         let mut receiver_framed = Framed::new(server, PxsCodec);
         let progress = Arc::new(ProgressBar::hidden());
+        let mut compression_state = None;
         let blocks = vec![Block {
             offset: 0,
             data: vec![
@@ -1990,6 +2065,7 @@ mod tests {
             blocks,
             &progress,
             TransportFeatures::default(),
+            &mut compression_state,
         )
         .await?;
 

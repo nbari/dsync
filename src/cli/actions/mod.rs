@@ -18,8 +18,6 @@ pub enum RemoteEndpoint {
     Tcp { addr: String, path: Option<String> },
     /// SSH endpoint such as `user@host:/path`.
     Ssh { host: String, path: String },
-    /// Standard input/output transport for advanced piping.
-    Stdio,
 }
 
 /// Parsed high-level action selected by the CLI.

@@ -20,6 +20,12 @@ The project is aimed at repeated refreshes of datasets such as:
 safe synchronization first, then speed through Rust parallelism, fixed-block
 delta sync, and transport choices that fit modern large-data workloads.
 
+> [!NOTE]
+> `0.6.1` focuses on bandwidth-bound network syncs: negotiated `zstd` block
+> compression, bounded small-file fan-out on the control session, chunk-parallel
+> large-file transfers, and reused zstd compression contexts for outbound
+> batches.
+
 ## What `pxs` Is For
 
 Use `pxs` when you need:
@@ -169,9 +175,9 @@ The `host:port/path` suffix selects what to read or write inside the configured
 root. Client-side per-sync flags such as `--checksum`, `--threshold`,
 `--delete`, and `--ignore` travel with the `pxs sync` request.
 
-For SSH and raw TCP, `pxs` negotiates block compression automatically. It
-prefers `zstd`, falls back to `lz4` when needed, and otherwise uses the
-existing uncompressed path.
+For SSH and raw TCP, `pxs` negotiates block compression automatically. It uses
+`zstd` when both peers support it and otherwise uses the existing uncompressed
+path.
 
 ## Guarantees and Safety Model
 
@@ -220,8 +226,7 @@ Durability and verification options:
 - It walks directory trees concurrently.
 - It uses fixed 128 KiB blocks, which works well for many in-place update
   workloads.
-- It can compress outbound network block batches with negotiated `zstd` and
-  fall back to `lz4` when needed.
+- It can compress outbound network block batches with negotiated `zstd`.
 - It can keep multiple small outbound network files in flight on the main
   control session.
 - It can avoid SSH overhead entirely on trusted networks via raw TCP.
@@ -278,6 +283,12 @@ benchmarking:
 - `--network-file-concurrency`: keep multiple smaller outbound network files in
   flight on the main control session
 
+If `--large-file-parallel-workers` or `--network-file-concurrency` is omitted,
+`pxs` chooses a conservative default from available CPU cores. That is a
+starting point, not a guarantee that the link can sustain it. On bandwidth-poor,
+high-latency, or otherwise congested networks, lower values can perform better
+and reduce saturation.
+
 ## PostgreSQL Helper
 
 This repository includes [`sync.sh`](./sync.sh), a PostgreSQL-oriented helper
@@ -286,6 +297,13 @@ for repeated SSH `pxs sync SRC DST` passes around `pg_backup_start()` and
 
 It is useful when evaluating `pxs` on the workload it was originally built to
 care about most: repeated `PGDATA` refreshes.
+
+`sync.sh` also accepts optional outbound SSH tuning overrides through
+environment variables: `PXS_NETWORK_FILE_CONCURRENCY`,
+`PXS_LARGE_FILE_PARALLEL_THRESHOLD`, and
+`PXS_LARGE_FILE_PARALLEL_WORKERS`. Leave them unset to keep `pxs` defaults, and
+reduce them on bandwidth-poor or high-latency links if the default fan-out
+saturates the network.
 
 ## Design Notes
 

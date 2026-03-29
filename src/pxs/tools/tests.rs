@@ -309,7 +309,12 @@ fn test_default_large_file_parallel_workers_is_conservative() {
 
 #[test]
 fn test_default_network_file_concurrency_is_bounded() {
-    assert_eq!(default_network_file_concurrency(), 4);
+    let concurrency = default_network_file_concurrency();
+    assert_eq!(concurrency, default_large_file_parallel_workers());
+    assert!(
+        (1..=8).contains(&concurrency),
+        "expected conservative outbound network file concurrency between 1 and 8, got {concurrency}"
+    );
 }
 
 #[test]

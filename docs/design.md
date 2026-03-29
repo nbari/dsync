@@ -43,7 +43,7 @@ Raw TCP setup commands remain:
 - `pxs listen ADDR ROOT`
 - `pxs serve ADDR ROOT`
 
-`push` and `pull` remain hidden compatibility aliases, not the public story.
+`sync` is the only public transfer command shape.
 
 ## Design Overview
 
@@ -91,10 +91,11 @@ sequenceDiagram
     C->>S: SyncComplete
 ```
 
-Raw TCP negotiates per-session block compression. It prefers `zstd`, falls back
-to `lz4`, and otherwise sends plain block batches. Smaller outbound files can be
-kept in flight concurrently on the control session, while files at or above the
-large-file threshold are drained and handled separately with chunk workers.
+Raw TCP negotiates per-session block compression. It uses `zstd` when both
+peers support it and otherwise sends plain block batches. Smaller outbound files
+can be kept in flight concurrently on the control session, while files at or
+above the large-file threshold are drained and handled separately with chunk
+workers.
 
 ### SSH Sync
 
@@ -109,10 +110,10 @@ flowchart LR
 
 SSH uses the same internal protocol shape as other network flows, but transports
 it over stdio, keeps SSH-level compression disabled to avoid double-compressing
-protocol payloads, and uses the same negotiated `zstd -> lz4 -> plain` block
+protocol payloads, and uses the same negotiated `zstd -> plain` block
 compression strategy as raw TCP. Smaller outbound files can share the control
-session concurrently, while large outbound transfers can fan out with
-additional worker sessions.
+session concurrently, while large outbound transfers can fan out with additional
+worker sessions.
 
 ## Sync Semantics
 
@@ -168,7 +169,7 @@ The answer is workload-specific, not universal:
 - block hashing and comparison are parallel
 - directory walking is concurrent
 - fixed blocks favor many in-place update workloads
-- negotiated `zstd`/`lz4` can reduce bytes on bandwidth-bound links
+- negotiated `zstd` can reduce bytes on bandwidth-bound links
 - smaller outbound network files can overlap on the control session
 - raw TCP can avoid SSH overhead on trusted networks
 - outbound network sync can fan out large files with worker sessions

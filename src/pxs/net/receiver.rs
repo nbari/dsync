@@ -90,19 +90,12 @@ enum RemoteDeleteOverride {
     Deny,
 }
 
-#[derive(Clone, Copy)]
-enum Lz4Allowance {
-    Allow,
-    Deny,
-}
-
 #[derive(Clone)]
 struct ClientHandlingOptions {
     show_progress: bool,
     fsync: bool,
     remote_fsync_override: RemoteFsyncOverride,
     remote_delete_override: RemoteDeleteOverride,
-    lz4: Lz4Allowance,
     large_file_parallel: bool,
     control_session_gate: Option<Arc<Semaphore>>,
     ignores: Arc<[String]>,
@@ -513,7 +506,6 @@ pub async fn run_pull_client_with_options(
         fsync: options.features.fsync,
         remote_fsync_override: RemoteFsyncOverride::Deny,
         remote_delete_override: RemoteDeleteOverride::Allow,
-        lz4: Lz4Allowance::Allow,
         large_file_parallel: false,
         control_session_gate: None,
         ignores: Arc::<[String]>::from(options.ignores.to_vec()),
@@ -561,7 +553,6 @@ pub async fn run_receiver(addr: &str, dst_root: &Path, fsync: bool) -> Result<()
                     fsync,
                     remote_fsync_override: RemoteFsyncOverride::Allow,
                     remote_delete_override: RemoteDeleteOverride::Allow,
-                    lz4: Lz4Allowance::Allow,
                     large_file_parallel: true,
                     control_session_gate: Some(control_session_gate),
                     ignores: Arc::from(Vec::<String>::new()),
@@ -600,7 +591,6 @@ pub async fn run_stdio_receiver(
             fsync,
             remote_fsync_override: RemoteFsyncOverride::Deny,
             remote_delete_override: RemoteDeleteOverride::Allow,
-            lz4: Lz4Allowance::Allow,
             large_file_parallel: true,
             control_session_gate: None,
             ignores: Arc::<[String]>::from(ignores.to_vec()),
@@ -750,7 +740,6 @@ pub async fn run_ssh_receiver(
             fsync: options.features.fsync,
             remote_fsync_override: RemoteFsyncOverride::Deny,
             remote_delete_override: RemoteDeleteOverride::Allow,
-            lz4: Lz4Allowance::Allow,
             large_file_parallel: false,
             control_session_gate: None,
             ignores: Arc::<[String]>::from(options.ignores.to_vec()),
@@ -1259,13 +1248,9 @@ where
         return match msg {
             Message::Handshake { version } => {
                 tracing::debug!("Client connected (version: {version})");
-                state.transport = handle_handshake(
-                    framed,
-                    version.clone(),
-                    matches!(options.lz4, Lz4Allowance::Allow),
-                    options.large_file_parallel,
-                )
-                .await?;
+                state.transport =
+                    handle_handshake(framed, version.clone(), true, options.large_file_parallel)
+                        .await?;
                 state.protocol_state = ProtocolState::AwaitingTransfer;
                 Ok(Some(true))
             }
@@ -1557,7 +1542,6 @@ where
             fsync,
             remote_fsync_override: RemoteFsyncOverride::Deny,
             remote_delete_override: RemoteDeleteOverride::Deny,
-            lz4: Lz4Allowance::Deny,
             large_file_parallel: true,
             control_session_gate: None,
             ignores: Arc::from(Vec::<String>::new()),
@@ -1607,13 +1591,8 @@ where
     match msg {
         Message::Handshake { version } => {
             tracing::debug!("Client connected (version: {version})");
-            state.transport = handle_handshake(
-                framed,
-                version,
-                matches!(options.lz4, Lz4Allowance::Allow),
-                options.large_file_parallel,
-            )
-            .await?;
+            state.transport =
+                handle_handshake(framed, version, true, options.large_file_parallel).await?;
             state.protocol_state = ProtocolState::AwaitingTransfer;
             Ok(state)
         }

@@ -13,16 +13,25 @@ const INITIAL_BACKOFF_MS: u64 = 500;
 const PROTOCOL_MAJOR: &str = env!("CARGO_PKG_VERSION_MAJOR");
 const PROTOCOL_MINOR: &str = env!("CARGO_PKG_VERSION_MINOR");
 const CAPABILITIES_PREFIX: &str = "caps=";
-const LZ4_BLOCKS_CAPABILITY: &str = "lz4-blocks";
 const ZSTD_BLOCKS_CAPABILITY: &str = "zstd-blocks";
 const LARGE_FILE_PARALLEL_CAPABILITY: &str = "large-file-parallel";
-const ZSTD_COMPRESSION_LEVEL: i32 = 1;
+const ZSTD_COMPRESSION_LEVEL_DEFAULT: i32 = 1;
+const ZSTD_COMPRESSION_LEVEL_EXPERIMENT: i32 = 3;
+/// Active zstd level for negotiated network block compression.
+///
+/// Flip this back to `ZSTD_COMPRESSION_LEVEL_DEFAULT` if the level-3 experiment
+/// regresses end-to-end transfer time on CPU-bound hosts.
+const ZSTD_COMPRESSION_LEVEL: i32 =
+    if ZSTD_COMPRESSION_LEVEL_EXPERIMENT >= ZSTD_COMPRESSION_LEVEL_DEFAULT {
+        ZSTD_COMPRESSION_LEVEL_EXPERIMENT
+    } else {
+        ZSTD_COMPRESSION_LEVEL_DEFAULT
+    };
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub(crate) enum BlockCompression {
     #[default]
     None,
-    Lz4,
     Zstd,
 }
 
@@ -32,9 +41,46 @@ pub(crate) struct TransportFeatures {
     pub(crate) large_file_parallel: bool,
 }
 
+/// Reusable compressor for serialized block-batch payloads.
+///
+/// Reusing the zstd context avoids rebuilding it for every outbound batch while
+/// preserving the existing "only send compressed when it is smaller" behavior.
+pub(crate) struct BlockCompressor {
+    zstd: zstd::bulk::Compressor<'static>,
+}
+
+impl BlockCompressor {
+    /// Create a reusable compressor using the active zstd level experiment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if zstd cannot initialize a compression context.
+    pub(crate) fn new() -> Result<Self> {
+        Ok(Self {
+            zstd: zstd::bulk::Compressor::new(ZSTD_COMPRESSION_LEVEL)?,
+        })
+    }
+
+    /// Compress a serialized block batch, returning `None` when it is not smaller.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if zstd compression fails.
+    pub(crate) fn compress_block_batch_payload(
+        &mut self,
+        payload: &[u8],
+    ) -> Result<Option<Vec<u8>>> {
+        let compressed = self.zstd.compress(payload)?;
+        if compressed.len() < payload.len() {
+            Ok(Some(compressed))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct PeerCapabilities {
-    lz4_block_messages: bool,
     zstd_block_messages: bool,
     large_file_parallel: bool,
 }
@@ -102,9 +148,7 @@ fn parse_peer_capabilities(version: &str) -> PeerCapabilities {
 
     let mut features = PeerCapabilities::default();
     for capability in raw_capabilities.split(',') {
-        if capability == LZ4_BLOCKS_CAPABILITY {
-            features.lz4_block_messages = true;
-        } else if capability == ZSTD_BLOCKS_CAPABILITY {
+        if capability == ZSTD_BLOCKS_CAPABILITY {
             features.zstd_block_messages = true;
         } else if capability == LARGE_FILE_PARALLEL_CAPABILITY {
             features.large_file_parallel = true;
@@ -121,7 +165,6 @@ pub(crate) fn local_handshake_version(
     let mut capabilities = Vec::new();
     if advertise_block_compression {
         capabilities.push(ZSTD_BLOCKS_CAPABILITY);
-        capabilities.push(LZ4_BLOCKS_CAPABILITY);
     }
     if advertise_large_file_parallel {
         capabilities.push(LARGE_FILE_PARALLEL_CAPABILITY);
@@ -148,8 +191,6 @@ pub(crate) fn negotiate_transport_features(
         block_compression: if allow_block_compression {
             if peer_features.zstd_block_messages {
                 BlockCompression::Zstd
-            } else if peer_features.lz4_block_messages {
-                BlockCompression::Lz4
             } else {
                 BlockCompression::None
             }
@@ -158,27 +199,6 @@ pub(crate) fn negotiate_transport_features(
         },
         large_file_parallel: allow_large_file_parallel && peer_features.large_file_parallel,
     })
-}
-
-/// Compress a serialized block batch for transport if the chosen codec is enabled.
-///
-/// # Errors
-///
-/// Returns an error if compression fails.
-pub(crate) fn compress_block_batch_payload(
-    payload: &[u8],
-    codec: BlockCompression,
-) -> Result<Option<Vec<u8>>> {
-    let compressed = match codec {
-        BlockCompression::None => return Ok(None),
-        BlockCompression::Lz4 => lz4_flex::compress_prepend_size(payload),
-        BlockCompression::Zstd => zstd::bulk::compress(payload, ZSTD_COMPRESSION_LEVEL)?,
-    };
-    if compressed.len() < payload.len() {
-        Ok(Some(compressed))
-    } else {
-        Ok(None)
-    }
 }
 
 /// Decompress a serialized block batch payload using the negotiated transport codec.
@@ -194,8 +214,6 @@ pub(crate) fn decompress_block_batch_payload(
         BlockCompression::None => {
             anyhow::bail!("received compressed block batch without negotiated compression support")
         }
-        BlockCompression::Lz4 => lz4_flex::decompress_size_prepended(payload)
-            .map_err(|error| anyhow::anyhow!("failed to decompress lz4 block batch: {error}")),
         BlockCompression::Zstd => zstd::stream::decode_all(Cursor::new(payload))
             .map_err(|error| anyhow::anyhow!("failed to decompress zstd block batch: {error}")),
     }
@@ -251,9 +269,9 @@ pub(crate) fn block_bytes(blocks: &[Block]) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::{
-        BlockCompression, TransportFeatures, compress_block_batch_payload,
-        decompress_block_batch_payload, local_handshake_version, negotiate_transport_features,
-        recv_with_timeout_for,
+        BlockCompression, BlockCompressor, TransportFeatures, ZSTD_COMPRESSION_LEVEL,
+        ZSTD_COMPRESSION_LEVEL_EXPERIMENT, decompress_block_batch_payload, local_handshake_version,
+        negotiate_transport_features, recv_with_timeout_for,
     };
     use crate::pxs::net::PxsCodec;
     use anyhow::Result;
@@ -278,13 +296,12 @@ mod tests {
         let version = local_handshake_version(true, false);
         assert!(version.contains("+caps="));
         assert!(version.contains("zstd-blocks"));
-        assert!(version.contains("lz4-blocks"));
     }
 
     #[test]
-    fn test_negotiate_transport_features_prefers_zstd_when_both_peers_support_it() -> Result<()> {
+    fn test_negotiate_transport_features_uses_zstd_when_peer_supports_it() -> Result<()> {
         let features = negotiate_transport_features(
-            &format!("{}+caps=zstd-blocks,lz4-blocks", env!("CARGO_PKG_VERSION")),
+            &format!("{}+caps=zstd-blocks", env!("CARGO_PKG_VERSION")),
             true,
             false,
         )?;
@@ -299,16 +316,16 @@ mod tests {
     }
 
     #[test]
-    fn test_negotiate_transport_features_falls_back_to_lz4_without_peer_zstd() -> Result<()> {
+    fn test_negotiate_transport_features_falls_back_to_plain_without_peer_zstd() -> Result<()> {
         let features = negotiate_transport_features(
-            &format!("{}+caps=lz4-blocks", env!("CARGO_PKG_VERSION")),
+            &format!("{}+caps=legacy-blocks", env!("CARGO_PKG_VERSION")),
             true,
             false,
         )?;
         assert_eq!(
             features,
             TransportFeatures {
-                block_compression: BlockCompression::Lz4,
+                block_compression: BlockCompression::None,
                 large_file_parallel: false,
             }
         );
@@ -360,7 +377,8 @@ mod tests {
     #[test]
     fn test_compress_and_decompress_block_batch_payload_with_zstd() -> Result<()> {
         let payload = vec![b'A'; 128 * 1024];
-        let compressed = compress_block_batch_payload(&payload, BlockCompression::Zstd)?
+        let compressed = BlockCompressor::new()?
+            .compress_block_batch_payload(&payload)?
             .ok_or_else(|| anyhow::anyhow!("expected compressed payload"))?;
         let decompressed = decompress_block_batch_payload(&compressed, BlockCompression::Zstd)?;
         assert_eq!(decompressed, payload);
@@ -368,12 +386,8 @@ mod tests {
     }
 
     #[test]
-    fn test_compress_and_decompress_block_batch_payload_with_lz4() -> Result<()> {
-        let payload = vec![b'A'; 128 * 1024];
-        let compressed = compress_block_batch_payload(&payload, BlockCompression::Lz4)?
-            .ok_or_else(|| anyhow::anyhow!("expected compressed payload"))?;
-        let decompressed = decompress_block_batch_payload(&compressed, BlockCompression::Lz4)?;
-        assert_eq!(decompressed, payload);
-        Ok(())
+    fn test_active_zstd_compression_level_uses_experiment_value() {
+        assert_eq!(ZSTD_COMPRESSION_LEVEL, ZSTD_COMPRESSION_LEVEL_EXPERIMENT);
+        assert_eq!(ZSTD_COMPRESSION_LEVEL, 3);
     }
 }

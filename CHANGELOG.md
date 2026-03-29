@@ -4,9 +4,11 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.1] - 2026-03-29
+
 ### Added
 
-- Added negotiated block compression for outbound SSH and raw TCP transfers, preferring `zstd` and falling back to `lz4` before the existing uncompressed path.
+- Added negotiated block compression for outbound SSH and raw TCP transfers, using `zstd` when both peers support it and otherwise keeping the existing uncompressed path.
 - Added `--network-file-concurrency` to bound how many smaller outbound network file transfers can stay in flight on the main control session.
 - Added regression coverage for negotiated `zstd` chunk-writer batches and bounded small-file network concurrency on the sender control path.
 
@@ -15,9 +17,13 @@ All notable changes to this project will be documented in this file.
 - Clarified the public project objective across the README, crate metadata, CLI help text, and benchmark script wording so `pxs` is consistently described as an integrity-first sync/clone tool for large mutable datasets rather than a general `rsync` replacement.
 - Reworked the README into an operator-focused guide and moved protocol and architecture notes into a dedicated contributor-facing design document.
 - Restored the public `sync` operand order to `pxs sync SRC DST` across local, SSH, and raw TCP flows so the command again follows source-first semantics instead of the newer destination-first model.
+- Removed the hidden `push` and `pull` compatibility aliases so `sync` is now the only public transfer subcommand.
 - Reworked outbound network scheduling so smaller files can share the control session concurrently, while files at or above `--large-file-parallel-threshold` drain in-flight small work and continue to use chunk-parallel worker transfers.
 - Extended `--large-file-parallel-threshold` from a large-file worker toggle into the scheduler boundary between small-file control-session fan-out and large-file chunk-worker mode for outbound network sync.
-- Kept SSH transport compression disabled so protocol-level `zstd`/`lz4` remains the only compression layer by default.
+- Made the default outbound small-file concurrency adaptive like large-file worker fan-out instead of using a fixed value when `--network-file-concurrency` is omitted.
+- Reused outbound zstd compressor contexts across block batches and switched the active network compression experiment to explicit zstd level `3` instead of the previous speed-biased level `1`.
+- Kept SSH transport compression disabled so protocol-level `zstd` remains the only compression layer by default.
+- Updated `sync.sh` so the PostgreSQL helper can pass through outbound SSH tuning via `PXS_NETWORK_FILE_CONCURRENCY`, `PXS_LARGE_FILE_PARALLEL_THRESHOLD`, and `PXS_LARGE_FILE_PARALLEL_WORKERS`.
 
 ## [0.6.0] - 2026-03-27
 

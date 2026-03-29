@@ -35,7 +35,7 @@ const FSYNC_LONG_HELP: &str =
     "Ensures that file data and metadata are flushed to disk before finishing. Slower but safer.";
 const LARGE_FILE_PARALLEL_THRESHOLD_LONG_HELP: &str = "For outbound network sync, files at or above this size use chunk-parallel worker transfers. Smaller files can share the main control session when network file concurrency is above 1. Accepts raw bytes or binary suffixes such as KiB, MiB, GiB, and TiB. Use 0 to disable large-file worker mode.";
 const LARGE_FILE_PARALLEL_WORKERS_LONG_HELP: &str = "Number of parallel worker connections or sessions for eligible large outbound network transfers. If omitted, pxs chooses a conservative default from available CPU cores.";
-const NETWORK_FILE_CONCURRENCY_LONG_HELP: &str = "Maximum number of small outbound network file transfers to keep in flight on the main control session. Files at or above --large-file-parallel-threshold are transferred separately using chunk workers.";
+const NETWORK_FILE_CONCURRENCY_LONG_HELP: &str = "Maximum number of small outbound network file transfers to keep in flight on the main control session. If omitted, pxs chooses a conservative default from available CPU cores. Higher values can saturate bandwidth-bound links, so reduce this on slower or congested networks. Files at or above --large-file-parallel-threshold are transferred separately using chunk workers.";
 
 /// Create a path validator that requires the path to exist.
 pub fn validator_path_exists() -> ValueParser {
@@ -282,13 +282,6 @@ fn dst_arg() -> Arg {
         .required(true)
 }
 
-fn endpoint_arg() -> Arg {
-    Arg::new("endpoint")
-        .help("Remote endpoint as host:port[/path], user@host:/path, or - for stdio")
-        .value_name("ENDPOINT")
-        .required(true)
-}
-
 fn addr_arg() -> Arg {
     Arg::new("addr")
         .help("Listen address such as 0.0.0.0:8080")
@@ -358,41 +351,6 @@ fn sync_command() -> Command {
         ])
 }
 
-fn push_command() -> Command {
-    Command::new("push")
-        .about("Push a local source to a remote receiver or SSH destination")
-        .hide(true)
-        .args([
-            src_arg(),
-            endpoint_arg(),
-            threshold_arg(false),
-            checksum_arg(false),
-            delete_arg(),
-            fsync_arg(false),
-            large_file_parallel_threshold_arg(),
-            large_file_parallel_workers_arg(),
-            network_file_concurrency_arg(),
-            ignore_arg(false),
-            exclude_from_arg(false),
-        ])
-}
-
-fn pull_command() -> Command {
-    Command::new("pull")
-        .about("Pull from a remote serve endpoint or SSH source into a local destination")
-        .hide(true)
-        .args([
-            endpoint_arg(),
-            dst_arg(),
-            threshold_arg(false),
-            checksum_arg(false),
-            delete_arg(),
-            fsync_arg(false),
-            ignore_arg(false),
-            exclude_from_arg(false),
-        ])
-}
-
 fn listen_command() -> Command {
     Command::new("listen")
         .about("Listen for incoming sync operations and write them to a destination root")
@@ -425,13 +383,7 @@ fn base_command() -> Command {
         .arg(verbose_arg())
         .arg(quiet_arg())
         .args(internal_stdio_args())
-        .subcommands([
-            sync_command(),
-            push_command(),
-            pull_command(),
-            listen_command(),
-            serve_command(),
-        ])
+        .subcommands([sync_command(), listen_command(), serve_command()])
 }
 
 /// Build the CLI command definition.

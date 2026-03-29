@@ -18,7 +18,7 @@ pub fn clamped_parallelism() -> usize {
 /// SSH and raw TCP worker attachments add extra per-worker overhead, so the
 /// default is intentionally bucketed rather than matching CPU count directly.
 #[must_use]
-pub fn default_large_file_parallel_workers() -> usize {
+fn default_remote_parallelism_bucket() -> usize {
     match clamped_parallelism() {
         0 | 1 => 1,
         2 | 3 => 2,
@@ -27,8 +27,14 @@ pub fn default_large_file_parallel_workers() -> usize {
     }
 }
 
+/// Return a conservative default worker count for parallel remote large-file transfer.
+#[must_use]
+pub fn default_large_file_parallel_workers() -> usize {
+    default_remote_parallelism_bucket()
+}
+
 /// Return the default number of small files to keep in flight on outbound network sync.
 #[must_use]
-pub const fn default_network_file_concurrency() -> usize {
-    4
+pub fn default_network_file_concurrency() -> usize {
+    default_remote_parallelism_bucket()
 }

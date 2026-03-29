@@ -280,7 +280,7 @@ async fn run_stdio_sync_with_receiver_args(
 }
 
 fn negotiated_compression_version() -> String {
-    format!("{}+caps=zstd-blocks,lz4-blocks", env!("CARGO_PKG_VERSION"))
+    format!("{}+caps=zstd-blocks", env!("CARGO_PKG_VERSION"))
 }
 
 fn serialize_test_block_batch(blocks: Vec<Block>) -> Result<Vec<u8>> {
@@ -1163,7 +1163,6 @@ async fn test_chunk_writer_accepts_zstd_compressed_batches() -> Result<()> {
     match handshake {
         Message::Handshake { version } => {
             assert!(version.contains("zstd-blocks"));
-            assert!(version.contains("lz4-blocks"));
         }
         other => anyhow::bail!("expected handshake, got {other:?}"),
     }

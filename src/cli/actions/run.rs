@@ -106,25 +106,6 @@ async fn handle_push_action(
             )
             .await?;
         }
-        RemoteEndpoint::Stdio => {
-            anyhow::ensure!(
-                !options.fsync,
-                "--fsync is not supported for `pxs push -`; use a receiver transport that can apply durability on the destination side"
-            );
-            anyhow::ensure!(
-                !options.delete,
-                "--delete is not supported for `pxs push -`; use SSH remote mirror mode instead"
-            );
-            crate::pxs::net::run_stdio_sender(
-                src,
-                options.threshold,
-                options.checksum,
-                false,
-                ignores,
-                false,
-            )
-            .await?;
-        }
         RemoteEndpoint::Tcp { addr, path } => {
             info!(
                 "Connecting to {addr} to sync {} into the remote destination (checksum: {})",
@@ -184,9 +165,6 @@ async fn handle_pull_action(
                 },
             )
             .await?;
-        }
-        RemoteEndpoint::Stdio => {
-            anyhow::bail!("stdio is not supported for pull mode");
         }
         RemoteEndpoint::Tcp { addr, path } => {
             info!("Connecting to {addr} to sync into {}", dst.display());
@@ -721,67 +699,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_push_stdio_rejects_fsync() -> Result<()> {
-        let dir = tempdir()?;
-        let src = dir.path().join("source.txt");
-        fs::write(&src, "payload")?;
-
-        let error = match handle(Action::Sync {
-            src: SyncOperand::Local(src),
-            dst: SyncOperand::Remote(RemoteEndpoint::Stdio),
-            threshold: 0.5,
-            checksum: false,
-            dry_run: false,
-            delete: false,
-            fsync: true,
-            large_file_parallel_threshold: 0,
-            large_file_parallel_workers: 0,
-            network_file_concurrency: 0,
-            ignores: Vec::new(),
-            quiet: false,
-        })
-        .await
-        {
-            Ok(()) => anyhow::bail!("stdio push should reject --fsync"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("--fsync is not supported"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_handle_push_stdio_rejects_delete() -> Result<()> {
-        let dir = tempdir()?;
-        let src_dir = dir.path().join("source");
-        fs::create_dir_all(&src_dir)?;
-
-        let error = match handle(Action::Sync {
-            src: SyncOperand::Local(src_dir),
-            dst: SyncOperand::Remote(RemoteEndpoint::Stdio),
-            threshold: 0.5,
-            checksum: false,
-            dry_run: false,
-            delete: true,
-            fsync: false,
-            large_file_parallel_threshold: 0,
-            large_file_parallel_workers: 0,
-            network_file_concurrency: 0,
-            ignores: Vec::new(),
-            quiet: false,
-        })
-        .await
-        {
-            Ok(()) => anyhow::bail!("stdio push should reject --delete"),
-            Err(error) => error,
-        };
-
-        assert!(error.to_string().contains("--delete is not supported"));
-        Ok(())
-    }
-
-    #[tokio::test]
-    async fn test_handle_tcp_pull_allows_delete_request() -> Result<()> {
+    async fn test_handle_remote_to_local_sync_allows_delete_request() -> Result<()> {
         let dir = tempdir()?;
         let dst = dir.path().join("dst");
         fs::create_dir_all(&dst)?;
@@ -805,7 +723,7 @@ mod tests {
         })
         .await
         {
-            Ok(()) => anyhow::bail!("raw TCP pull should attempt the remote session"),
+            Ok(()) => anyhow::bail!("remote-to-local sync should attempt the remote session"),
             Err(error) => error,
         };
 

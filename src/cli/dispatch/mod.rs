@@ -22,8 +22,6 @@ pub fn handler(matches: &ArgMatches) -> Result<Action> {
 
     match matches.subcommand() {
         Some(("sync", submatches)) => handle_sync(submatches, quiet),
-        Some(("push", submatches)) => handle_push(submatches, quiet),
-        Some(("pull", submatches)) => handle_pull(submatches, quiet),
         Some(("listen", submatches)) => handle_listen(submatches, quiet),
         Some(("serve", submatches)) => handle_serve(submatches, quiet),
         Some((other, _)) => anyhow::bail!("unsupported subcommand: {other}"),
@@ -72,11 +70,7 @@ fn threshold(matches: &ArgMatches) -> f32 {
         .unwrap_or(&DEFAULT_THRESHOLD)
 }
 
-fn parse_remote_endpoint(endpoint: &str, allow_stdio: bool) -> Result<RemoteEndpoint> {
-    if allow_stdio && endpoint == "-" {
-        return Ok(RemoteEndpoint::Stdio);
-    }
-
+fn parse_remote_endpoint(endpoint: &str) -> Result<RemoteEndpoint> {
     if let Some(ssh) = parse_ssh_endpoint(endpoint)? {
         return Ok(RemoteEndpoint::Ssh {
             host: ssh.host,
@@ -124,15 +118,15 @@ fn validate_local_destination_operand(path: &Path) -> Result<()> {
 
 fn parse_sync_operand(value: &str) -> Result<SyncOperand> {
     if value.contains('@') {
-        return Ok(SyncOperand::Remote(parse_remote_endpoint(value, false)?));
+        return Ok(SyncOperand::Remote(parse_remote_endpoint(value)?));
     }
 
     if value.contains('[') || value.contains(']') {
-        return Ok(SyncOperand::Remote(parse_remote_endpoint(value, false)?));
+        return Ok(SyncOperand::Remote(parse_remote_endpoint(value)?));
     }
 
     if parse_tcp_endpoint(value)?.is_some() {
-        return Ok(SyncOperand::Remote(parse_remote_endpoint(value, false)?));
+        return Ok(SyncOperand::Remote(parse_remote_endpoint(value)?));
     }
 
     Ok(SyncOperand::Local(PathBuf::from(value)))
@@ -206,48 +200,7 @@ fn handle_sync(matches: &ArgMatches, quiet: bool) -> Result<Action> {
     let dst_text = required_string(matches, "dst")?;
     let src = parse_sync_operand(&src_text)?;
     let dst = parse_sync_operand(&dst_text)?;
-
-    if matches!(src, SyncOperand::Remote(RemoteEndpoint::Stdio))
-        || matches!(dst, SyncOperand::Remote(RemoteEndpoint::Stdio))
-    {
-        anyhow::bail!("stdio is not supported by `sync`; use `push` for manual piping");
-    }
-
     build_sync_action(src, dst, matches, quiet)
-}
-
-fn handle_push(matches: &ArgMatches, quiet: bool) -> Result<Action> {
-    let src = required_path(matches, "src")?;
-    let endpoint = parse_remote_endpoint(&required_string(matches, "endpoint")?, true)?;
-    build_sync_action(
-        SyncOperand::Local(src),
-        SyncOperand::Remote(endpoint),
-        matches,
-        quiet,
-    )
-}
-
-fn handle_pull(matches: &ArgMatches, quiet: bool) -> Result<Action> {
-    let endpoint_text = required_string(matches, "endpoint")?;
-    let endpoint = parse_remote_endpoint(&endpoint_text, false)?;
-    let threshold = threshold(matches);
-    let checksum = matches.get_flag("checksum");
-    let ignores = parse_ignores(matches);
-
-    anyhow::ensure!(
-        !matches!(endpoint, RemoteEndpoint::Stdio),
-        "stdio is not supported for pull mode"
-    );
-
-    let _ = threshold;
-    let _ = checksum;
-    let _ = ignores;
-    build_sync_action(
-        SyncOperand::Remote(endpoint),
-        SyncOperand::Local(required_path(matches, "dst")?),
-        matches,
-        quiet,
-    )
 }
 
 fn handle_listen(matches: &ArgMatches, quiet: bool) -> Result<Action> {
@@ -496,7 +449,7 @@ mod tests {
     }
 
     #[test]
-    fn test_push_ssh_endpoint_parses_remote_path() -> Result<()> {
+    fn test_sync_local_to_ssh_endpoint_parses_remote_path() -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("src.txt");
         std::fs::write(&src, "content")?;
@@ -504,7 +457,7 @@ mod tests {
 
         let action = parse_action(&[
             "pxs",
-            "push",
+            "sync",
             &src_arg,
             "user@example:/srv/data",
             "--checksum",
@@ -543,7 +496,7 @@ mod tests {
     }
 
     #[test]
-    fn test_push_ssh_endpoint_parses_large_file_parallel_flags() -> Result<()> {
+    fn test_sync_local_to_ssh_endpoint_parses_large_file_parallel_flags() -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("src.txt");
         std::fs::write(&src, "content")?;
@@ -551,7 +504,7 @@ mod tests {
 
         let action = parse_action(&[
             "pxs",
-            "push",
+            "sync",
             &src_arg,
             "user@example:/srv/data",
             "--large-file-parallel-threshold",
@@ -576,13 +529,13 @@ mod tests {
     }
 
     #[test]
-    fn test_push_tcp_endpoint_preserves_bracketed_ipv6_socket() -> Result<()> {
+    fn test_sync_local_to_tcp_endpoint_preserves_bracketed_ipv6_socket() -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("src.txt");
         std::fs::write(&src, "content")?;
         let src_arg = src.to_string_lossy().to_string();
 
-        let action = parse_action(&["pxs", "push", &src_arg, "[::1]:7878"])?;
+        let action = parse_action(&["pxs", "sync", &src_arg, "[::1]:7878"])?;
 
         match action {
             Action::Sync {
@@ -592,14 +545,14 @@ mod tests {
                 assert_eq!(addr, "[::1]:7878");
                 assert!(path.is_none());
             }
-            other => anyhow::bail!("expected TCP push endpoint, got {other:?}"),
+            other => anyhow::bail!("expected TCP sync endpoint, got {other:?}"),
         }
 
         Ok(())
     }
 
     #[test]
-    fn test_push_tcp_endpoint_parses_large_file_parallel_flags() -> Result<()> {
+    fn test_sync_local_to_tcp_endpoint_parses_large_file_parallel_flags() -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("src.txt");
         std::fs::write(&src, "content")?;
@@ -607,7 +560,7 @@ mod tests {
 
         let action = parse_action(&[
             "pxs",
-            "push",
+            "sync",
             &src_arg,
             "127.0.0.1:7878",
             "--large-file-parallel-threshold",
@@ -664,25 +617,35 @@ mod tests {
     }
 
     #[test]
-    fn test_push_stdio_endpoint_is_preserved_for_manual_piping() -> Result<()> {
+    fn test_push_subcommand_is_rejected() -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("src.txt");
         std::fs::write(&src, "content")?;
         let src_arg = src.to_string_lossy().to_string();
 
-        let action = parse_action(&["pxs", "push", &src_arg, "-"])?;
-        match action {
-            Action::Sync {
-                dst: SyncOperand::Remote(RemoteEndpoint::Stdio),
-                ..
-            } => {}
-            other => anyhow::bail!("expected stdio push endpoint, got {other:?}"),
-        }
+        let Err(error) = parse_action(&["pxs", "push", &src_arg, "user@example:/srv/data"]) else {
+            anyhow::bail!("push subcommand should be rejected");
+        };
+        assert!(error.to_string().contains("unrecognized subcommand"));
         Ok(())
     }
 
     #[test]
-    fn test_pull_ssh_endpoint_parses_remote_path_and_flags() -> Result<()> {
+    fn test_pull_subcommand_is_rejected() -> Result<()> {
+        let dir = tempdir()?;
+        let dst = dir.path().join("dst");
+        std::fs::create_dir_all(&dst)?;
+        let dst_arg = dst.to_string_lossy().to_string();
+
+        let Err(error) = parse_action(&["pxs", "pull", "user@example:/srv/data", &dst_arg]) else {
+            anyhow::bail!("pull subcommand should be rejected");
+        };
+        assert!(error.to_string().contains("unrecognized subcommand"));
+        Ok(())
+    }
+
+    #[test]
+    fn test_sync_remote_to_local_ssh_endpoint_parses_remote_path_and_flags() -> Result<()> {
         let dir = tempdir()?;
         let dst = dir.path().join("dst");
         std::fs::create_dir_all(&dst)?;
@@ -690,7 +653,7 @@ mod tests {
 
         let action = parse_action(&[
             "pxs",
-            "pull",
+            "sync",
             "user@example:/srv/data",
             &dst_arg,
             "--checksum",
@@ -733,13 +696,13 @@ mod tests {
     }
 
     #[test]
-    fn test_pull_ssh_endpoint_parses_bracketed_ipv6_host() -> Result<()> {
+    fn test_sync_remote_to_local_ssh_endpoint_parses_bracketed_ipv6_host() -> Result<()> {
         let dir = tempdir()?;
         let dst = dir.path().join("dst");
         std::fs::create_dir_all(&dst)?;
         let dst_arg = dst.to_string_lossy().to_string();
 
-        let action = parse_action(&["pxs", "pull", "user@[2001:db8::1]:/srv/data", &dst_arg])?;
+        let action = parse_action(&["pxs", "sync", "user@[2001:db8::1]:/srv/data", &dst_arg])?;
 
         match action {
             Action::Sync {
@@ -761,13 +724,14 @@ mod tests {
     }
 
     #[test]
-    fn test_push_ssh_endpoint_defaults_empty_remote_path_to_current_directory() -> Result<()> {
+    fn test_sync_local_to_ssh_endpoint_defaults_empty_remote_path_to_current_directory()
+    -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("src.txt");
         std::fs::write(&src, "content")?;
         let src_arg = src.to_string_lossy().to_string();
 
-        let action = parse_action(&["pxs", "push", &src_arg, "user@example:"])?;
+        let action = parse_action(&["pxs", "sync", &src_arg, "user@example:"])?;
 
         match action {
             Action::Sync {
@@ -789,13 +753,13 @@ mod tests {
     }
 
     #[test]
-    fn test_push_ssh_endpoint_with_colons_in_path() -> Result<()> {
+    fn test_sync_local_to_ssh_endpoint_with_colons_in_path() -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("src.txt");
         std::fs::write(&src, "content")?;
         let src_arg = src.to_string_lossy().to_string();
 
-        let action = parse_action(&["pxs", "push", &src_arg, "user@example:path:with:colons"])?;
+        let action = parse_action(&["pxs", "sync", &src_arg, "user@example:path:with:colons"])?;
 
         match action {
             Action::Sync {
@@ -817,13 +781,13 @@ mod tests {
     }
 
     #[test]
-    fn test_pull_tcp_accepts_source_side_flags() -> Result<()> {
+    fn test_sync_remote_to_local_tcp_accepts_source_side_flags() -> Result<()> {
         let dir = tempdir()?;
         let dst = dir.path().join("dst");
         std::fs::create_dir_all(&dst)?;
         let dst_arg = dst.to_string_lossy().to_string();
 
-        let action = parse_action(&["pxs", "pull", "127.0.0.1:9999", &dst_arg, "--checksum"])?;
+        let action = parse_action(&["pxs", "sync", "127.0.0.1:9999", &dst_arg, "--checksum"])?;
         match action {
             Action::Sync {
                 src: SyncOperand::Remote(RemoteEndpoint::Tcp { addr, path }),
@@ -840,13 +804,13 @@ mod tests {
     }
 
     #[test]
-    fn test_push_rejects_malformed_bracketed_endpoint() -> Result<()> {
+    fn test_sync_rejects_malformed_bracketed_endpoint() -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("src.txt");
         std::fs::write(&src, "content")?;
         let src_arg = src.to_string_lossy().to_string();
 
-        let Err(error) = parse_action(&["pxs", "push", &src_arg, "[::1"]) else {
+        let Err(error) = parse_action(&["pxs", "sync", &src_arg, "[::1"]) else {
             anyhow::bail!("malformed bracketed endpoint should be rejected");
         };
 
@@ -855,13 +819,13 @@ mod tests {
     }
 
     #[test]
-    fn test_push_rejects_ssh_endpoint_without_path() -> Result<()> {
+    fn test_sync_rejects_ssh_endpoint_without_path() -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("src.txt");
         std::fs::write(&src, "content")?;
         let src_arg = src.to_string_lossy().to_string();
 
-        let Err(error) = parse_action(&["pxs", "push", &src_arg, "user@example"]) else {
+        let Err(error) = parse_action(&["pxs", "sync", &src_arg, "user@example"]) else {
             anyhow::bail!("SSH endpoint without path should be rejected");
         };
 

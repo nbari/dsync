@@ -10,6 +10,13 @@ PXS_BIN="${PXS_BIN:-pxs}"
 SSH_BIN="${SSH_BIN:-ssh}"
 BACKUP_LABEL_NAME="pxs_migration"
 
+# Optional outbound SSH tuning knobs. Leave them unset to keep the built-in pxs
+# defaults, which already adapt worker counts conservatively from CPU cores.
+# On weak or high-latency links, lower values can be faster.
+PXS_NETWORK_FILE_CONCURRENCY="${PXS_NETWORK_FILE_CONCURRENCY:-}"
+PXS_LARGE_FILE_PARALLEL_THRESHOLD="${PXS_LARGE_FILE_PARALLEL_THRESHOLD:-}"
+PXS_LARGE_FILE_PARALLEL_WORKERS="${PXS_LARGE_FILE_PARALLEL_WORKERS:-}"
+
 # Keep the same exclusions as the original rsync-based workflow so we do not
 # overwrite destination-specific config or transient postmaster state.
 PXS_IGNORE_ARGS=(
@@ -26,6 +33,18 @@ PXS_SYNC_ARGS=(
   --delete
   "${PXS_IGNORE_ARGS[@]}"
 )
+
+if [[ -n "$PXS_NETWORK_FILE_CONCURRENCY" ]]; then
+  PXS_SYNC_ARGS+=(--network-file-concurrency "$PXS_NETWORK_FILE_CONCURRENCY")
+fi
+
+if [[ -n "$PXS_LARGE_FILE_PARALLEL_THRESHOLD" ]]; then
+  PXS_SYNC_ARGS+=(--large-file-parallel-threshold "$PXS_LARGE_FILE_PARALLEL_THRESHOLD")
+fi
+
+if [[ -n "$PXS_LARGE_FILE_PARALLEL_WORKERS" ]]; then
+  PXS_SYNC_ARGS+=(--large-file-parallel-workers "$PXS_LARGE_FILE_PARALLEL_WORKERS")
+fi
 
 tmpfile=""
 script_started=$SECONDS
@@ -68,6 +87,17 @@ format_duration() {
   local seconds=$((total_seconds % 60))
 
   printf "%02d:%02d:%02d" "$hours" "$minutes" "$seconds"
+}
+
+describe_setting() {
+  local value=$1
+  local fallback=$2
+
+  if [[ -n "$value" ]]; then
+    printf "%s" "$value"
+  else
+    printf "%s" "$fallback"
+  fi
 }
 
 # Time a single step and print a compact summary after it completes.
@@ -174,6 +204,7 @@ run_preflight() {
   echo "[*] Capability summary:"
   echo "    - supported here: recursive SSH sync to remote destinations, symlinks, perms, mtimes, remote --delete, repeated PGDATA passes"
   echo "    - speed mode: --fsync is disabled for all passes"
+  echo "    - outbound tuning: network-file-concurrency=$(describe_setting "$PXS_NETWORK_FILE_CONCURRENCY" "auto"), large-file-parallel-threshold=$(describe_setting "$PXS_LARGE_FILE_PARALLEL_THRESHOLD" "pxs default"), large-file-parallel-workers=$(describe_setting "$PXS_LARGE_FILE_PARALLEL_WORKERS" "auto")"
   echo "    - not guaranteed here: hard links (-H)"
 
   detect_tablespaces || true
@@ -182,8 +213,9 @@ run_preflight() {
 
 run_pxs_sync() {
   # Repeated runs are expected to get faster as the destination converges
-  # because pxs skips unchanged files and can send deltas for changed ones.
-  echo "[*] pxs sync: $SRC_PGDATA -> $DST_HOST:$DST_PGDATA (--delete, no --fsync)"
+  # because pxs skips unchanged files, reuses existing destination data, and
+  # can send deltas for changed blocks instead of rewriting the whole tree.
+  echo "[*] pxs sync: $SRC_PGDATA -> $DST_HOST:$DST_PGDATA (--delete, no --fsync, network-file-concurrency=$(describe_setting "$PXS_NETWORK_FILE_CONCURRENCY" "auto"), large-file-parallel-threshold=$(describe_setting "$PXS_LARGE_FILE_PARALLEL_THRESHOLD" "pxs default"), large-file-parallel-workers=$(describe_setting "$PXS_LARGE_FILE_PARALLEL_WORKERS" "auto"))"
   "$PXS_BIN" sync "$SRC_PGDATA" "$DST_HOST:$DST_PGDATA" "${PXS_SYNC_ARGS[@]}"
 }
 

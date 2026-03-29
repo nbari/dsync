@@ -27,32 +27,21 @@ fn stderr_text(output: &Output) -> String {
 }
 
 #[test]
-fn test_pull_stdio_reports_unsupported_mode() -> Result<()> {
+fn test_pull_subcommand_is_rejected() -> Result<()> {
     let dir = tempdir()?;
     let dst_arg = dir.path().join("dst").to_string_lossy().to_string();
-    let output = run_pxs(&["pull", "-", &dst_arg])?;
+    let output = run_pxs(&["pull", "127.0.0.1:9999", &dst_arg])?;
 
     assert!(!output.status.success());
-    assert!(stderr_text(&output).contains("unsupported remote endpoint syntax: -"));
+    assert!(stderr_text(&output).contains("unrecognized subcommand"));
     Ok(())
 }
 
 #[test]
-fn test_pull_tcp_source_flags_attempts_connection() -> Result<()> {
+fn test_sync_remote_to_local_tcp_with_checksum_attempts_connection() -> Result<()> {
     let dir = tempdir()?;
     let dst_arg = dir.path().join("dst").to_string_lossy().to_string();
-    let output = run_pxs(&["pull", "127.0.0.1:9999", &dst_arg, "--checksum"])?;
-
-    assert!(!output.status.success());
-    assert!(stderr_text(&output).contains("Failed to connect"));
-    Ok(())
-}
-
-#[test]
-fn test_pull_tcp_delete_attempts_connection() -> Result<()> {
-    let dir = tempdir()?;
-    let dst_arg = dir.path().join("dst").to_string_lossy().to_string();
-    let output = run_pxs(&["pull", "127.0.0.1:9999", &dst_arg, "--delete"])?;
+    let output = run_pxs(&["sync", "127.0.0.1:9999", &dst_arg, "--checksum"])?;
 
     assert!(!output.status.success());
     assert!(stderr_text(&output).contains("Failed to connect"));
@@ -60,12 +49,23 @@ fn test_pull_tcp_delete_attempts_connection() -> Result<()> {
 }
 
 #[test]
-fn test_push_reports_malformed_bracketed_endpoint() -> Result<()> {
+fn test_sync_remote_to_local_tcp_with_delete_attempts_connection() -> Result<()> {
+    let dir = tempdir()?;
+    let dst_arg = dir.path().join("dst").to_string_lossy().to_string();
+    let output = run_pxs(&["sync", "127.0.0.1:9999", &dst_arg, "--delete"])?;
+
+    assert!(!output.status.success());
+    assert!(stderr_text(&output).contains("Failed to connect"));
+    Ok(())
+}
+
+#[test]
+fn test_sync_reports_malformed_bracketed_endpoint() -> Result<()> {
     let dir = tempdir()?;
     let src = dir.path().join("src.txt");
     std::fs::write(&src, "content")?;
     let src_arg = src.to_string_lossy().to_string();
-    let output = run_pxs(&["push", &src_arg, "[::1"])?;
+    let output = run_pxs(&["sync", &src_arg, "[::1"])?;
 
     assert!(!output.status.success());
     assert!(stderr_text(&output).contains("missing closing `]`"));
@@ -73,10 +73,10 @@ fn test_push_reports_malformed_bracketed_endpoint() -> Result<()> {
 }
 
 #[test]
-fn test_push_reports_missing_source_path() -> Result<()> {
+fn test_sync_reports_missing_source_path() -> Result<()> {
     let dir = tempdir()?;
     let src_arg = dir.path().join("missing.txt").to_string_lossy().to_string();
-    let output = run_pxs(&["push", &src_arg, "127.0.0.1:9999"])?;
+    let output = run_pxs(&["sync", &src_arg, "127.0.0.1:9999"])?;
 
     assert!(!output.status.success());
     assert!(stderr_text(&output).contains("Path does not exist"));
@@ -84,15 +84,15 @@ fn test_push_reports_missing_source_path() -> Result<()> {
 }
 
 #[test]
-fn test_push_stdio_delete_reports_actionable_error() -> Result<()> {
+fn test_push_subcommand_is_rejected() -> Result<()> {
     let dir = tempdir()?;
     let src_dir = dir.path().join("src");
     std::fs::create_dir_all(&src_dir)?;
     let src_arg = src_dir.to_string_lossy().to_string();
-    let output = run_pxs(&["push", &src_arg, "-", "--delete"])?;
+    let output = run_pxs(&["push", &src_arg, "127.0.0.1:9999"])?;
 
     assert!(!output.status.success());
-    assert!(stderr_text(&output).contains("--delete is not supported"));
+    assert!(stderr_text(&output).contains("unrecognized subcommand"));
     Ok(())
 }
 
@@ -181,7 +181,7 @@ fn test_sync_local_source_first_current_directory_end_to_end() -> Result<()> {
 }
 
 #[tokio::test]
-async fn test_push_reports_incompatible_peer_version() -> Result<()> {
+async fn test_sync_reports_incompatible_peer_version() -> Result<()> {
     let dir = tempdir()?;
     let src = dir.path().join("src.txt");
     std::fs::write(&src, "content")?;
@@ -210,7 +210,7 @@ async fn test_push_reports_incompatible_peer_version() -> Result<()> {
 
     let addr_arg = addr.to_string();
     let output =
-        tokio::task::spawn_blocking(move || run_pxs(&["push", &src_arg, &addr_arg])).await??;
+        tokio::task::spawn_blocking(move || run_pxs(&["sync", &src_arg, &addr_arg])).await??;
     server.await??;
 
     assert!(!output.status.success());
