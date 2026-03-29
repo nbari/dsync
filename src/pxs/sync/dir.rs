@@ -1,4 +1,4 @@
-use crate::pxs::sync::{SyncOptions, delete, file, meta};
+use crate::pxs::sync::{SyncOptions, delete, file, is_source_entry_disappeared, meta};
 use crate::pxs::tools::{self, clamped_parallelism};
 use anyhow::{Context, Result};
 use futures_util::{StreamExt, stream::FuturesUnordered};
@@ -35,6 +35,14 @@ impl DirectoryWalkState {
     }
 }
 
+fn is_not_found_io_error(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::NotFound
+}
+
+fn is_not_found_walk_error(error: &ignore::Error) -> bool {
+    error.io_error().is_some_and(is_not_found_io_error)
+}
+
 /// Calculate the total size of a directory.
 ///
 /// # Errors
@@ -66,16 +74,36 @@ pub fn calculate_total_size(path: &Path, ignores: &[String]) -> Result<u64> {
 
     let mut total = 0;
     for entry in walker {
-        let entry = entry.map_err(|e| {
-            anyhow::anyhow!("failed to walk source directory {}: {e}", path.display())
-        })?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if is_not_found_walk_error(&error) => {
+                tracing::debug!("skipping source walk entry that disappeared: {error}");
+                continue;
+            }
+            Err(error) => {
+                return Err(anyhow::anyhow!(
+                    "failed to walk source directory {}: {error}",
+                    path.display()
+                ));
+            }
+        };
         if entry.file_type().is_some_and(|ft| ft.is_file()) {
-            let meta = entry.metadata().map_err(|e| {
-                anyhow::anyhow!(
-                    "failed to read metadata for {}: {e}",
-                    entry.path().display()
-                )
-            })?;
+            let meta = match entry.metadata() {
+                Ok(meta) => meta,
+                Err(error) if is_not_found_walk_error(&error) => {
+                    tracing::debug!(
+                        "skipping source file that disappeared during size scan: {}",
+                        entry.path().display()
+                    );
+                    continue;
+                }
+                Err(error) => {
+                    return Err(anyhow::anyhow!(
+                        "failed to read metadata for {}: {error}",
+                        entry.path().display()
+                    ));
+                }
+            };
             total += meta.len();
         }
     }
@@ -93,7 +121,15 @@ pub(crate) async fn sync_dir_recursive(
 
     let walk_result = async {
         for entry in walker {
-            handle_walk_entry(context, &mut state, entry?).await?;
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(error) if is_not_found_walk_error(&error) => {
+                    tracing::debug!("skipping source walk entry that disappeared: {error}");
+                    continue;
+                }
+                Err(error) => return Err(error.into()),
+            };
+            handle_walk_entry(context, &mut state, entry).await?;
         }
         Ok::<(), anyhow::Error>(())
     }
@@ -193,7 +229,25 @@ async fn handle_symlink_entry(
 
     let target = tokio::fs::read_link(src_path)
         .await
-        .with_context(|| format!("failed to read symlink target: {}", src_path.display()))?;
+        .map_err(|error| {
+            crate::pxs::sync::classify_source_io_error(
+                error,
+                src_path,
+                "reading source symlink target",
+            )
+        })
+        .with_context(|| format!("failed to read symlink target: {}", src_path.display()));
+    let target = match target {
+        Ok(target) => target,
+        Err(error) if is_source_entry_disappeared(&error) => {
+            tracing::debug!(
+                "skipping source symlink that disappeared during sync: {}",
+                src_path.display()
+            );
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
     if context.options.dry_run {
         eprintln!(
             "(dry-run) symlink {} -> {}",
@@ -215,7 +269,22 @@ async fn handle_symlink_entry(
             target.display()
         )
     })?;
-    if let Err(error) = meta::apply_metadata(src_path, &prepared_path) {
+    let source_meta = match meta::read_source_metadata(src_path) {
+        Ok(source_meta) => source_meta,
+        Err(error) if is_source_entry_disappeared(&error) => {
+            let _ = std::fs::remove_file(&prepared_path);
+            tracing::debug!(
+                "skipping source symlink metadata because it disappeared: {}",
+                src_path.display()
+            );
+            return Ok(());
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&prepared_path);
+            return Err(error);
+        }
+    };
+    if let Err(error) = meta::apply_metadata_from(&source_meta, &prepared_path) {
         let _ = std::fs::remove_file(&prepared_path);
         return Err(error);
     }
@@ -247,72 +316,87 @@ fn spawn_file_sync_task(
     let block_semaphore = Arc::clone(&context.block_semaphore);
 
     tokio::spawn(async move {
-        let src_size = tools::get_file_size(&src).await?;
+        let sync_result = async {
+            let src_size = file::read_source_file_size(&src).await?;
 
-        if tools::should_skip_file(&src, &dst, checksum).await? {
-            main_pb.inc(src_size);
-            let total_blocks = usize::try_from(src_size.div_ceil(128 * 1024)).unwrap_or(0);
-            return Ok(crate::pxs::sync::SyncStats {
-                total_blocks,
-                updated_blocks: 0,
-            });
-        }
-
-        if dry_run {
-            if !quiet {
-                eprintln!("(dry-run) sync file: {} ({src_size} bytes)", src.display());
+            if file::should_skip_source_file(&src, &dst, checksum).await? {
+                main_pb.inc(src_size);
+                let total_blocks = usize::try_from(src_size.div_ceil(128 * 1024)).unwrap_or(0);
+                return Ok(crate::pxs::sync::SyncStats {
+                    total_blocks,
+                    updated_blocks: 0,
+                });
             }
-            main_pb.inc(src_size);
-            let total_blocks = usize::try_from(src_size.div_ceil(128 * 1024)).unwrap_or(0);
-            return Ok(crate::pxs::sync::SyncStats {
-                total_blocks,
-                updated_blocks: 0,
-            });
+
+            if dry_run {
+                if !quiet {
+                    eprintln!("(dry-run) sync file: {} ({src_size} bytes)", src.display());
+                }
+                main_pb.inc(src_size);
+                let total_blocks = usize::try_from(src_size.div_ceil(128 * 1024)).unwrap_or(0);
+                return Ok(crate::pxs::sync::SyncStats {
+                    total_blocks,
+                    updated_blocks: 0,
+                });
+            }
+
+            // Create a sub-progressbar for files larger than a certain threshold to avoid screen clutter.
+            let file_pb = if src_size > 1024 * 1024 && !quiet {
+                let pb = multi_progress.add(ProgressBar::new(src_size));
+                pb.set_style(
+                    indicatif::ProgressStyle::default_bar()
+                        .template(
+                            "{spinner:.blue} [{bar:20.blue/white}] {bytes}/{total_bytes} {msg}",
+                        )
+                        .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
+                        .progress_chars("=>-"),
+                );
+                let msg = src
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .to_string();
+                pb.set_message(msg);
+                Arc::new(pb)
+            } else {
+                Arc::new(ProgressBar::hidden())
+            };
+
+            let full_copy = tools::should_use_full_copy_meta(src_size, &dst, threshold).await?;
+
+            // Increment both the top-level directory progress and the optional file progress.
+            let combined_pb = Arc::new(tools::CombinedProgressBar::new(main_pb, file_pb.clone()));
+
+            let result = file::sync_changed_blocks_with_pb(
+                &src,
+                &dst,
+                full_copy,
+                combined_pb,
+                fsync,
+                Some(block_semaphore),
+            )
+            .await;
+
+            if !file_pb.is_hidden() {
+                file_pb.finish_and_clear();
+                multi_progress.remove(file_pb.as_ref());
+            }
+
+            result
         }
-
-        // Create a sub-progressbar for files larger than a certain threshold to avoid screen clutter
-        // For small files, the sub-progress bar is so fast it just creates flicker.
-        // Let's say files larger than 1MB get their own bar.
-        let file_pb = if src_size > 1024 * 1024 && !quiet {
-            let pb = multi_progress.add(ProgressBar::new(src_size));
-            pb.set_style(
-                indicatif::ProgressStyle::default_bar()
-                    .template("{spinner:.blue} [{bar:20.blue/white}] {bytes}/{total_bytes} {msg}")
-                    .unwrap_or_else(|_| indicatif::ProgressStyle::default_bar())
-                    .progress_chars("=>-"),
-            );
-            let msg = src
-                .file_name()
-                .unwrap_or_default()
-                .to_string_lossy()
-                .to_string();
-            pb.set_message(msg);
-            Arc::new(pb)
-        } else {
-            Arc::new(ProgressBar::hidden())
-        };
-
-        let full_copy = tools::should_use_full_copy_meta(src_size, &dst, threshold).await?;
-
-        // We need a combined progress bar that increments BOTH the main dir pb and the file pb
-        let combined_pb = Arc::new(tools::CombinedProgressBar::new(main_pb, file_pb.clone()));
-
-        let result = file::sync_changed_blocks_with_pb(
-            &src,
-            &dst,
-            full_copy,
-            combined_pb,
-            fsync,
-            Some(block_semaphore),
-        )
         .await;
 
-        if !file_pb.is_hidden() {
-            file_pb.finish_and_clear();
-            multi_progress.remove(file_pb.as_ref());
+        match sync_result {
+            Ok(stats) => Ok(stats),
+            Err(error) if is_source_entry_disappeared(&error) => {
+                tracing::debug!(
+                    "skipping source file that disappeared during sync: {}",
+                    src.display()
+                );
+                Ok(crate::pxs::sync::SyncStats::default())
+            }
+            Err(error) => Err(error),
         }
-
-        result
     })
 }
 
@@ -398,15 +482,95 @@ fn apply_directory_metadata(
     for src_path in directory_paths {
         let rel_path = src_path.strip_prefix(context.src_dir)?;
         let dst_path = context.dst_dir.join(rel_path);
-        meta::apply_metadata(&src_path, &dst_path)?;
+        let source_meta = match meta::read_source_metadata(&src_path) {
+            Ok(source_meta) => source_meta,
+            Err(error) if is_source_entry_disappeared(&error) => {
+                tracing::debug!(
+                    "skipping directory metadata for source path that disappeared: {}",
+                    src_path.display()
+                );
+                continue;
+            }
+            Err(error) => return Err(error),
+        };
+        meta::apply_metadata_from(&source_meta, &dst_path)?;
         if context.options.fsync {
             tools::sync_directory_and_parent(&dst_path)?;
         }
     }
-    meta::apply_metadata(context.src_dir, context.dst_dir)?;
+    let root_meta = meta::read_source_metadata(context.src_dir)?;
+    meta::apply_metadata_from(&root_meta, context.dst_dir)?;
     if context.options.fsync {
         tools::sync_directory_and_parent(context.dst_dir)?;
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DirectorySyncContext, apply_directory_metadata, spawn_file_sync_task};
+    use crate::pxs::sync::SyncOptions;
+    use anyhow::Result;
+    use indicatif::{MultiProgress, ProgressBar};
+    use std::{fs, path::Path, sync::Arc};
+    use tempfile::tempdir;
+    use tokio::sync::Semaphore;
+
+    fn test_context<'a>(
+        src_dir: &'a Path,
+        dst_dir: &'a Path,
+        options: &'a SyncOptions,
+    ) -> DirectorySyncContext<'a> {
+        DirectorySyncContext {
+            src_dir,
+            dst_dir,
+            options,
+            main_pb: Arc::new(ProgressBar::hidden()),
+            multi_progress: Arc::new(MultiProgress::new()),
+            block_semaphore: Arc::new(Semaphore::new(1)),
+        }
+    }
+
+    #[test]
+    fn test_apply_directory_metadata_skips_missing_nested_source_directory() -> Result<()> {
+        let dir = tempdir()?;
+        let src_dir = dir.path().join("src");
+        let dst_dir = dir.path().join("dst");
+        let vanished_src_dir = src_dir.join("nested");
+        let vanished_dst_dir = dst_dir.join("nested");
+
+        fs::create_dir_all(&vanished_src_dir)?;
+        fs::create_dir_all(&vanished_dst_dir)?;
+        fs::remove_dir_all(&vanished_src_dir)?;
+
+        let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, true);
+        let context = test_context(&src_dir, &dst_dir, &options);
+
+        apply_directory_metadata(&context, vec![vanished_src_dir])?;
+
+        assert!(dst_dir.exists());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_spawn_file_sync_task_skips_missing_source_file() -> Result<()> {
+        let dir = tempdir()?;
+        let src_dir = dir.path().join("src");
+        let dst_dir = dir.path().join("dst");
+        fs::create_dir_all(&src_dir)?;
+        fs::create_dir_all(&dst_dir)?;
+
+        let missing_src = src_dir.join("vanished.bin");
+        let dst_path = dst_dir.join("vanished.bin");
+
+        let options = SyncOptions::new(1.0, false, false, false, Vec::new(), false, true);
+        let context = test_context(&src_dir, &dst_dir, &options);
+
+        let stats = spawn_file_sync_task(&context, missing_src, dst_path).await??;
+
+        assert_eq!(stats.total_blocks, 0);
+        assert_eq!(stats.updated_blocks, 0);
+        Ok(())
+    }
 }

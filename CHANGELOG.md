@@ -4,6 +4,17 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
+## [0.6.2] - 2026-03-29
+
+### Changed
+
+- Expanded the bundled `sync.sh` PostgreSQL helper ignore set so repeated SSH sync passes now skip destination-specific config/control files and transient runtime state by default, and added newline-delimited `PXS_EXTRA_IGNORE_PATTERNS` support for deployment-specific exclusions.
+
+### Fixed
+
+- Fixed local directory sync so transient source files, symlinks, and nested directories that disappear after discovery no longer abort the run with a late `No such file or directory (os error 2)` during queued file work or the final directory metadata pass.
+- Fixed `sync.sh` cleanup so it now makes a best-effort `pg_backup_stop()` call if the script exits after entering PostgreSQL backup mode but before the normal stop step runs.
+
 ## [0.6.1] - 2026-03-29
 
 ### Added

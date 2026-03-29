@@ -1,4 +1,4 @@
-use crate::pxs::sync::{SyncStats, meta};
+use crate::pxs::sync::{SyncStats, classify_source_anyhow_error, classify_source_io_error, meta};
 use crate::pxs::tools::{self, ProgressBarLike, clamped_parallelism};
 use anyhow::{Context, Result};
 use futures_util::StreamExt;
@@ -15,6 +15,48 @@ fn mapped_chunk(mmap: &memmap2::Mmap, offset: u64, len: usize) -> Result<Option<
         .checked_add(len)
         .ok_or_else(|| anyhow::anyhow!("mapped chunk end overflow"))?;
     Ok(mmap.get(start..end))
+}
+
+/// Read the current source size for local file sync.
+///
+/// # Errors
+///
+/// Returns an error if the source file size cannot be read.
+pub(crate) async fn read_source_file_size(src_path: &Path) -> Result<u64> {
+    tools::get_file_size(src_path)
+        .await
+        .map_err(|error| classify_source_anyhow_error(error, src_path, "reading source file size"))
+        .with_context(|| format!("failed to read source file size: {}", src_path.display()))
+}
+
+/// Decide whether a local source file can be skipped without rewriting it.
+///
+/// # Errors
+///
+/// Returns an error if the source metadata comparison fails.
+pub(crate) async fn should_skip_source_file(
+    src_path: &Path,
+    dst_path: &Path,
+    checksum: bool,
+) -> Result<bool> {
+    tools::should_skip_file(src_path, dst_path, checksum)
+        .await
+        .map_err(|error| {
+            classify_source_anyhow_error(error, src_path, "checking source file metadata for skip")
+        })
+        .with_context(|| {
+            format!(
+                "failed to compare source {} with destination {}",
+                src_path.display(),
+                dst_path.display()
+            )
+        })
+}
+
+fn open_source_file(src_path: &Path) -> Result<std::fs::File> {
+    std::fs::File::open(src_path)
+        .map_err(|error| classify_source_io_error(error, src_path, "opening source file"))
+        .with_context(|| format!("failed to open source file: {}", src_path.display()))
 }
 
 pub(crate) struct WorkerContext {
@@ -46,7 +88,7 @@ pub async fn sync_changed_blocks_with_pb(
     let seed_from_existing = matches!(std::fs::symlink_metadata(dst_path), Ok(meta) if meta.file_type().is_file())
         && !full_copy;
     staged_file
-        .prepare(tools::get_file_size(src_path).await?, seed_from_existing)
+        .prepare(read_source_file_size(src_path).await?, seed_from_existing)
         .context("failed to prepare staged destination file")?;
     let sync_result =
         sync_changed_blocks_to_staging(src_path, staged_file.path(), full_copy, pb, semaphore)
@@ -102,8 +144,7 @@ async fn sync_changed_blocks_to_staging(
     pb: Arc<dyn ProgressBarLike>,
     semaphore: Option<Arc<Semaphore>>,
 ) -> Result<SyncStats> {
-    let src_file = std::fs::File::open(src_path)
-        .with_context(|| format!("failed to open source file: {}", src_path.display()))?;
+    let src_file = open_source_file(src_path)?;
 
     let src_len = src_file
         .metadata()

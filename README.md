@@ -21,10 +21,9 @@ safe synchronization first, then speed through Rust parallelism, fixed-block
 delta sync, and transport choices that fit modern large-data workloads.
 
 > [!NOTE]
-> `0.6.1` focuses on bandwidth-bound network syncs: negotiated `zstd` block
-> compression, bounded small-file fan-out on the control session, chunk-parallel
-> large-file transfers, and reused zstd compression contexts for outbound
-> batches.
+> `0.6.2` hardens local directory sync against transient source entries that
+> disappear mid-run and tightens the PostgreSQL helper defaults for
+> destination-specific config and transient runtime files.
 
 ## What `pxs` Is For
 
@@ -304,6 +303,14 @@ environment variables: `PXS_NETWORK_FILE_CONCURRENCY`,
 `PXS_LARGE_FILE_PARALLEL_WORKERS`. Leave them unset to keep `pxs` defaults, and
 reduce them on bandwidth-poor or high-latency links if the default fan-out
 saturates the network.
+
+The helper also keeps destination-specific PostgreSQL config/control files and
+transient runtime state out of the repeated sync passes by default, including
+`postgresql.conf`, `postgresql.auto.conf`, `pg_hba.conf`, `pg_ident.conf`,
+`postmaster.pid`, `postmaster.opts`, `current_logfiles`, `pg_stat_tmp`,
+`pg_stat_tmp/**`, `pg_dynshmem`, `pg_dynshmem/**`, and `**/pg_internal.init`.
+Add newline-delimited extra ignore patterns through `PXS_EXTRA_IGNORE_PATTERNS`
+when a deployment has additional host-local files that should not be mirrored.
 
 ## Design Notes
 

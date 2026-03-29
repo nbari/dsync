@@ -35,7 +35,11 @@ pub async fn should_skip_file(src: &Path, dst: &Path, checksum: bool) -> Result<
         return Ok(false);
     }
 
-    let dst_meta = tokio::fs::symlink_metadata(dst).await?;
+    let dst_meta = match tokio::fs::symlink_metadata(dst).await {
+        Ok(dst_meta) => dst_meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(error) => return Err(error.into()),
+    };
     if !dst_meta.file_type().is_file() {
         return Ok(false);
     }
@@ -84,7 +88,11 @@ pub async fn should_use_full_copy_meta(src_size: u64, dst: &Path, threshold: f32
         return Ok(false);
     }
 
-    let dst_meta = fs::symlink_metadata(dst).await?;
+    let dst_meta = match fs::symlink_metadata(dst).await {
+        Ok(dst_meta) => dst_meta,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(true),
+        Err(error) => return Err(error.into()),
+    };
     if !dst_meta.file_type().is_file() {
         return Ok(true);
     }

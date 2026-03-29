@@ -372,6 +372,50 @@ async fn test_sync_dir_with_delete_and_ignore() -> Result<()> {
 }
 
 #[tokio::test]
+async fn test_sync_dir_with_delete_preserves_ignored_runtime_directories() -> Result<()> {
+    let dir = tempdir()?;
+    let src_dir = dir.path().join("src");
+    let dst_dir = dir.path().join("dst");
+
+    fs::create_dir_all(&src_dir)?;
+    fs::create_dir_all(dst_dir.join("pg_stat_tmp"))?;
+    fs::create_dir_all(dst_dir.join("pg_dynshmem"))?;
+    fs::write(dst_dir.join("pg_stat_tmp/worker.stat"), "keep me")?;
+    fs::write(dst_dir.join("pg_dynshmem/segment"), "keep me too")?;
+    fs::write(dst_dir.join("stale.txt"), "delete me")?;
+
+    let options = SyncOptions::new(
+        1.0,
+        false,
+        false,
+        true,
+        vec![
+            "pg_stat_tmp".to_string(),
+            "pg_stat_tmp/**".to_string(),
+            "pg_dynshmem".to_string(),
+            "pg_dynshmem/**".to_string(),
+        ],
+        false,
+        false,
+    );
+    sync::sync_dir(&src_dir, &dst_dir, &options).await?;
+
+    assert!(dst_dir.join("pg_stat_tmp").is_dir());
+    assert!(dst_dir.join("pg_dynshmem").is_dir());
+    assert_eq!(
+        fs::read_to_string(dst_dir.join("pg_stat_tmp/worker.stat"))?,
+        "keep me"
+    );
+    assert_eq!(
+        fs::read_to_string(dst_dir.join("pg_dynshmem/segment"))?,
+        "keep me too"
+    );
+    assert!(!dst_dir.join("stale.txt").exists());
+
+    Ok(())
+}
+
+#[tokio::test]
 async fn test_sync_dir_with_delete_preserves_final_directory_mtime() -> Result<()> {
     use std::os::unix::fs::MetadataExt;
 

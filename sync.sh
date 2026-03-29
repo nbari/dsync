@@ -16,16 +16,42 @@ BACKUP_LABEL_NAME="pxs_migration"
 PXS_NETWORK_FILE_CONCURRENCY="${PXS_NETWORK_FILE_CONCURRENCY:-}"
 PXS_LARGE_FILE_PARALLEL_THRESHOLD="${PXS_LARGE_FILE_PARALLEL_THRESHOLD:-}"
 PXS_LARGE_FILE_PARALLEL_WORKERS="${PXS_LARGE_FILE_PARALLEL_WORKERS:-}"
+PXS_EXTRA_IGNORE_PATTERNS="${PXS_EXTRA_IGNORE_PATTERNS:-}"
 
-# Keep the same exclusions as the original rsync-based workflow so we do not
-# overwrite destination-specific config or transient postmaster state.
-PXS_IGNORE_ARGS=(
-  --ignore postmaster.pid
-  --ignore postmaster.opts
-  --ignore pg_hba.conf
-  --ignore pg_ident.conf
-  --ignore postgresql.conf
+# Keep destination-specific configuration, control files, and transient runtime
+# state out of the transfer so repeated PGDATA passes do not churn or overwrite
+# values that should remain local to the destination host.
+PXS_IGNORE_PATTERNS=(
+  "postmaster.pid"
+  "postmaster.opts"
+  "current_logfiles"
+  "pg_hba.conf"
+  "pg_ident.conf"
+  "postgresql.conf"
+  "postgresql.auto.conf"
+  "standby.signal"
+  "recovery.signal"
+  "promote"
+  "backup_label"
+  "backup_label.old"
+  "pg_stat_tmp"
+  "pg_stat_tmp/**"
+  "pg_dynshmem"
+  "pg_dynshmem/**"
+  "**/pg_internal.init"
 )
+PXS_IGNORE_ARGS=()
+for pattern in "${PXS_IGNORE_PATTERNS[@]}"; do
+  PXS_IGNORE_ARGS+=(--ignore "$pattern")
+done
+
+if [[ -n "$PXS_EXTRA_IGNORE_PATTERNS" ]]; then
+  while IFS= read -r pattern; do
+    [[ -n "$pattern" ]] || continue
+    [[ "$pattern" == \#* ]] && continue
+    PXS_IGNORE_ARGS+=(--ignore "$pattern")
+  done <<< "$PXS_EXTRA_IGNORE_PATTERNS"
+fi
 
 # Speed-first transfer profile: mirror the destination with --delete, but skip
 # --fsync on all passes so the first benchmarks reflect raw transfer speed.
@@ -48,12 +74,18 @@ fi
 
 tmpfile=""
 script_started=$SECONDS
+backup_mode_active=0
 
 cleanup() {
   # Remove the temporary backup_label file and shut down the persistent psql
   # coprocess on normal exit or interruption.
   if [[ -n "$tmpfile" && -f "$tmpfile" ]]; then
     rm -f "$tmpfile"
+  fi
+
+  if [[ "$backup_mode_active" -eq 1 && -n "${PG[1]:-}" ]]; then
+    echo "[*] Attempting pg_backup_stop() during cleanup..." >&2
+    printf "SELECT pg_backup_stop();\n" >&"${PG[1]}" || true
   fi
 
   if [[ -n "${PG_PID:-}" ]]; then
@@ -235,6 +267,7 @@ run_timed_step "Pre-syncing data directory (this may take a while)" run_pxs_sync
 echo "[*] Starting PostgreSQL backup mode..."
 printf "SELECT pg_backup_start('%s', true);\n" "$BACKUP_LABEL_NAME" >&"${PG[1]}"
 read -r -u "${PG[0]}" _
+backup_mode_active=1
 
 # Second pass should be much smaller because most data already exists remotely.
 run_timed_step "Syncing data directory again (this should take less time)" run_pxs_sync
@@ -243,6 +276,7 @@ run_timed_step "Syncing data directory again (this should take less time)" run_p
 # final data pass so the destination reflects the completed backup window.
 echo "[*] Stopping PostgreSQL backup mode and capturing label..."
 printf "SELECT labelfile FROM pg_backup_stop();\n" >&"${PG[1]}"
+backup_mode_active=0
 printf "SELECT 'END_OF_LABEL';\n" >&"${PG[1]}"
 
 backup_label=""
