@@ -2,11 +2,20 @@ pub mod run;
 
 use std::path::PathBuf;
 
-/// Remote endpoint selected by a public push or pull command.
+/// Source or destination operand selected by the unified public sync command.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SyncOperand {
+    /// Local filesystem path.
+    Local(PathBuf),
+    /// Remote endpoint.
+    Remote(RemoteEndpoint),
+}
+
+/// Remote endpoint selected by the unified public sync CLI.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum RemoteEndpoint {
-    /// Raw TCP endpoint such as `host:port`.
-    Tcp(String),
+    /// Raw TCP endpoint such as `host:port` or `host:port/path`.
+    Tcp { addr: String, path: Option<String> },
     /// SSH endpoint such as `user@host:/path`.
     Ssh { host: String, path: String },
     /// Standard input/output transport for advanced piping.
@@ -16,50 +25,29 @@ pub enum RemoteEndpoint {
 /// Parsed high-level action selected by the CLI.
 #[derive(Debug)]
 pub enum Action {
-    /// Synchronize a local source path into a local destination path.
+    /// Synchronize between local and remote endpoints using transport-aware dispatch.
     Sync {
-        src: PathBuf,
-        dst: PathBuf,
+        src: SyncOperand,
+        dst: SyncOperand,
         threshold: f32,
         checksum: bool,
         dry_run: bool,
         delete: bool,
         fsync: bool,
-        ignores: Vec<String>,
-        quiet: bool,
-    },
-    /// Push a local source path to a remote endpoint.
-    Push {
-        endpoint: RemoteEndpoint,
-        src: PathBuf,
-        threshold: f32,
-        checksum: bool,
-        delete: bool,
-        fsync: bool,
         large_file_parallel_threshold: u64,
         large_file_parallel_workers: usize,
+        network_file_concurrency: usize,
         ignores: Vec<String>,
         quiet: bool,
     },
-    /// Pull from a remote endpoint into a local destination path.
-    Pull {
-        endpoint: RemoteEndpoint,
-        dst: PathBuf,
-        threshold: f32,
-        checksum: bool,
-        delete: bool,
-        fsync: bool,
-        ignores: Vec<String>,
-        quiet: bool,
-    },
-    /// Listen for incoming push operations and write them into `dst`.
+    /// Listen for incoming sync operations and write them into `dst`.
     Listen {
         addr: String,
         dst: PathBuf,
         fsync: bool,
         quiet: bool,
     },
-    /// Serve `src` to remote pull clients.
+    /// Serve `src` to remote sync clients.
     Serve {
         addr: String,
         src: PathBuf,
@@ -88,7 +76,6 @@ pub enum Action {
     InternalChunkWrite {
         dst: PathBuf,
         transfer_id: String,
-        path: String,
         quiet: bool,
     },
 }

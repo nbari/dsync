@@ -8,34 +8,34 @@ use clap::{
 };
 use std::path::PathBuf;
 
-const LONG_ABOUT: &str = "pxs is a file synchronization tool for the same broad \
-    job as rsync: moving data trees efficiently and refreshing existing copies \
-    with as little work as possible. It is not a drop-in replacement for rsync. \
-    pxs focuses on modern large-data sync workloads and uses Rust performance, \
-    parallelism, concurrency, fixed-block chunking, and high-throughput \
-    transport to speed up repeated synchronization when those choices help.\n\n\
+const LONG_ABOUT: &str = "pxs is an integrity-first sync and clone tool for \
+    large mutable datasets. It keeps destination trees accurate across local \
+    paths, SSH, and raw TCP, and it is designed to outperform rsync in target \
+    workloads such as PostgreSQL PGDATA, VM images, and repeated large-data \
+    refreshes. It is not a drop-in replacement for rsync.\n\n\
     EXAMPLES:\n\n\
-    1. Local Sync (File or Directory):\n\
-       pxs sync /data/old /data/new\n\n\
-    2. Network Sync - Receiver (Server 2):\n\
-       pxs listen 0.0.0.0:8080 /new/pgdata\n\n\
-    3. Network Sync - Sender (Server 1):\n\
-       pxs push /old/pgdata 192.168.1.10:8080\n\n\
-    4. Pull Mode (SSH):\n\
-       pxs pull user@server:/data ./local\n\n\
-    5. Force Content Verification (Checksum):\n\
-       pxs sync file.bin copy.bin --checksum\n\n\
+    1. Local Sync:\n\
+       pxs sync /var/lib/postgresql/data /srv/restore/pgdata\n\n\
+    2. SSH Sync:\n\
+       pxs sync user@db2:/srv/export/pgdata /srv/restore/pgdata\n\n\
+    3. Raw TCP Receiver Setup:\n\
+       pxs listen 0.0.0.0:8080 /srv\n\n\
+    4. Raw TCP Sync:\n\
+       pxs sync /var/lib/postgresql/data 192.168.1.10:8080/incoming/pgdata\n\n\
+    5. Verify And Durably Commit:\n\
+       pxs sync file.bin backup.bin --checksum --fsync\n\n\
     SUPPORTED PLATFORMS:\n\
        Linux, macOS, and BSD.\n\
        Windows is not supported.";
 const ABOUT: &str =
-    "pxs (Parallel X-Sync) - Rust file synchronization for modern large-data workloads.";
-const THRESHOLD_LONG_HELP: &str = "Value between 0.1 and 1.0. If the destination file size is less than this percentage of the source, a full rewrite is performed.";
+    "pxs (Parallel X-Sync) - Integrity-first sync/clone for large mutable datasets.";
+const THRESHOLD_LONG_HELP: &str = "Value between 0.1 and 1.0. If the destination file size is less than this fraction of the source, pxs rewrites the file instead of attempting block reuse.";
 const CHECKSUM_LONG_HELP: &str = "By default, pxs skips files if size and modification time match. Use this to force a block-by-block hash comparison. In network mode, pxs also performs end-to-end BLAKE3 verification after the transfer completes.";
 const FSYNC_LONG_HELP: &str =
     "Ensures that file data and metadata are flushed to disk before finishing. Slower but safer.";
-const LARGE_FILE_PARALLEL_THRESHOLD_LONG_HELP: &str = "Enable remote push chunk-parallel transfer for files at or above this size when the transport supports it. Accepts raw bytes or binary suffixes such as KiB, MiB, GiB, and TiB. Use 0 to disable.";
-const LARGE_FILE_PARALLEL_WORKERS_LONG_HELP: &str = "Number of parallel worker connections or sessions for eligible remote large files. If omitted, pxs chooses a conservative default from available CPU cores.";
+const LARGE_FILE_PARALLEL_THRESHOLD_LONG_HELP: &str = "For outbound network sync, files at or above this size use chunk-parallel worker transfers. Smaller files can share the main control session when network file concurrency is above 1. Accepts raw bytes or binary suffixes such as KiB, MiB, GiB, and TiB. Use 0 to disable large-file worker mode.";
+const LARGE_FILE_PARALLEL_WORKERS_LONG_HELP: &str = "Number of parallel worker connections or sessions for eligible large outbound network transfers. If omitted, pxs chooses a conservative default from available CPU cores.";
+const NETWORK_FILE_CONCURRENCY_LONG_HELP: &str = "Maximum number of small outbound network file transfers to keep in flight on the main control session. Files at or above --large-file-parallel-threshold are transferred separately using chunk workers.";
 
 /// Create a path validator that requires the path to exist.
 pub fn validator_path_exists() -> ValueParser {
@@ -172,7 +172,7 @@ fn threshold_arg(hidden: bool) -> Arg {
         .long_help(THRESHOLD_LONG_HELP)
         .value_name("THRESHOLD")
         .value_parser(threshold_parser())
-        .default_value("0.5")
+        .default_value("0.1")
         .hide(hidden)
 }
 
@@ -199,7 +199,7 @@ fn fsync_arg(hidden: bool) -> Arg {
 fn large_file_parallel_threshold_arg() -> Arg {
     Arg::new("large_file_parallel_threshold")
         .long("large-file-parallel-threshold")
-        .help("Enable remote push chunk-parallel transfer at or above SIZE")
+        .help("Use chunk-parallel workers for outbound network files at or above SIZE")
         .long_help(LARGE_FILE_PARALLEL_THRESHOLD_LONG_HELP)
         .value_name("SIZE")
         .value_parser(size_bytes_parser())
@@ -209,8 +209,17 @@ fn large_file_parallel_threshold_arg() -> Arg {
 fn large_file_parallel_workers_arg() -> Arg {
     Arg::new("large_file_parallel_workers")
         .long("large-file-parallel-workers")
-        .help("Set the number of worker sessions/connections for large-file push")
+        .help("Set the number of worker sessions/connections for large outbound network transfers")
         .long_help(LARGE_FILE_PARALLEL_WORKERS_LONG_HELP)
+        .value_name("N")
+        .value_parser(positive_usize_parser())
+}
+
+fn network_file_concurrency_arg() -> Arg {
+    Arg::new("network_file_concurrency")
+        .long("network-file-concurrency")
+        .help("Set the number of small outbound network files to keep in flight")
+        .long_help(NETWORK_FILE_CONCURRENCY_LONG_HELP)
         .value_name("N")
         .value_parser(positive_usize_parser())
 }
@@ -258,6 +267,13 @@ fn src_arg() -> Arg {
         .required(true)
 }
 
+fn sync_operand_arg(id: &'static str, help: &'static str, value_name: &'static str) -> Arg {
+    Arg::new(id)
+        .help(help)
+        .value_name(value_name)
+        .required(true)
+}
+
 fn dst_arg() -> Arg {
     Arg::new("dst")
         .help("Path to the destination file or directory")
@@ -268,7 +284,7 @@ fn dst_arg() -> Arg {
 
 fn endpoint_arg() -> Arg {
     Arg::new("endpoint")
-        .help("Remote endpoint as host:port, user@host:/path, or - for stdio")
+        .help("Remote endpoint as host:port[/path], user@host:/path, or - for stdio")
         .value_name("ENDPOINT")
         .required(true)
 }
@@ -280,7 +296,7 @@ fn addr_arg() -> Arg {
         .required(true)
 }
 
-fn internal_stdio_args() -> [Arg; 13] {
+fn internal_stdio_args() -> [Arg; 12] {
     [
         Arg::new("stdio")
             .long("stdio")
@@ -314,11 +330,6 @@ fn internal_stdio_args() -> [Arg; 13] {
             .help("Receiver-issued transfer id for chunk-writer mode")
             .hide(true)
             .value_name("ID"),
-        Arg::new("chunk_path")
-            .long("chunk-path")
-            .help("Protocol path for the chunk-writer file")
-            .hide(true)
-            .value_name("PATH"),
         threshold_arg(true),
         checksum_arg(true),
         delete_arg(),
@@ -330,15 +341,18 @@ fn internal_stdio_args() -> [Arg; 13] {
 
 fn sync_command() -> Command {
     Command::new("sync")
-        .about("Synchronize a local source into a local destination")
+        .about("Synchronize from SRC into DST across local paths, SSH endpoints, or raw TCP")
         .args([
-            src_arg(),
-            dst_arg(),
+            sync_operand_arg("src", "Source path or remote endpoint", "SRC"),
+            sync_operand_arg("dst", "Destination path or remote endpoint", "DST"),
             threshold_arg(false),
             checksum_arg(false),
             fsync_arg(false),
             dry_run_arg(),
             delete_arg(),
+            large_file_parallel_threshold_arg(),
+            large_file_parallel_workers_arg(),
+            network_file_concurrency_arg(),
             ignore_arg(false),
             exclude_from_arg(false),
         ])
@@ -347,6 +361,7 @@ fn sync_command() -> Command {
 fn push_command() -> Command {
     Command::new("push")
         .about("Push a local source to a remote receiver or SSH destination")
+        .hide(true)
         .args([
             src_arg(),
             endpoint_arg(),
@@ -356,6 +371,7 @@ fn push_command() -> Command {
             fsync_arg(false),
             large_file_parallel_threshold_arg(),
             large_file_parallel_workers_arg(),
+            network_file_concurrency_arg(),
             ignore_arg(false),
             exclude_from_arg(false),
         ])
@@ -364,6 +380,7 @@ fn push_command() -> Command {
 fn pull_command() -> Command {
     Command::new("pull")
         .about("Pull from a remote serve endpoint or SSH source into a local destination")
+        .hide(true)
         .args([
             endpoint_arg(),
             dst_arg(),
@@ -378,13 +395,13 @@ fn pull_command() -> Command {
 
 fn listen_command() -> Command {
     Command::new("listen")
-        .about("Listen for incoming push operations and write them to a destination")
+        .about("Listen for incoming sync operations and write them to a destination root")
         .args([addr_arg(), dst_arg(), fsync_arg(false)])
 }
 
 fn serve_command() -> Command {
     Command::new("serve")
-        .about("Serve a local source for remote pull clients")
+        .about("Serve a local source root for remote sync clients")
         .args([
             addr_arg(),
             src_arg(),
@@ -426,10 +443,11 @@ pub fn new() -> Command {
 #[cfg(test)]
 mod tests {
     use super::new;
+    use anyhow::Result;
     use tempfile::tempdir;
 
     #[test]
-    fn test_verbose_flag_counts_occurrences() -> anyhow::Result<()> {
+    fn test_verbose_flag_counts_occurrences() -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("src.txt");
         let dst = dir.path().join("dst.txt");
@@ -442,7 +460,7 @@ mod tests {
     }
 
     #[test]
-    fn test_threshold_rejects_out_of_range_values() -> anyhow::Result<()> {
+    fn test_threshold_rejects_out_of_range_values() -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("src.txt");
         let dst = dir.path().join("dst.txt");
@@ -461,19 +479,20 @@ mod tests {
     }
 
     #[test]
-    fn test_help_hides_internal_stdio_flags() -> anyhow::Result<()> {
+    fn test_help_hides_internal_stdio_flags() -> Result<()> {
         let mut help = Vec::new();
         new().write_long_help(&mut help)?;
         let help = String::from_utf8(help)?;
         assert!(!help.contains("--stdio"));
         assert!(!help.contains("--source"));
         assert!(help.contains("sync"));
-        assert!(help.contains("push"));
+        assert!(!help.contains("\npush"));
+        assert!(!help.contains("\npull"));
         Ok(())
     }
 
     #[test]
-    fn test_internal_stdio_mode_still_parses() -> anyhow::Result<()> {
+    fn test_internal_stdio_mode_still_parses() -> Result<()> {
         let matches =
             new().try_get_matches_from(["pxs", "--stdio", "--destination", ".", "--fsync"])?;
         assert!(matches.get_flag("stdio"));

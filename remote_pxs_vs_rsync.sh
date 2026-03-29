@@ -5,6 +5,10 @@
 #    --remote-root /home/devops/pxs_bench/pgdata \
 #    --pxs-bin ./target/release/pxs
 
+# Targeted remote benchmark for repeated SSH sync into pre-seeded destinations.
+# Use it to compare pxs and rsync on a specific workload shape, not as a
+# universal performance proof.
+
 set -euo pipefail
 
 usage() {
@@ -25,6 +29,7 @@ Options:
   -h, --help            Show this help
 
 Notes:
+  - This is a workload-specific comparison helper, not a universal benchmark.
   - The script creates and resets only:
       REMOTE_ROOT/pxs
       REMOTE_ROOT/rsync
@@ -160,7 +165,7 @@ fi
 
 echo "== No-change Round (no checksum) =="
 run_timed "pxs_no_checksum" \
-    "$PXS_BIN" push "$SOURCE" "$HOST:$PXS_DST"
+    "$PXS_BIN" sync "$SOURCE" "$HOST:$PXS_DST"
 run_timed "rsync_no_checksum" \
     rsync -a --inplace --no-whole-file -e "$RSYNC_SSH_CMD" "$RSYNC_SOURCE" "$HOST:$RSYNC_DST/"
 echo "pxs: $(format_ms "${TIMES[pxs_no_checksum]}")"
@@ -170,7 +175,7 @@ echo
 if [[ "$RUN_CHECKSUM_ROUND" == "true" ]]; then
     echo "== No-change Round (checksum) =="
     run_timed "pxs_checksum" \
-        "$PXS_BIN" push "$SOURCE" "$HOST:$PXS_DST" -c
+        "$PXS_BIN" sync "$SOURCE" "$HOST:$PXS_DST" -c
     run_timed "rsync_checksum" \
         rsync -a --checksum --inplace --no-whole-file -e "$RSYNC_SSH_CMD" "$RSYNC_SOURCE" "$HOST:$RSYNC_DST/"
     echo "pxs -c: $(format_ms "${TIMES[pxs_checksum]}")"

@@ -1,4 +1,6 @@
-FROM debian:stable-slim
+# Use the Google mirror of Docker Official Images to avoid Docker Hub rate limits
+# in CI while keeping the same Debian base image.
+FROM mirror.gcr.io/library/debian:stable-slim
 
 RUN apt-get update && \
     apt-get install -y openssh-server openssh-client iproute2 procps sudo && \

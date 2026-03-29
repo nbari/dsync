@@ -1,4 +1,5 @@
 use crate::pxs::sync::dir::DirectorySyncContext;
+use crate::pxs::tools;
 use anyhow::{Context, Result};
 
 /// Delete extraneous files from destination that do not exist in the source.
@@ -72,6 +73,9 @@ pub(crate) async fn delete_extraneous_files(context: &DirectorySyncContext<'_>) 
             tokio::fs::remove_file(&path)
                 .await
                 .with_context(|| format!("failed to remove file {}", path.display()))?;
+        }
+        if context.options.fsync {
+            tools::sync_parent_directory(&path)?;
         }
     }
 

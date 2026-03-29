@@ -1,4 +1,5 @@
 use super::codec::PxsCodec;
+use anyhow::Result;
 use std::process::Stdio;
 use tokio::process::{Child, ChildStdin, ChildStdout, Command};
 use tokio_util::codec::Framed;
@@ -39,11 +40,7 @@ pub(crate) fn build_ssh_push_command(dst_path: &str, fsync: bool, ignores: &[Str
 
 /// Build the remote pxs command used for SSH chunk-writer worker mode.
 #[must_use]
-pub(crate) fn build_ssh_chunk_writer_command(
-    dst_path: &str,
-    transfer_id: &str,
-    rel_path: &str,
-) -> String {
+pub(crate) fn build_ssh_chunk_writer_command(dst_path: &str, transfer_id: &str) -> String {
     let args = vec![
         "pxs".to_string(),
         "--stdio".to_string(),
@@ -53,8 +50,6 @@ pub(crate) fn build_ssh_chunk_writer_command(
         "--chunk-writer".to_string(),
         "--transfer-id".to_string(),
         transfer_id.to_string(),
-        "--chunk-path".to_string(),
-        rel_path.to_string(),
     ];
     build_remote_command(&args)
 }
@@ -116,7 +111,7 @@ pub(crate) struct ChildSession {
 }
 
 impl ChildSession {
-    pub(crate) fn spawn(mut cmd: Command) -> anyhow::Result<Self> {
+    pub(crate) fn spawn(mut cmd: Command) -> Result<Self> {
         let mut child = cmd.spawn()?;
         let stdin = child
             .stdin
@@ -133,7 +128,7 @@ impl ChildSession {
         })
     }
 
-    pub(crate) fn framed_mut(&mut self) -> anyhow::Result<&mut Framed<FramedChildIo, PxsCodec>> {
+    pub(crate) fn framed_mut(&mut self) -> Result<&mut Framed<FramedChildIo, PxsCodec>> {
         self.framed
             .as_mut()
             .ok_or_else(|| anyhow::anyhow!("framed session already finalized"))
@@ -141,9 +136,9 @@ impl ChildSession {
 
     pub(crate) async fn finish(
         mut self,
-        session_result: anyhow::Result<()>,
+        session_result: Result<()>,
         process_label: &str,
-    ) -> anyhow::Result<()> {
+    ) -> Result<()> {
         drop(self.framed.take());
 
         if session_result.is_err() {
@@ -180,6 +175,7 @@ mod tests {
         ChildSession, build_ssh_chunk_writer_command, build_ssh_command, build_ssh_pull_command,
         build_ssh_push_command, shell_quote,
     };
+    use anyhow::Result;
     use std::time::{Duration, Instant};
     use tokio::process::Command;
 
@@ -217,12 +213,11 @@ mod tests {
     }
 
     #[test]
-    fn test_build_ssh_chunk_writer_command_quotes_paths() {
-        let command =
-            build_ssh_chunk_writer_command("/tmp/dst path", "deadbeef-42", "nested/it's-here");
+    fn test_build_ssh_chunk_writer_command_quotes_transfer() {
+        let command = build_ssh_chunk_writer_command("/tmp/dst path", "deadbeef-42");
         assert_eq!(
             command,
-            "'pxs' '--stdio' '--quiet' '--destination' '/tmp/dst path' '--chunk-writer' '--transfer-id' 'deadbeef-42' '--chunk-path' 'nested/it'\"'\"'s-here'"
+            "'pxs' '--stdio' '--quiet' '--destination' '/tmp/dst path' '--chunk-writer' '--transfer-id' 'deadbeef-42'"
         );
     }
 
@@ -253,7 +248,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_child_session_finish_kills_process_on_error() -> anyhow::Result<()> {
+    async fn test_child_session_finish_kills_process_on_error() -> Result<()> {
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg("sleep 60")
@@ -276,7 +271,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_child_session_finish_surfaces_nonzero_exit() -> anyhow::Result<()> {
+    async fn test_child_session_finish_surfaces_nonzero_exit() -> Result<()> {
         let mut cmd = Command::new("sh");
         cmd.arg("-c")
             .arg("exit 7")

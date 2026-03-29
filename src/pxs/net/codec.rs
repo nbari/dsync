@@ -1,4 +1,5 @@
 use super::MAX_FRAME_SIZE;
+use anyhow::Result;
 use bytes::{Buf, BufMut, BytesMut};
 use rkyv::util::AlignedVec;
 use tokio_util::codec::{Decoder, Encoder};

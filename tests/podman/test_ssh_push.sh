@@ -3,10 +3,7 @@ set -euo pipefail
 
 cargo build --release
 
-if [ ! -f tests/podman/id_ed25519 ]; then
-    echo "Generating SSH keys for test..."
-    ssh-keygen -t ed25519 -f tests/podman/id_ed25519 -N ""
-fi
+bash tests/podman/ensure_ssh_key.sh
 
 DOCKER=${DOCKER:-podman}
 IMAGE="pxs-ssh-push-test"
@@ -45,7 +42,7 @@ $DOCKER run -d --name pxs-ssh-push-server \
 echo "Waiting for SSH server to be ready..."
 sleep 2
 
-echo "Starting client and pushing directory..."
+echo "Starting client and syncing directory to the remote destination..."
 $DOCKER run --name pxs-ssh-push-client \
     -t \
     --network "$NETWORK" \
@@ -59,7 +56,7 @@ $DOCKER run --name pxs-ssh-push-client \
              chmod 600 /home/devops/.ssh/id_ed25519 && \
              echo -e 'Host pxs-ssh-push-server\n  StrictHostKeyChecking no\n  UserKnownHostsFile /dev/null\n  IdentityFile ~/.ssh/id_ed25519' > /home/devops/.ssh/config && \
              chown devops:devops /home/devops/.ssh/config && \
-             sudo -u devops pxs push /src \"devops@pxs-ssh-push-server:$REMOTE_ROOT\" \
+             sudo -u devops pxs sync /src \"devops@pxs-ssh-push-server:$REMOTE_ROOT\" \
              --ignore '*.tmp' \
              -vv"
 
@@ -82,7 +79,7 @@ if [ "$(cat "/home/devops/Remote Dst/nested/keep.txt")" != "push nested payload"
     exit 1
 fi
 if [ -e "/home/devops/Remote Dst/skip.tmp" ]; then
-    echo "Ignored file was transferred during SSH push"
+    echo "Ignored file was transferred during SSH sync"
     exit 1
 fi
 EOF
@@ -90,4 +87,4 @@ EOF
 
 $DOCKER exec pxs-ssh-push-server bash -lc "$REMOTE_CHECK_SCRIPT"
 
-echo "✅ SSH Push test passed!"
+echo "✅ SSH sync-to-remote test passed!"

@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{Context, Result};
 use filetime::{FileTime, set_file_times};
 use std::hash::Hasher;
 use std::path::Path;
@@ -9,7 +9,7 @@ use twox_hash::XxHash64;
 /// # Errors
 ///
 /// Returns an error if any attribute fails to be applied.
-pub fn apply_metadata(src: &Path, dst: &Path) -> anyhow::Result<()> {
+pub fn apply_metadata(src: &Path, dst: &Path) -> Result<()> {
     let meta = std::fs::symlink_metadata(src).context("failed to read source metadata")?;
     let permissions = meta.permissions();
     if !meta.file_type().is_symlink() {

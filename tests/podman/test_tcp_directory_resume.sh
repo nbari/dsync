@@ -3,6 +3,8 @@ set -euo pipefail
 
 cargo build --release
 
+bash tests/podman/ensure_ssh_key.sh
+
 DOCKER=${DOCKER:-podman}
 IMAGE="pxs-tcp-tree-test"
 NETWORK="pxs-tcp-tree-net"
@@ -71,14 +73,14 @@ $DOCKER run -d --name pxs-tree-receiver \
 echo "Waiting for receiver to be ready..."
 sleep 2
 
-echo "Starting sender and pushing directory tree..."
+echo "Starting sender and syncing directory tree..."
 $DOCKER run --name pxs-tree-sender \
     -t \
     --network "$NETWORK" \
     -v "$(pwd)/target/release/pxs:/usr/local/bin/pxs:ro" \
     -v "$SRC_DIR:/src:ro" \
     "$IMAGE" \
-    bash -lc "pxs push /src pxs-tree-receiver:$PORT -vv"
+    bash -lc "pxs sync /src pxs-tree-receiver:$PORT -vv"
 
 if [ "$(sha256sum "$DST_DIR/resume.bin" | awk '{print $1}')" != "$RESUME_HASH" ]; then
     echo "resume.bin hash mismatch after resume sync"

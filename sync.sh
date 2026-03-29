@@ -162,8 +162,8 @@ run_preflight() {
   echo "[*] Local pxs:  $local_version"
   echo "[*] Remote pxs: $remote_version"
 
-  if ! "$PXS_BIN" push --help 2>&1 | grep -q -- '--delete'; then
-    echo "[-] Local pxs does not advertise push --delete support." >&2
+  if ! "$PXS_BIN" sync --help 2>&1 | grep -q -- '--delete'; then
+    echo "[-] Local pxs does not advertise sync --delete support." >&2
     exit 1
   fi
 
@@ -172,7 +172,7 @@ run_preflight() {
   "$SSH_BIN" "$DST_HOST" "mkdir -p -- $(shell_quote "$remote_parent") $(shell_quote "$DST_PGDATA")"
 
   echo "[*] Capability summary:"
-  echo "    - supported here: recursive SSH push, symlinks, perms, mtimes, remote --delete, repeated PGDATA passes"
+  echo "    - supported here: recursive SSH sync to remote destinations, symlinks, perms, mtimes, remote --delete, repeated PGDATA passes"
   echo "    - speed mode: --fsync is disabled for all passes"
   echo "    - not guaranteed here: hard links (-H)"
 
@@ -183,8 +183,8 @@ run_preflight() {
 run_pxs_sync() {
   # Repeated runs are expected to get faster as the destination converges
   # because pxs skips unchanged files and can send deltas for changed ones.
-  echo "[*] pxs push: $SRC_PGDATA -> $DST_HOST:$DST_PGDATA (--delete, no --fsync)"
-  "$PXS_BIN" push "$SRC_PGDATA" "$DST_HOST:$DST_PGDATA" "${PXS_SYNC_ARGS[@]}"
+  echo "[*] pxs sync: $SRC_PGDATA -> $DST_HOST:$DST_PGDATA (--delete, no --fsync)"
+  "$PXS_BIN" sync "$SRC_PGDATA" "$DST_HOST:$DST_PGDATA" "${PXS_SYNC_ARGS[@]}"
 }
 
 # Preflight first so we fail fast on missing tools, unsupported pxs builds, or

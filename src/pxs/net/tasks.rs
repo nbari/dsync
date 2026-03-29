@@ -1,26 +1,30 @@
-use super::{path::validate_protocol_path, protocol::FileMetadata};
-use std::path::{Path, PathBuf};
+use super::{
+    path::{protocol_path_to_pathbuf, validate_protocol_path},
+    protocol::FileMetadata,
+};
+use anyhow::Result;
+use std::{
+    os::unix::ffi::OsStrExt,
+    path::{Path, PathBuf},
+};
 
 #[derive(Clone)]
 pub(crate) enum SyncTask {
     Dir {
-        path: String,
+        path: Vec<u8>,
         metadata: FileMetadata,
     },
     Symlink {
-        path: String,
-        target: String,
+        path: Vec<u8>,
+        target: Vec<u8>,
         metadata: FileMetadata,
     },
     File {
-        path: String,
+        path: Vec<u8>,
     },
 }
 
-fn build_overrides(
-    src_root: &Path,
-    ignores: &[String],
-) -> anyhow::Result<ignore::overrides::Override> {
+fn build_overrides(src_root: &Path, ignores: &[String]) -> Result<ignore::overrides::Override> {
     use ignore::overrides::OverrideBuilder;
 
     let mut override_builder = OverrideBuilder::new(src_root);
@@ -30,18 +34,15 @@ fn build_overrides(
     Ok(override_builder.build()?)
 }
 
-pub(crate) fn source_path_for(src_root: &Path, rel_path: &str) -> PathBuf {
+pub(crate) fn source_path_for(src_root: &Path, rel_path: &[u8]) -> Result<PathBuf> {
     if src_root.is_file() {
-        src_root.to_path_buf()
+        Ok(src_root.to_path_buf())
     } else {
-        src_root.join(rel_path)
+        Ok(src_root.join(protocol_path_to_pathbuf(rel_path)?))
     }
 }
 
-fn collect_sync_tasks_sync(
-    src_root: &Path,
-    ignores: &[String],
-) -> anyhow::Result<(Vec<SyncTask>, u64)> {
+fn collect_sync_tasks_sync(src_root: &Path, ignores: &[String]) -> Result<(Vec<SyncTask>, u64)> {
     use ignore::WalkBuilder;
 
     let mut tasks = Vec::new();
@@ -51,7 +52,8 @@ fn collect_sync_tasks_sync(
         let metadata = FileMetadata::from(std::fs::metadata(src_root)?);
         let path = src_root
             .file_name()
-            .map(|name| name.to_string_lossy().to_string())
+            .map(OsStrExt::as_bytes)
+            .map(ToOwned::to_owned)
             .ok_or_else(|| anyhow::anyhow!("source file has no name: {}", src_root.display()))?;
         validate_protocol_path(&path)?;
         total_size = metadata.size;
@@ -77,12 +79,13 @@ fn collect_sync_tasks_sync(
             continue;
         }
 
-        let rel_path = path
-            .strip_prefix(src_root)?
-            .components()
-            .map(|component| component.as_os_str().to_string_lossy().to_string())
-            .collect::<Vec<_>>()
-            .join("/");
+        let mut rel_path = Vec::new();
+        for (index, component) in path.strip_prefix(src_root)?.components().enumerate() {
+            if index > 0 {
+                rel_path.push(b'/');
+            }
+            rel_path.extend_from_slice(component.as_os_str().as_bytes());
+        }
         validate_protocol_path(&rel_path)?;
         let metadata = FileMetadata::from(entry.metadata()?);
 
@@ -90,7 +93,7 @@ fn collect_sync_tasks_sync(
             let target = std::fs::read_link(path)?;
             tasks.push(SyncTask::Symlink {
                 path: rel_path,
-                target: target.to_string_lossy().to_string(),
+                target: target.as_os_str().as_bytes().to_vec(),
                 metadata,
             });
         } else if entry.file_type().is_some_and(|ft| ft.is_dir()) {
@@ -110,7 +113,7 @@ fn collect_sync_tasks_sync(
 pub(crate) async fn collect_sync_tasks(
     src_root: &Path,
     ignores: &[String],
-) -> anyhow::Result<(Vec<SyncTask>, u64)> {
+) -> Result<(Vec<SyncTask>, u64)> {
     let src_root_owned = src_root.to_path_buf();
     let ignores_owned = ignores.to_vec();
     tokio::task::spawn_blocking(move || collect_sync_tasks_sync(&src_root_owned, &ignores_owned))

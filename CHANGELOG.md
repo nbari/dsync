@@ -2,6 +2,44 @@
 
 All notable changes to this project will be documented in this file.
 
+## [Unreleased]
+
+### Added
+
+- Added negotiated block compression for outbound SSH and raw TCP transfers, preferring `zstd` and falling back to `lz4` before the existing uncompressed path.
+- Added `--network-file-concurrency` to bound how many smaller outbound network file transfers can stay in flight on the main control session.
+- Added regression coverage for negotiated `zstd` chunk-writer batches and bounded small-file network concurrency on the sender control path.
+
+### Changed
+
+- Clarified the public project objective across the README, crate metadata, CLI help text, and benchmark script wording so `pxs` is consistently described as an integrity-first sync/clone tool for large mutable datasets rather than a general `rsync` replacement.
+- Reworked the README into an operator-focused guide and moved protocol and architecture notes into a dedicated contributor-facing design document.
+- Restored the public `sync` operand order to `pxs sync SRC DST` across local, SSH, and raw TCP flows so the command again follows source-first semantics instead of the newer destination-first model.
+- Reworked outbound network scheduling so smaller files can share the control session concurrently, while files at or above `--large-file-parallel-threshold` drain in-flight small work and continue to use chunk-parallel worker transfers.
+- Extended `--large-file-parallel-threshold` from a large-file worker toggle into the scheduler boundary between small-file control-session fan-out and large-file chunk-worker mode for outbound network sync.
+- Kept SSH transport compression disabled so protocol-level `zstd`/`lz4` remains the only compression layer by default.
+
+## [0.6.0] - 2026-03-27
+
+### Added
+
+- Added broader transport validation across the public sync surface, including local CLI smoke tests, raw TCP delete regressions, Podman SSH/raw TCP suite runners, and Linux CI jobs for the SSH and raw TCP end-to-end suites.
+- Added dedicated SSH end-to-end coverage for `--delete`, `--fsync`, ignore forwarding, exact-file syncs, and large-file parallel push worker fan-out.
+- Added dedicated raw TCP end-to-end coverage for directory pull with `--delete`, `--checksum`, and ignore handling.
+
+### Changed
+
+- Standardized the public interface around `pxs sync DEST SRC` for local, SSH, and raw TCP transfers. `push` and `pull` remain available as hidden compatibility aliases.
+- Extended raw TCP endpoint syntax to `host:port/path` so the client can address an exact file or directory path within a configured `listen` or `serve` root.
+- Reworked the README, Podman helpers, benchmark helpers, and PostgreSQL migration script examples around the unified `sync DEST SRC` model.
+- Split the shared tools implementation into focused `src/pxs/tools/` modules and standardized `anyhow::Result` style across the codebase and tests by importing `Result` and using plain `Result<T>` in signatures.
+
+### Fixed
+
+- Fixed remote exact-path sync handling so explicit single-file targets are honored instead of being treated like directory roots during remote sync sessions.
+- Fixed the macOS release build by making staging probe no-op hooks available on non-test non-Linux targets instead of gating them away at compile time.
+- Fixed release documentation drift around raw TCP sync flags so the README now reflects current client-side `--checksum`, `--threshold`, `--delete`, and `--ignore` behavior.
+
 ## [0.5.1] - 2026-03-26
 
 ### Added

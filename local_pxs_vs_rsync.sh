@@ -1,8 +1,9 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# local_pxs_vs_rsync.sh - Optimized Benchmark
-# Compares pxs (fixed-block) vs rsync (rolling-hash)
+# local_pxs_vs_rsync.sh - targeted local benchmark
+# Compares pxs and rsync on selected fixed-block large-file workloads.
+# Useful for workload-specific evaluation, not as a universal speed claim.
 
 WORKDIR="${WORKDIR:-/tmp/pxs-bench}"
 SRC="$WORKDIR/src.bin"
@@ -22,6 +23,7 @@ run_bench() {
 
     echo -e "\n>> Benchmarking $tool ($label)"
     echo "CMD: $cmd"
+    echo "Workload note: targeted comparison, not a blanket throughput claim."
     
     TIMEFORMAT="  Time: %R seconds"
     if [[ "$tool" == "pxs" ]]; then

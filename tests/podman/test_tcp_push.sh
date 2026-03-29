@@ -4,6 +4,8 @@ set -euo pipefail
 # Build pxs release
 cargo build --release
 
+bash tests/podman/ensure_ssh_key.sh
+
 # Use podman or docker
 DOCKER=${DOCKER:-podman}
 
@@ -54,15 +56,15 @@ $DOCKER run -d --name pxs-tcp-receiver \
 echo "Waiting for receiver to be ready..."
 sleep 2
 
-# Push file over raw TCP
-echo "Starting sender and pushing file..."
+# Sync file into the raw TCP listener
+echo "Starting sender and syncing file..."
 $DOCKER run --name pxs-tcp-sender \
     -t \
     --network "$NETWORK" \
     -v "$(pwd)/target/release/pxs:/usr/local/bin/pxs:ro" \
     -v "$SRC_DIR:/src:ro" \
     "$IMAGE" \
-    bash -lc "pxs push /src/test.bin pxs-tcp-receiver:$PORT -vv"
+    bash -lc "pxs sync /src/test.bin pxs-tcp-receiver:$PORT/test.bin -vv"
 
 # Verify copied bytes on the host bind mount
 if [ ! -f "$DEST_FILE" ]; then
@@ -72,10 +74,10 @@ fi
 
 DEST_HASH=$(sha256sum "$DEST_FILE" | awk '{print $1}')
 if [ "$SOURCE_HASH" != "$DEST_HASH" ]; then
-    echo "Hash mismatch after TCP push"
+    echo "Hash mismatch after TCP sync"
     echo "source: $SOURCE_HASH"
     echo "dest:   $DEST_HASH"
     exit 1
 fi
 
-echo "✅ Direct TCP push test passed!"
+echo "✅ Direct TCP sync-to-listen test passed!"

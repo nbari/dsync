@@ -9,7 +9,7 @@ use tokio::sync::Semaphore;
 
 pub(crate) const BLOCK_SIZE: usize = 128 * 1024;
 
-fn mapped_chunk(mmap: &memmap2::Mmap, offset: u64, len: usize) -> anyhow::Result<Option<&[u8]>> {
+fn mapped_chunk(mmap: &memmap2::Mmap, offset: u64, len: usize) -> Result<Option<&[u8]>> {
     let start = usize::try_from(offset).map_err(|e| anyhow::anyhow!(e))?;
     let end = start
         .checked_add(len)
@@ -227,21 +227,20 @@ fn spawn_sync_worker(
                 let to_read_u64 = std::cmp::min(BLOCK_SIZE as u64, end_offset - offset);
                 let to_read = usize::try_from(to_read_u64).map_err(|e| anyhow::anyhow!(e))?;
 
-                let mut write_if_needed =
-                    |src_chunk: &[u8], needs_write: bool| -> anyhow::Result<()> {
-                        if needs_write {
-                            if let Err(e) = worker_context.dst.write_all_at(src_chunk, offset) {
-                                if e.raw_os_error() == Some(nix::libc::ENOSPC) {
-                                    anyhow::bail!(
-                                        "Disk full: not enough space to write to destination"
-                                    );
-                                }
-                                return Err(e).context("failed to write to destination");
+                let mut write_if_needed = |src_chunk: &[u8], needs_write: bool| -> Result<()> {
+                    if needs_write {
+                        if let Err(e) = worker_context.dst.write_all_at(src_chunk, offset) {
+                            if e.raw_os_error() == Some(nix::libc::ENOSPC) {
+                                anyhow::bail!(
+                                    "Disk full: not enough space to write to destination"
+                                );
                             }
-                            chunk_updated += 1;
+                            return Err(e).context("failed to write to destination");
                         }
-                        Ok(())
-                    };
+                        chunk_updated += 1;
+                    }
+                    Ok(())
+                };
 
                 if let Some(src_mmap) = &worker_context.src_mmap
                     && let Some(src_chunk) = mapped_chunk(src_mmap, offset, to_read)?

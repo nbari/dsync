@@ -4,6 +4,8 @@ set -euo pipefail
 # Build pxs release
 cargo build --release
 
+bash tests/podman/ensure_ssh_key.sh
+
 DOCKER=${DOCKER:-podman}
 IMAGE="pxs-tcp-pull-test"
 NETWORK="pxs-tcp-pull-net"
@@ -41,19 +43,19 @@ $DOCKER run -d --name pxs-tcp-source \
     -v "$(pwd)/target/release/pxs:/usr/local/bin/pxs:ro" \
     -v "$SRC_DIR:/srv/export:ro" \
     "$IMAGE" \
-    bash -lc "pxs serve 0.0.0.0:$PORT /srv/export/test.bin -vv"
+    bash -lc "pxs serve 0.0.0.0:$PORT /srv/export -vv"
 
 echo "Waiting for source server to be ready..."
 sleep 2
 
-echo "Starting client and pulling file..."
+echo "Starting client and syncing file from serve..."
 $DOCKER run --name pxs-tcp-client \
     -t \
     --network "$NETWORK" \
     -v "$(pwd)/target/release/pxs:/usr/local/bin/pxs:ro" \
     -v "$DST_DIR:/data" \
     "$IMAGE" \
-    bash -lc "pxs pull pxs-tcp-source:$PORT /data -vv"
+    bash -lc "pxs sync pxs-tcp-source:$PORT/test.bin /data/test.bin -vv"
 
 if [ ! -f "$DEST_FILE" ]; then
     echo "Destination file was not created: $DEST_FILE"
@@ -62,10 +64,10 @@ fi
 
 DEST_HASH=$(sha256sum "$DEST_FILE" | awk '{print $1}')
 if [ "$SOURCE_HASH" != "$DEST_HASH" ]; then
-    echo "Hash mismatch after TCP pull"
+    echo "Hash mismatch after TCP sync"
     echo "source: $SOURCE_HASH"
     echo "dest:   $DEST_HASH"
     exit 1
 fi
 
-echo "✅ Direct TCP pull test passed!"
+echo "✅ Direct TCP sync-from-serve test passed!"

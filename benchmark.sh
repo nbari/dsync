@@ -1,5 +1,9 @@
 #!/bin/bash
 
+# Targeted local benchmark for large-file sync behavior.
+# This script is useful for comparing pxs and rsync on one specific workload
+# shape. It is not a universal performance claim.
+
 # Colors for output
 GREEN='\033[0;32m'
 BLUE='\033[0;34m'
@@ -15,6 +19,8 @@ DST_RSYNC="bench_dest_rsync.bin"
 
 echo -e "${BLUE}Creating 1GB source file...${NC}"
 dd if=/dev/urandom of=$SRC bs=1M count=1024 status=progress
+
+echo -e "${BLUE}Benchmark scope: large local file sync with identical correctness expectations.${NC}"
 
 echo -e "\n${GREEN}--- Initial Sync (Full Copy) ---${NC}"
 

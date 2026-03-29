@@ -1,11 +1,11 @@
-use crate::cli::actions::{Action, RemoteEndpoint};
+use crate::cli::actions::{Action, RemoteEndpoint, SyncOperand};
 use crate::pxs::{
     net::{LargeFileParallelOptions, RemoteFeatureOptions, RemoteSyncOptions},
     sync, tools,
 };
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-use tracing::{info, instrument};
+use tracing::{debug, info, instrument};
 
 enum HandleOutcome {
     PrintCompletion,
@@ -20,6 +20,7 @@ struct PushCommandOptions {
     fsync: bool,
     large_file_parallel_threshold: u64,
     large_file_parallel_workers: usize,
+    network_file_concurrency: usize,
 }
 
 fn remote_large_file_parallel_options(
@@ -37,6 +38,14 @@ fn remote_large_file_parallel_options(
             options.large_file_parallel_workers
         },
     })
+}
+
+fn remote_network_file_concurrency(options: PushCommandOptions) -> usize {
+    if options.network_file_concurrency == 0 {
+        tools::default_network_file_concurrency()
+    } else {
+        options.network_file_concurrency
+    }
 }
 
 fn format_updated_block_percentage(stats: sync::SyncStats) -> String {
@@ -76,13 +85,14 @@ async fn handle_push_action(
 ) -> Result<()> {
     match endpoint {
         RemoteEndpoint::Ssh { host, path } => {
-            eprintln!("Connecting via SSH to {host} to sync to {path}");
+            info!("Connecting via SSH to {host} to sync to {path}");
             let large_file_parallel = remote_large_file_parallel_options(options);
             crate::pxs::net::run_ssh_sender(
                 host,
                 src,
                 path,
                 RemoteSyncOptions {
+                    path: None,
                     threshold: options.threshold,
                     features: RemoteFeatureOptions {
                         checksum: options.checksum,
@@ -90,6 +100,7 @@ async fn handle_push_action(
                         fsync: options.fsync,
                     },
                     large_file_parallel,
+                    network_file_concurrency: remote_network_file_concurrency(options),
                     ignores,
                 },
             )
@@ -114,24 +125,27 @@ async fn handle_push_action(
             )
             .await?;
         }
-        RemoteEndpoint::Tcp(addr) => {
-            anyhow::ensure!(
-                !options.delete,
-                "--delete is not supported for raw TCP push; use SSH remote mirror mode instead"
-            );
-            eprintln!(
-                "Connecting to {addr} to sync from {} (checksum: {})",
+        RemoteEndpoint::Tcp { addr, path } => {
+            info!(
+                "Connecting to {addr} to sync {} into the remote destination (checksum: {})",
                 src.display(),
                 options.checksum
             );
-            crate::pxs::net::run_sender_with_options(
+            crate::pxs::net::run_sender_with_features(
                 addr,
                 src,
-                options.threshold,
-                options.checksum,
-                options.fsync,
-                ignores,
-                remote_large_file_parallel_options(options),
+                RemoteSyncOptions {
+                    path: path.as_deref(),
+                    threshold: options.threshold,
+                    features: RemoteFeatureOptions {
+                        checksum: options.checksum,
+                        delete: options.delete,
+                        fsync: options.fsync,
+                    },
+                    large_file_parallel: remote_large_file_parallel_options(options),
+                    network_file_concurrency: remote_network_file_concurrency(options),
+                    ignores,
+                },
             )
             .await?;
         }
@@ -151,12 +165,13 @@ async fn handle_pull_action(
 ) -> Result<()> {
     match endpoint {
         RemoteEndpoint::Ssh { host, path } => {
-            eprintln!("Pulling via SSH from {host}:{path} to {}", dst.display());
+            info!("Syncing via SSH from {host}:{path} into {}", dst.display());
             crate::pxs::net::run_ssh_receiver(
                 host,
                 dst,
                 path,
                 RemoteSyncOptions {
+                    path: None,
                     threshold,
                     features: RemoteFeatureOptions {
                         checksum,
@@ -164,6 +179,7 @@ async fn handle_pull_action(
                         fsync,
                     },
                     large_file_parallel: None,
+                    network_file_concurrency: 1,
                     ignores,
                 },
             )
@@ -172,13 +188,25 @@ async fn handle_pull_action(
         RemoteEndpoint::Stdio => {
             anyhow::bail!("stdio is not supported for pull mode");
         }
-        RemoteEndpoint::Tcp(addr) => {
-            anyhow::ensure!(
-                !delete,
-                "--delete is not supported for raw TCP pull; use SSH remote mirror mode instead"
-            );
-            eprintln!("Connecting to {addr} to pull to {}", dst.display());
-            crate::pxs::net::run_pull_client(addr, dst, fsync).await?;
+        RemoteEndpoint::Tcp { addr, path } => {
+            info!("Connecting to {addr} to sync into {}", dst.display());
+            crate::pxs::net::run_pull_client_with_options(
+                addr,
+                dst,
+                RemoteSyncOptions {
+                    path: path.as_deref(),
+                    threshold,
+                    features: RemoteFeatureOptions {
+                        checksum,
+                        delete,
+                        fsync,
+                    },
+                    large_file_parallel: None,
+                    network_file_concurrency: 1,
+                    ignores,
+                },
+            )
+            .await?;
         }
     }
 
@@ -187,7 +215,7 @@ async fn handle_pull_action(
 
 async fn handle_listen_action(addr: &str, dst: &Path, fsync: bool, quiet: bool) -> Result<()> {
     if !quiet {
-        eprintln!("Listening on {addr} for incoming sync to {}", dst.display());
+        info!("Listening on {addr} for incoming sync to {}", dst.display());
     }
     crate::pxs::net::run_receiver(addr, dst, fsync).await
 }
@@ -201,7 +229,7 @@ async fn handle_serve_action(
     quiet: bool,
 ) -> Result<()> {
     if !quiet {
-        eprintln!("Serving {} on {addr} (checksum: {checksum})", src.display());
+        info!("Serving {} on {addr} (checksum: {checksum})", src.display());
     }
     crate::pxs::net::run_sender_listener(addr, src, threshold, checksum, ignores).await
 }
@@ -229,33 +257,9 @@ async fn handle_internal_stdio_send_action(
 async fn handle_internal_chunk_write_action(
     dst: &Path,
     transfer_id: &str,
-    path: &str,
     quiet: bool,
 ) -> Result<()> {
-    crate::pxs::net::run_stdio_chunk_writer(dst, transfer_id, path, quiet).await
-}
-
-async fn handle_push_cli_action(
-    endpoint: &RemoteEndpoint,
-    src: &Path,
-    options: PushCommandOptions,
-    ignores: &[String],
-) -> Result<HandleOutcome> {
-    handle_push_action(endpoint, src, options, ignores).await?;
-    Ok(HandleOutcome::PrintCompletion)
-}
-
-async fn handle_pull_cli_action(
-    endpoint: &RemoteEndpoint,
-    dst: &Path,
-    threshold: f32,
-    checksum: bool,
-    delete: bool,
-    fsync: bool,
-    ignores: &[String],
-) -> Result<HandleOutcome> {
-    handle_pull_action(endpoint, dst, threshold, checksum, delete, fsync, ignores).await?;
-    Ok(HandleOutcome::PrintCompletion)
+    crate::pxs::net::run_stdio_chunk_writer(dst, transfer_id, quiet).await
 }
 
 async fn handle_listen_cli_action(
@@ -305,10 +309,9 @@ async fn handle_internal_send_cli_action(
 async fn handle_internal_chunk_write_cli_action(
     dst: &Path,
     transfer_id: &str,
-    path: &str,
     quiet: bool,
 ) -> Result<HandleOutcome> {
-    handle_internal_chunk_write_action(dst, transfer_id, path, quiet).await?;
+    handle_internal_chunk_write_action(dst, transfer_id, quiet).await?;
     Ok(HandleOutcome::PrintCompletion)
 }
 
@@ -399,6 +402,48 @@ async fn handle_local_sync(
     Ok(HandleOutcome::PrintCompletion)
 }
 
+async fn handle_sync_operands(
+    src: &SyncOperand,
+    dst: &SyncOperand,
+    options: sync::SyncOptions,
+    push_options: PushCommandOptions,
+) -> Result<HandleOutcome> {
+    match (src, dst) {
+        (SyncOperand::Local(src_path), SyncOperand::Local(dst_path)) => {
+            handle_local_sync(src_path, dst_path, options).await
+        }
+        (SyncOperand::Local(src_path), SyncOperand::Remote(endpoint)) => {
+            anyhow::ensure!(
+                !options.dry_run,
+                "--dry-run is only supported for local-to-local sync"
+            );
+            handle_push_action(endpoint, src_path, push_options, options.ignores.as_slice())
+                .await?;
+            Ok(HandleOutcome::PrintCompletion)
+        }
+        (SyncOperand::Remote(endpoint), SyncOperand::Local(dst_path)) => {
+            anyhow::ensure!(
+                !options.dry_run,
+                "--dry-run is only supported for local-to-local sync"
+            );
+            handle_pull_action(
+                endpoint,
+                dst_path,
+                options.threshold,
+                options.checksum,
+                options.delete,
+                options.fsync,
+                options.ignores.as_slice(),
+            )
+            .await?;
+            Ok(HandleOutcome::PrintCompletion)
+        }
+        (SyncOperand::Remote(_), SyncOperand::Remote(_)) => {
+            anyhow::bail!("sync supports at most one remote operand per invocation")
+        }
+    }
+}
+
 /// Handle the action
 ///
 /// # Errors
@@ -406,10 +451,11 @@ async fn handle_local_sync(
 /// Returns an error if synchronization fails.
 #[instrument(skip(action))]
 pub async fn handle(action: Action) -> Result<()> {
+    debug!("Dispatching action: {action:?}");
     let (is_quiet, outcome) = dispatch_action(action).await?;
 
     if matches!(outcome, HandleOutcome::PrintCompletion) && !is_quiet {
-        eprintln!("Synchronization complete");
+        info!("Synchronization complete");
     }
 
     Ok(())
@@ -425,6 +471,9 @@ async fn dispatch_action(action: Action) -> Result<(bool, HandleOutcome)> {
             dry_run,
             delete,
             fsync,
+            large_file_parallel_threshold,
+            large_file_parallel_workers,
+            network_file_concurrency,
             ignores,
             quiet,
         } => {
@@ -432,6 +481,15 @@ async fn dispatch_action(action: Action) -> Result<(bool, HandleOutcome)> {
                 src,
                 dst,
                 sync::SyncOptions::new(threshold, checksum, dry_run, delete, ignores, fsync, quiet),
+                PushCommandOptions {
+                    threshold,
+                    checksum,
+                    delete,
+                    fsync,
+                    large_file_parallel_threshold,
+                    large_file_parallel_workers,
+                    network_file_concurrency,
+                },
             )
             .await
         }
@@ -440,103 +498,19 @@ async fn dispatch_action(action: Action) -> Result<(bool, HandleOutcome)> {
 }
 
 async fn dispatch_sync_variant(
-    src: PathBuf,
-    dst: PathBuf,
+    src: SyncOperand,
+    dst: SyncOperand,
     options: sync::SyncOptions,
-) -> Result<(bool, HandleOutcome)> {
-    Ok((options.quiet, handle_local_sync(&src, &dst, options).await?))
-}
-
-async fn dispatch_push_variant(
-    endpoint: RemoteEndpoint,
-    src: PathBuf,
-    options: PushCommandOptions,
-    ignores: Vec<String>,
-    quiet: bool,
+    push_options: PushCommandOptions,
 ) -> Result<(bool, HandleOutcome)> {
     Ok((
-        quiet,
-        handle_push_cli_action(&endpoint, &src, options, &ignores).await?,
-    ))
-}
-
-async fn dispatch_pull_variant(
-    endpoint: RemoteEndpoint,
-    dst: PathBuf,
-    threshold: f32,
-    features: RemoteFeatureOptions,
-    ignores: Vec<String>,
-    quiet: bool,
-) -> Result<(bool, HandleOutcome)> {
-    Ok((
-        quiet,
-        handle_pull_cli_action(
-            &endpoint,
-            &dst,
-            threshold,
-            features.checksum,
-            features.delete,
-            features.fsync,
-            &ignores,
-        )
-        .await?,
+        options.quiet,
+        handle_sync_operands(&src, &dst, options, push_options).await?,
     ))
 }
 
 async fn dispatch_remote_or_internal_action(action: Action) -> Result<(bool, HandleOutcome)> {
     match action {
-        Action::Push {
-            endpoint,
-            src,
-            threshold,
-            checksum,
-            delete,
-            fsync,
-            large_file_parallel_threshold,
-            large_file_parallel_workers,
-            ignores,
-            quiet,
-        } => {
-            dispatch_push_variant(
-                endpoint,
-                src,
-                PushCommandOptions {
-                    threshold,
-                    checksum,
-                    delete,
-                    fsync,
-                    large_file_parallel_threshold,
-                    large_file_parallel_workers,
-                },
-                ignores,
-                quiet,
-            )
-            .await
-        }
-        Action::Pull {
-            endpoint,
-            dst,
-            threshold,
-            checksum,
-            delete,
-            fsync,
-            ignores,
-            quiet,
-        } => {
-            dispatch_pull_variant(
-                endpoint,
-                dst,
-                threshold,
-                RemoteFeatureOptions {
-                    checksum,
-                    delete,
-                    fsync,
-                },
-                ignores,
-                quiet,
-            )
-            .await
-        }
         Action::Listen {
             addr,
             dst,
@@ -568,9 +542,8 @@ async fn dispatch_remote_or_internal_action(action: Action) -> Result<(bool, Han
         Action::InternalChunkWrite {
             dst,
             transfer_id,
-            path,
             quiet,
-        } => dispatch_internal_chunk_write_variant(dst, transfer_id, path, quiet).await,
+        } => dispatch_internal_chunk_write_variant(dst, transfer_id, quiet).await,
         Action::Sync { .. } => unreachable!("sync action handled by dispatch_action"),
     }
 }
@@ -630,24 +603,41 @@ async fn dispatch_internal_send_variant(
 async fn dispatch_internal_chunk_write_variant(
     dst: PathBuf,
     transfer_id: String,
-    path: String,
     quiet: bool,
 ) -> Result<(bool, HandleOutcome)> {
     Ok((
         quiet,
-        handle_internal_chunk_write_cli_action(&dst, &transfer_id, &path, quiet).await?,
+        handle_internal_chunk_write_cli_action(&dst, &transfer_id, quiet).await?,
     ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{handle, resolve_local_file_destination};
-    use crate::cli::actions::Action;
+    use crate::cli::actions::{Action, RemoteEndpoint, SyncOperand};
+    use anyhow::Result;
     use std::fs;
     use tempfile::tempdir;
 
+    fn local_sync_action(src: std::path::PathBuf, dst: std::path::PathBuf) -> Action {
+        Action::Sync {
+            src: SyncOperand::Local(src),
+            dst: SyncOperand::Local(dst),
+            threshold: 0.5,
+            checksum: false,
+            dry_run: false,
+            delete: false,
+            fsync: false,
+            large_file_parallel_threshold: 0,
+            large_file_parallel_workers: 0,
+            network_file_concurrency: 0,
+            ignores: Vec::new(),
+            quiet: false,
+        }
+    }
+
     #[test]
-    fn test_resolve_local_file_destination_into_existing_directory() -> anyhow::Result<()> {
+    fn test_resolve_local_file_destination_into_existing_directory() -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("source.bin");
         let dst_dir = dir.path().join("dest");
@@ -661,7 +651,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_local_sync_copies_file_into_existing_directory() -> anyhow::Result<()> {
+    async fn test_handle_local_sync_copies_file_into_existing_directory() -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("source.txt");
         let dst_dir = dir.path().join("dest");
@@ -669,18 +659,7 @@ mod tests {
         fs::create_dir_all(&dst_dir)?;
         fs::write(dst_dir.join("stale.txt"), "stale")?;
 
-        handle(Action::Sync {
-            src: src.clone(),
-            dst: dst_dir.clone(),
-            threshold: 0.5,
-            checksum: false,
-            dry_run: false,
-            delete: false,
-            fsync: false,
-            ignores: Vec::new(),
-            quiet: false,
-        })
-        .await?;
+        handle(local_sync_action(src.clone(), dst_dir.clone())).await?;
 
         assert!(dst_dir.is_dir());
         assert_eq!(fs::read_to_string(dst_dir.join("source.txt"))?, "payload");
@@ -688,8 +667,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_local_sync_replaces_file_destination_with_directory() -> anyhow::Result<()>
-    {
+    async fn test_handle_local_sync_replaces_file_destination_with_directory() -> Result<()> {
         let dir = tempdir()?;
         let src_dir = dir.path().join("src");
         let dst_file = dir.path().join("dest.txt");
@@ -697,18 +675,7 @@ mod tests {
         fs::write(src_dir.join("nested/file.txt"), "payload")?;
         fs::write(&dst_file, "existing file")?;
 
-        handle(Action::Sync {
-            src: src_dir,
-            dst: dst_file.clone(),
-            threshold: 0.5,
-            checksum: false,
-            dry_run: false,
-            delete: false,
-            fsync: false,
-            ignores: Vec::new(),
-            quiet: false,
-        })
-        .await?;
+        handle(local_sync_action(src_dir, dst_file.clone())).await?;
 
         assert!(dst_file.is_dir());
         assert_eq!(
@@ -719,20 +686,23 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_local_sync_rejects_delete_for_single_file() -> anyhow::Result<()> {
+    async fn test_handle_local_sync_rejects_delete_for_single_file() -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("source.txt");
         let dst = dir.path().join("dest.txt");
         fs::write(&src, "payload")?;
 
         let error = match handle(Action::Sync {
-            src,
-            dst,
+            src: SyncOperand::Local(src),
+            dst: SyncOperand::Local(dst),
             threshold: 0.5,
             checksum: false,
             dry_run: false,
             delete: true,
             fsync: false,
+            large_file_parallel_threshold: 0,
+            large_file_parallel_workers: 0,
+            network_file_concurrency: 0,
             ignores: Vec::new(),
             quiet: false,
         })
@@ -751,20 +721,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_push_stdio_rejects_fsync() -> anyhow::Result<()> {
+    async fn test_handle_push_stdio_rejects_fsync() -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("source.txt");
         fs::write(&src, "payload")?;
 
-        let error = match handle(Action::Push {
-            endpoint: crate::cli::actions::RemoteEndpoint::Stdio,
-            src,
+        let error = match handle(Action::Sync {
+            src: SyncOperand::Local(src),
+            dst: SyncOperand::Remote(RemoteEndpoint::Stdio),
             threshold: 0.5,
             checksum: false,
+            dry_run: false,
             delete: false,
             fsync: true,
             large_file_parallel_threshold: 0,
             large_file_parallel_workers: 0,
+            network_file_concurrency: 0,
             ignores: Vec::new(),
             quiet: false,
         })
@@ -779,20 +751,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_push_stdio_rejects_delete() -> anyhow::Result<()> {
+    async fn test_handle_push_stdio_rejects_delete() -> Result<()> {
         let dir = tempdir()?;
         let src_dir = dir.path().join("source");
         fs::create_dir_all(&src_dir)?;
 
-        let error = match handle(Action::Push {
-            endpoint: crate::cli::actions::RemoteEndpoint::Stdio,
-            src: src_dir,
+        let error = match handle(Action::Sync {
+            src: SyncOperand::Local(src_dir),
+            dst: SyncOperand::Remote(RemoteEndpoint::Stdio),
             threshold: 0.5,
             checksum: false,
+            dry_run: false,
             delete: true,
             fsync: false,
             large_file_parallel_threshold: 0,
             large_file_parallel_workers: 0,
+            network_file_concurrency: 0,
             ignores: Vec::new(),
             quiet: false,
         })
@@ -807,33 +781,44 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn test_handle_tcp_pull_rejects_delete() -> anyhow::Result<()> {
+    async fn test_handle_tcp_pull_allows_delete_request() -> Result<()> {
         let dir = tempdir()?;
         let dst = dir.path().join("dst");
         fs::create_dir_all(&dst)?;
 
-        let error = match handle(Action::Pull {
-            endpoint: crate::cli::actions::RemoteEndpoint::Tcp(String::from("127.0.0.1:9999")),
-            dst,
+        let error = match handle(Action::Sync {
+            src: SyncOperand::Remote(RemoteEndpoint::Tcp {
+                addr: String::from("127.0.0.1:9999"),
+                path: None,
+            }),
+            dst: SyncOperand::Local(dst),
             threshold: 0.5,
             checksum: false,
+            dry_run: false,
             delete: true,
             fsync: false,
+            large_file_parallel_threshold: 0,
+            large_file_parallel_workers: 0,
+            network_file_concurrency: 0,
             ignores: Vec::new(),
             quiet: false,
         })
         .await
         {
-            Ok(()) => anyhow::bail!("raw TCP pull should reject --delete"),
+            Ok(()) => anyhow::bail!("raw TCP pull should attempt the remote session"),
             Err(error) => error,
         };
 
-        assert!(error.to_string().contains("--delete is not supported"));
+        assert!(
+            error.to_string().contains("connect")
+                || error.to_string().contains("Connection")
+                || error.to_string().contains("refused")
+        );
         Ok(())
     }
 
     #[tokio::test]
-    async fn test_handle_local_sync_rejects_symlinked_parent_destination() -> anyhow::Result<()> {
+    async fn test_handle_local_sync_rejects_symlinked_parent_destination() -> Result<()> {
         let dir = tempdir()?;
         let src = dir.path().join("source.txt");
         let dst_root = dir.path().join("dest");
@@ -845,13 +830,16 @@ mod tests {
         std::os::unix::fs::symlink(external_dir.path(), dst_root.join("escape"))?;
 
         let error = match handle(Action::Sync {
-            src,
-            dst: dst_root.join("escape/payload.txt"),
+            src: SyncOperand::Local(src),
+            dst: SyncOperand::Local(dst_root.join("escape/payload.txt")),
             threshold: 0.5,
             checksum: false,
             dry_run: false,
             delete: false,
             fsync: false,
+            large_file_parallel_threshold: 0,
+            large_file_parallel_workers: 0,
+            network_file_concurrency: 0,
             ignores: Vec::new(),
             quiet: false,
         })

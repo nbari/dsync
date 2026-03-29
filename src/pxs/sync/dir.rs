@@ -21,6 +21,7 @@ pub(crate) struct DirectoryWalkState {
     pub directory_paths: Vec<PathBuf>,
     pub tasks: FuturesUnordered<tokio::task::JoinHandle<Result<crate::pxs::sync::SyncStats>>>,
     pub max_in_flight: usize,
+    pub stats: crate::pxs::sync::SyncStats,
 }
 
 impl DirectoryWalkState {
@@ -29,6 +30,7 @@ impl DirectoryWalkState {
             directory_paths: Vec::new(),
             tasks: FuturesUnordered::new(),
             max_in_flight: clamped_parallelism(),
+            stats: crate::pxs::sync::SyncStats::default(),
         }
     }
 }
@@ -98,16 +100,16 @@ pub(crate) async fn sync_dir_recursive(
     .await;
 
     // Ensure all background sync tasks are awaited even if the loop fails
-    let sync_stats = wait_for_sync_tasks(&mut state.tasks).await?;
+    let sync_stats = wait_for_sync_tasks(&mut state).await?;
 
     // Propagate the first error encountered
     walk_result?;
 
-    apply_directory_metadata(context, state.directory_paths)?;
-
     if context.options.delete {
         delete::delete_extraneous_files(context).await?;
     }
+
+    apply_directory_metadata(context, state.directory_paths)?;
 
     Ok(sync_stats)
 }
@@ -341,7 +343,9 @@ async fn handle_walk_entry(
     if file_type.is_file() {
         tools::ensure_no_symlink_ancestors_under_root(context.dst_dir, &dst_path)?;
         if state.tasks.len() >= state.max_in_flight {
-            wait_for_next_sync_task(&mut state.tasks).await?;
+            let task_stats = wait_for_next_sync_task(&mut state.tasks).await?;
+            state.stats.total_blocks += task_stats.total_blocks;
+            state.stats.updated_blocks += task_stats.updated_blocks;
         }
         state.tasks.push(spawn_file_sync_task(
             context,
@@ -369,17 +373,16 @@ async fn wait_for_next_sync_task(
 }
 
 async fn wait_for_sync_tasks(
-    tasks: &mut FuturesUnordered<tokio::task::JoinHandle<Result<crate::pxs::sync::SyncStats>>>,
+    state: &mut DirectoryWalkState,
 ) -> Result<crate::pxs::sync::SyncStats> {
-    let mut total_stats = crate::pxs::sync::SyncStats::default();
-    while let Some(task_result) = tasks.next().await {
-        let stats = task_result
+    while let Some(task_result) = state.tasks.next().await {
+        let task_stats = task_result
             .map_err(|e| anyhow::anyhow!(e))
             .context("worker task panicked")??;
-        total_stats.total_blocks += stats.total_blocks;
-        total_stats.updated_blocks += stats.updated_blocks;
+        state.stats.total_blocks += task_stats.total_blocks;
+        state.stats.updated_blocks += task_stats.updated_blocks;
     }
-    Ok(total_stats)
+    Ok(state.stats)
 }
 
 fn apply_directory_metadata(

@@ -1,4 +1,4 @@
-use anyhow::Context;
+use anyhow::{Context, Result};
 use filetime::FileTime;
 use rkyv::{
     api::high::to_bytes_in,
@@ -75,6 +75,15 @@ pub enum Message {
     SessionOptions {
         fsync: bool,
         delete: bool,
+        path: Option<Vec<u8>>,
+        single_file_name: Option<Vec<u8>>,
+    },
+    PullRequest {
+        path: Option<Vec<u8>>,
+        threshold: f32,
+        checksum: bool,
+        delete: bool,
+        ignores: Vec<String>,
     },
     ParallelTransferConfig {
         threshold_bytes: u64,
@@ -84,74 +93,74 @@ pub enum Message {
         total_size: u64,
     },
     SyncDir {
-        path: String,
+        path: Vec<u8>,
         metadata: FileMetadata,
     },
     SyncSymlink {
-        path: String,
-        target: String,
+        path: Vec<u8>,
+        target: Vec<u8>,
         metadata: FileMetadata,
     },
     SyncFile {
-        path: String,
+        path: Vec<u8>,
         metadata: FileMetadata,
         threshold: f32,
         checksum: bool,
     },
     RequestFullCopy {
-        path: String,
+        path: Vec<u8>,
     },
     RequestParallelFullCopy {
-        path: String,
+        path: Vec<u8>,
         transfer_id: String,
     },
     RequestHashes {
-        path: String,
+        path: Vec<u8>,
     },
     BlockHashes {
-        path: String,
+        path: Vec<u8>,
         hashes: Vec<u64>,
     },
     ApplyBlocks {
-        path: String,
+        path: Vec<u8>,
         blocks: Vec<Block>,
     },
     ApplyBlocksCompressed {
-        path: String,
+        path: Vec<u8>,
         compressed: Vec<u8>,
     },
     ApplyMetadata {
-        path: String,
+        path: Vec<u8>,
         metadata: FileMetadata,
     },
     MetadataApplied {
-        path: String,
+        path: Vec<u8>,
     },
     EndOfFile {
-        path: String,
+        path: Vec<u8>,
     },
     RequestBlocks {
-        path: String,
+        path: Vec<u8>,
         indices: Vec<u32>,
     },
     RequestParallelBlocks {
-        path: String,
+        path: Vec<u8>,
         transfer_id: String,
         indices: Vec<u32>,
     },
     ChunkWriterStart {
         transfer_id: String,
-        path: String,
+        path: Vec<u8>,
     },
     VerifyChecksum {
-        path: String,
+        path: Vec<u8>,
         hash: [u8; 32],
     },
     ChecksumVerified {
-        path: String,
+        path: Vec<u8>,
     },
     ChecksumMismatch {
-        path: String,
+        path: Vec<u8>,
     },
     SyncComplete,
     SyncCompleteAck,
@@ -174,7 +183,7 @@ struct BlockBatchPayload {
 /// # Errors
 ///
 /// Returns an error if serialization fails.
-pub fn serialize_message(msg: &Message) -> anyhow::Result<AlignedVec<16>> {
+pub fn serialize_message(msg: &Message) -> Result<AlignedVec<16>> {
     let mut vec = AlignedVec::<16>::new();
     to_bytes_in::<_, rkyv::rancor::Error>(msg, &mut vec)
         .map_err(|e| anyhow::anyhow!("failed to serialize message: {e}"))?;
@@ -186,7 +195,7 @@ pub fn serialize_message(msg: &Message) -> anyhow::Result<AlignedVec<16>> {
 /// # Errors
 ///
 /// Returns an error if deserialization fails.
-pub fn deserialize_message(bytes: &[u8]) -> anyhow::Result<Message> {
+pub fn deserialize_message(bytes: &[u8]) -> Result<Message> {
     let mut aligned = AlignedVec::<16>::new();
     aligned.extend_from_slice(bytes);
     rkyv::from_bytes::<Message, rkyv::rancor::Error>(&aligned)
@@ -198,7 +207,7 @@ pub fn deserialize_message(bytes: &[u8]) -> anyhow::Result<Message> {
 /// # Errors
 ///
 /// Returns an error if serialization fails.
-pub(crate) fn serialize_block_batch(blocks: &[Block]) -> anyhow::Result<AlignedVec<16>> {
+pub(crate) fn serialize_block_batch(blocks: &[Block]) -> Result<AlignedVec<16>> {
     let payload = BlockBatchPayload {
         blocks: blocks.to_vec(),
     };
@@ -213,7 +222,7 @@ pub(crate) fn serialize_block_batch(blocks: &[Block]) -> anyhow::Result<AlignedV
 /// # Errors
 ///
 /// Returns an error if deserialization fails.
-pub(crate) fn deserialize_block_batch(bytes: &[u8]) -> anyhow::Result<Vec<Block>> {
+pub(crate) fn deserialize_block_batch(bytes: &[u8]) -> Result<Vec<Block>> {
     let mut aligned = AlignedVec::<16>::new();
     aligned.extend_from_slice(bytes);
     let payload = rkyv::from_bytes::<BlockBatchPayload, rkyv::rancor::Error>(&aligned)
@@ -226,7 +235,7 @@ pub(crate) fn deserialize_block_batch(bytes: &[u8]) -> anyhow::Result<Vec<Block>
 /// # Errors
 ///
 /// Returns an error if any attribute fails to be applied.
-pub fn apply_file_metadata(path: &Path, metadata: &FileMetadata) -> anyhow::Result<()> {
+pub fn apply_file_metadata(path: &Path, metadata: &FileMetadata) -> Result<()> {
     use std::fs::Permissions;
     use std::os::unix::fs::PermissionsExt;
 

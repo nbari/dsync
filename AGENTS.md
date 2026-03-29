@@ -30,10 +30,18 @@
 - `./local_pxs_vs_rsync.sh`: local rsync vs pxs benchmark.
 - `./remote_pxs_vs_rsync.sh --source <PATH> --host <USER@HOST> --remote-root <PATH>`: remote benchmark.
 
+## Project Objective
+- Keep the public story consistent: `pxs` is an integrity-first sync/clone tool for large mutable datasets, designed to outperform `rsync` in its target workloads.
+- Do not position `pxs` as a general `rsync` replacement or imply full `rsync -aHAXx` parity unless that is actually implemented.
+- Keep `README.md`, `Cargo.toml` description, and CLI `about` text aligned when changing public wording.
+- Keep the public sync order consistent: `pxs sync SRC DST`.
+- Keep the main README operator-focused; move protocol and contributor design detail to `docs/design.md`.
+
 ## Coding Style & Naming Conventions
 - All production code should have documentation. Document public modules, types, functions, constants, and any non-obvious internal logic that would otherwise be hard to maintain safely.
 - Rust 2024 edition; defaults to `rustfmt`.
 - Clippy is strict (`all` + `pedantic` deny). Avoid `unwrap`, `expect`, and panics; prefer `?` and typed errors.
+- When using `anyhow`, import `anyhow::Result` (and `Context` when needed) at the top of the file and use plain `Result<T>` in signatures instead of fully-qualified `anyhow::Result<T>`.
 - Do not add `#[allow(...)]` in production code; only acceptable inside test modules when needed.
 - File/module names `snake_case`; types `UpperCamelCase`; constants `SCREAMING_SNAKE_CASE`.
 - Group imports from the same crate/namespace (for example, `use std::{...};`) rather than many single-line imports.

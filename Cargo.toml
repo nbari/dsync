@@ -1,9 +1,9 @@
 [package]
 name = "pxs"
-version = "0.5.1"
+version = "0.6.0"
 edition = "2024"
 authors = ["Nicolas Embriz <nbari@tequila.io>"]
-description = "pxs (Parallel X-Sync) - Rust file synchronization focused on faster sync for modern large-data workloads."
+description = "pxs (Parallel X-Sync) - Integrity-first Rust sync/clone for large mutable datasets."
 readme = "README.md"
 homepage = "https://github.com/nbari/pxs"
 repository = "https://github.com/nbari/pxs"
@@ -72,6 +72,7 @@ tracing = "0.1"
 tracing-opentelemetry = "0.32"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
 twox-hash = "2.1.2"
+zstd = "0.13"
 blake3 = { version = "1", features = ["mmap", "rayon"] }
 
 [package.metadata.generate-rpm]
